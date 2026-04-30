@@ -2,6 +2,10 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+/// Comparator uses a base lexicographical comparison by first comparing the user key and then the sequence ordering
+/// for the correct sequence ordering to work (desc) we need to use big_endian encoding.
+/// This must be adhered to for internal key encoding
+
 pub trait Comparator: Send + Sync {
     fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
     // TODO: Add separator and successor and other signatures we may need

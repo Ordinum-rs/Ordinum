@@ -4,7 +4,7 @@ use std::{
     ptr,
 };
 
-use crate::utils::var_int::VarInt;
+use crate::utils::{self, var_int::VarInt};
 
 //
 //
@@ -12,6 +12,9 @@ use crate::utils::var_int::VarInt;
 //
 // Batches use a compact binary representation where all operations are encoded sequentially into a byte slice
 // the binary representation is so that batches can form the records of the WAL without any additional changes
+// We are free to choose the endianness and for optimisation on x86 architectures we choose little endian here.
+// This applies only to the structure of the batch i.e batch count, varint and column_family_id. For the internal key, we defer to the endianness it uses which is
+// big endian for seq number comparison
 //
 // Batch:
 // | --------- 12 byte header ----------|--------- Operations ---------|
@@ -88,6 +91,7 @@ use crate::utils::var_int::VarInt;
 //
 // As a default, a batch is initialised with 1KB (taken from Pebble - https://github.com/cockroachdb/pebble/blob/a3b8dfe9/batch.go#L38)
 //
+//
 const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
 const MAX_BATCH_SIZE: usize = 1 << 20;
 const SINGLE_BATCH_INIT_SIZE: usize = 1 << 8; // NOTE: For now we start small (cache line) and grow if needed as we allocate on each batch for now
@@ -138,6 +142,7 @@ pub(crate) struct Batch {
     // save_points
     // wal_term_point
     // max_bytes
+    max_bytes: usize,
 }
 
 // A record in a batch will have an operation type and a column family ID followed by varstring key and value.
@@ -169,7 +174,10 @@ impl Batch {
     pub(crate) fn new() -> Self {
         let mut data = Vec::with_capacity(DEFAULT_BATCH_INIT_SIZE);
         data.extend_from_slice(&[0u8; HEADER_SIZE]);
-        Self { data }
+        Self {
+            data,
+            max_bytes: MAX_BATCH_SIZE,
+        }
     }
 
     pub(crate) fn new_with_capacity(cap: usize) -> Self {
@@ -178,7 +186,10 @@ impl Batch {
         assert!(cap <= MAX_BATCH_SIZE);
         let mut data = Vec::with_capacity(cap);
         data.extend_from_slice(&[0u8; HEADER_SIZE]);
-        Self { data }
+        Self {
+            data,
+            max_bytes: MAX_BATCH_SIZE,
+        }
     }
 
     // Put uses the default column family (DEFAULT_CF)
@@ -189,16 +200,13 @@ impl Batch {
     {
         // NOTE: What work can we do here before calling put_bytes?
         // value send off to blob file write the pointer bytes?
-        println!("preparing batch");
         self.put_bytes(key.as_ref(), value.as_ref())
     }
 
     pub(crate) fn put_bytes(&mut self, key: &[u8], value: &[u8]) {
-        println!("adding operation bytes");
-
         // Write to batch buffer
         self.data.push(BatchOpType::Put.into());
-        self.data.extend_from_slice(&0u32.to_be_bytes());
+        self.data.extend_from_slice(&0u32.to_le_bytes());
         self.data
             .extend_from_slice(VarInt::new(key.len() as u32).as_slice());
         self.data.extend_from_slice(key);
@@ -207,10 +215,31 @@ impl Batch {
         self.data.extend_from_slice(value);
 
         // Increment count
-        //
+
+        let count_slice = &mut self.data[BATCH_COUNT_OFFSET..BATCH_COUNT_OFFSET + 4];
+
+        unsafe {
+            utils::write_u32_le_unsafe(
+                count_slice.as_mut_ptr(),
+                utils::read_u32_le_unsafe(count_slice.as_ptr()) + 1,
+            )
+        }
     }
 
-    // TOOD: Add()
+    pub(crate) fn batch_count(&self) -> u32 {
+        unsafe {
+            utils::read_u32_le_unsafe(
+                self.data[BATCH_COUNT_OFFSET..BATCH_COUNT_OFFSET + 4].as_ptr(),
+            )
+        }
+    }
+
+    // TOOD: Apply_batch()
+
+    pub(crate) fn apply_batch(&self /*column family resolver, seq_no, flush_scheduler */) {}
+
+    //
+    // TODO: Batch Iterator
 
     // NOTE: Can we defer creation until commit and then build the vec?
 }
@@ -231,6 +260,8 @@ mod tests {
         let mut batch = Batch::new();
 
         batch.put(word, "");
+
+        assert_eq!(batch.batch_count(), 1);
 
         // DB::put(word, value: "");
     }
