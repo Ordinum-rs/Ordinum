@@ -1,7 +1,3 @@
-//
-//
-//
-//
 // db.write(batch)
 //     │
 //     ├─ create Writer node on stack
@@ -42,3 +38,36 @@
 //    │
 //    └── if leader: caller thread continues executing through db_impl_write
 //                   accessing self directly for WAL, memtables, CFs
+
+use std::{ptr, sync::atomic::AtomicPtr};
+
+use super::writer::Writer;
+
+/// WriteThread is the coordination mechanism for multiple writes. Each calling thread will creater a writer holding a batch of operations and try to join
+/// the write thread queue. The write thread will group multiple writes and determine leader/followers.
+/// Once complete, it will signal to followers and drop
+pub(crate) struct WriteThread {
+    head: AtomicPtr<Writer>,
+}
+
+impl Default for WriteThread {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WriteThread {
+    pub(crate) fn new() -> Self {
+        Self {
+            head: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    pub(crate) fn join(&self, writer: &Writer) -> bool {
+        // TODO: Need to understand how we cut the linked list and then reverse it to give to the leader from oldest to newest
+        let _ = writer;
+        todo!()
+    }
+}
+
+//
