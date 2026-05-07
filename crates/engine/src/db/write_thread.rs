@@ -108,14 +108,17 @@ impl WriteThread {
 
     fn link_writer(&self, writer: *mut Writer) -> bool {
         debug_assert!(unsafe { (*writer).state.load(Ordering::Relaxed) & WriterState::INIT != 0 });
+        debug_assert!(!writer.is_null());
 
+        // TODO: Double check ordering here
         let mut current_newest_writer = self.newest_writer.load(Ordering::Relaxed);
 
         loop {
-            // XXX: We can put write stall logic and control flow here
+            // XXX: We can put write stall blocking here
+            //
 
-            // Link to the previously newest writer.
-            // Produces a newest->older intrusive stack.
+            // # SAFETY:
+            // We check that writer is not null so we are safe to dereference
             unsafe {
                 (*writer)
                     .link_older
@@ -162,13 +165,20 @@ impl WriteThread {
     /// writers. It operates only on the leader's snapshot of the group.
     fn set_new_links(&self, group_newest_writer: *mut Writer) {
         //
+
+        assert!(!group_newest_writer.is_null());
+
         let mut current = group_newest_writer;
 
         loop {
+            // # SAFTEY:
+            // current is not null so we are safe to load link_older
             let older = unsafe { (*current).link_older.load(Ordering::Relaxed) };
 
             // If the older Writer is null (reached end) or the older Writers next link is set already we break
             if older.is_null()
+                // # SAFETY:
+                // if older was null we will have hit the first conditional check, therefore, older is safe to dereference here
                 || !(unsafe { (*older).group_next.load(Ordering::Relaxed).is_null() })
             {
                 debug_assert!(
@@ -178,6 +188,8 @@ impl WriteThread {
                 break;
             }
 
+            // # SAFETY:
+            // old is not null so we are safe to access the group_next to store current
             unsafe { (*older).group_next.store(current, Ordering::Relaxed) };
             current = older;
         }
@@ -189,6 +201,8 @@ impl WriteThread {
         //
         //
 
+        // # SAFTEY:
+        // leader is NonNull, batch is NonNull. leader Writer remains active on the stack and outlives this method
         let size = unsafe { leader.as_ref().batch.as_ref().batch_size() };
 
         // Limit the max size if the leader's batch is smaller than MIN_BATCH_GROUP_SIZE so that small writes are not
@@ -217,6 +231,8 @@ impl WriteThread {
 
         while w != newest_writer {
             //
+            // # SAFTEY:
+            // We know that writer is NonNull and that it is safe to dereference because the stack allocated writer will oulive this method
             let w = unsafe { (*w).group_next.load(Ordering::Relaxed) };
 
             // TODO: Finish from here
