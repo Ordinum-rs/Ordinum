@@ -202,7 +202,7 @@ impl WriteThread {
         // `leader` is `NonNull`, and `batch` is initialized during writer
         // construction and immutable after publication. Reading batch metadata
         // does not race with any concurrent mutation.
-        let size = unsafe { leader.as_ref().batch.as_ref().batch_size() };
+        let mut size = unsafe { leader.as_ref().batch.as_ref().batch_size() };
 
         // Limit the max size if the leader's batch is smaller than MIN_BATCH_GROUP_SIZE so that small writes are not
         // slowed by group mechanics
@@ -217,26 +217,26 @@ impl WriteThread {
         write_group.last_writer = leader.as_ptr();
 
         // Get the newest_writer to use to link newer writers in the group
-        let newest_writer = self.newest_writer.load(Ordering::Acquire);
+        let snapshot_newest_w = self.newest_writer.load(Ordering::Acquire);
 
-        self.set_new_links(newest_writer);
+        self.set_new_links(snapshot_newest_w);
 
         // Traverse the WriteGroup in contextual order (oldest->newest) and decide if we need to remove writers and append to end (next group)
 
-        let mut w = leader.as_ptr();
-        let mut we = leader.as_ptr();
-        let mut r: *mut Writer = ptr::null_mut();
-        let mut re: *mut Writer = ptr::null_mut();
+        let mut current_writer = leader.as_ptr();
+        let mut write_group_end = leader.as_ptr();
+        let mut rejected_head: *mut Writer = ptr::null_mut();
+        let mut rejected_tail: *mut Writer = ptr::null_mut();
 
-        while w != newest_writer {
-            debug_assert!(!unsafe { *(*w).group_next.get() }.is_null());
+        while current_writer != snapshot_newest_w {
+            debug_assert!(!unsafe { *(*current_writer).group_next.get() }.is_null());
             //
             // SAFETY:
             // `w` is part of the current materialized execution chain.
             // `group_next` has been initialized by `set_new_links()` before
             // entering this loop, so reading it yields either the next writer
             // in this group or null at the group boundary.
-            w = unsafe { *(*w).group_next.get() };
+            current_writer = unsafe { *(*current_writer).group_next.get() };
 
             // Compatibility checks
 
@@ -263,11 +263,11 @@ impl WriteThread {
             // - append rejected writers to `r_list` for handoff into the next group.
             unsafe {
                 // Don't group empty batches
-                if (*w).batch.as_ref().is_empty() ||
+                if (*current_writer).batch.as_ref().is_empty() ||
                     // Remove batches which breach our max size
-                    (*w).batch.as_ref().batch_size() > max_size ||
+                    (*current_writer).batch.as_ref().batch_size() > max_size ||
                     // If sync modes do not match with leader, remove
-                    (*w).sync != (*leader.as_ptr()).sync
+                    (*current_writer).sync != (*leader.as_ptr()).sync
                 // TODO: Add other conditions
                 {
                     //
@@ -282,8 +282,8 @@ impl WriteThread {
                     //               <---------<------------┚
                     //               link so W1 skips current
 
-                    let older = *(*w).link_older.get();
-                    let newer = *(*w).group_next.get();
+                    let older = *(*current_writer).link_older.get();
+                    let newer = *(*current_writer).group_next.get();
 
                     // Set the current's older writer's group_next to the writer after current so current is skipped
                     *(*older).group_next.get() = newer;
@@ -291,24 +291,128 @@ impl WriteThread {
                     // Do the inverse of above
                     if !newer.is_null() {
                         *(*newer).link_older.get() = older;
-                    }
+                    };
 
                     // Insert current into r_list
+                    // Building by tail append: r = beginning (head/oldest) rb = end (tail/newest)
 
-                    break;
+                    // If end of r_list is null we can just set both start and end pointers to current
+                    if rejected_tail.is_null() {
+                        rejected_tail = current_writer;
+                        rejected_head = current_writer;
+                        // current writers link_older should be changed to null as it is the oldest entry in the r_list
+                        *(*current_writer).link_older.get() = ptr::null_mut();
+                    } else {
+                        // else we need to insert the current writer at the tail of the r_list
+
+                        // Link current writer's link_older to point to the current re writer
+                        *(*current_writer).link_older.get() = rejected_tail;
+                        // Link the current re writer's group_next to point to the current writer
+                        *(*rejected_tail).group_next.get() = current_writer;
+                        // update new re tail to equal current writer
+                        rejected_tail = current_writer;
+                    }
+                } else {
+                    // We pass compatability checks on the writers and can now grow the group upwards
+                    write_group_end = current_writer;
+                    let cw = &*current_writer;
+                    size += cw.batch.as_ref().batch_size();
+                    write_group.last_writer = current_writer;
+                    write_group.size += 1;
                 };
+            };
+        } // Loop exit - current_writer should be snapshot_newest_w here
+
+        // Once we've reached newest_writer (end of write group for this loop) we can append the rejected list to the end of the current_writer
+        // so the next newest writer (or leader handoff) can process it
+        if !rejected_head.is_null() {
+            // SAFETY:
+            // `rejected_head..rejected_tail` is a temporary rejected chain built
+            // by this leader, and `write_group_end` is the last accepted writer.
+            //
+            // This leader has exclusive permission to mutate these intrusive links.
+            // Grafting `rejected_head` after `write_group_end` and null-terminating
+            // `rejected_tail.group_next` restores a single execution chain.
+            unsafe {
+                // link the rejected head to the write groups tail
+                *(*rejected_head).link_older.get() = write_group_end;
+                // Null the link_newer rejected tail because there will be no more appended (it is at end)
+                *(*rejected_tail).group_next.get() = ptr::null_mut();
+                // Now link the write_groups tail group_next to point to the rejected lists head
+                *(*write_group_end).group_next.get() = rejected_head;
             }
 
-            // compatable check
-            // append rejected_list
-            // fix r_list links
-            // update write group
+            // Now we have a write group and have appended the rejected_list, we need to detect if newer writers have joined in the meantime. We do so through
+            // CASing on the global newest writer and comparing against our view taken of the newest_writer (snapshot_newest_w) and the rejected_tail writer.
+            // If we succeed the rejected_tail becomes the newest writer in the global linked list.
+            // If we fail, then new writers have joined since then and we must link them correctly.
+            //
+            // For example:
+            // [A = Comapatible R = Rejected]
+            //
+            // EnterGroupBatch start ->
+            //
+            // get global newest_writer list:
+            // newest | W4 --> W3 -->  W2 -->  W1 -->  L | oldest
+            //          C      C       R       R       C
+            //
+            // writer list:
+            // tail   | L  --> W3 --> W4 | head
+            // rejected list:
+            // tail   | W1 --> W2        | head
+            //
+            // write_group list:
+            // tail   | L  --> W3 --> W4 --> W1 --> W2 | head
+            //         we             wb     re     rb
+            //
+            //
+            // global newest writer list after new writers join:
+            // newest | W6 --> W5 --> W4 --> W3 -->  W2 -->  W1 -->  L | oldest
+            //          ^      ^
+            //                 W5 link_older now points to the end of the compatible writer group W4
+            //
+            // The oldest writer newer than our snapshot must have its `link_older`
+            // rewired from `snapshot_newest_w` to `rejected_tail`.
+            // tail   | L  --> W3 --> W4 --> W1 --> W2 --> W5 --> W6 | head
+            //        |   write group     |  rejected   |     new    |
             //
 
-            break;
+            match self.newest_writer.compare_exchange_weak(
+                snapshot_newest_w,
+                rejected_tail,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => { /* If ok drop out, our view on newest_writer hasn't changed and so we can assign rejected tail to newest writer global */
+                }
+                // If we error, we want the global newest writer, and then we walk it's link_older until we get to the writer's whose link_older equals
+                // our snapshot_newest_w. Once we're there we can re-assign it's link_older to point to the rejected tail writer
+                Err(mut current_global_newest) => {
+                    // SAFETY:
+                    //
+                    // The failed CAS returned the current global head, which is a live writer
+                    // published through `self.newest_writer`.
+                    //
+                    // Writers newer than `snapshot_newest_w` were linked by `link_writer()`
+                    // before publication, so each has a valid non-null `link_older` pointing
+                    // toward older writers.
+                    //
+                    // As the sole current batch-group leader, this thread has exclusive
+                    // permission to mutate intrusive group links. Walking `link_older` from
+                    // the current global head until reaching the first writer whose
+                    // `link_older == snapshot_newest_w` identifies the oldest writer newer
+                    // than our snapshot. Re-pointing that writer to `rejected_tail` restores
+                    // queue continuity after local group surgery.
+                    unsafe {
+                        while *(*current_global_newest).link_older.get() != snapshot_newest_w {
+                            current_global_newest = *(*current_global_newest).link_older.get();
+                        }
+                        // We are at the writer which needs to be linked to the rejected tail writer
+                        *(*current_global_newest).link_older.get() = rejected_tail
+                    }
+                }
+            }
         }
-
-        todo!()
     }
 
     pub(crate) fn join(&self, writer: &Writer) {
@@ -485,5 +589,10 @@ mod tests {
         // assertions:
         assert!(follower_1_state.load(Ordering::Relaxed) & WriterState::LEADER != 0);
         assert!(follower_2_state.load(Ordering::Relaxed) & WriterState::COMPLETE != 0);
+    }
+
+    #[test]
+    fn entering_as_group() {
+        todo!()
     }
 }
