@@ -1,5 +1,6 @@
 use std::{
     cell::UnsafeCell,
+    fmt::Display,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicU8, Ordering},
     thread::{self, Thread},
@@ -10,6 +11,7 @@ use crate::db::{
     write_thread::{WriteGroup, WriteThread},
 };
 
+// WriterState is a struct here and not an enum because it is a bitflag set
 #[non_exhaustive]
 pub(super) struct WriterState;
 
@@ -18,6 +20,32 @@ impl WriterState {
     pub const LEADER: u8 = 1 << 1;
     pub const LOCKED_WAITING: u8 = 1 << 2;
     pub const COMPLETE: u8 = 1 << 3;
+
+    pub fn debug(state: u8) -> String {
+        let mut states = Vec::new();
+
+        if state & Self::INIT != 0 {
+            states.push("INIT");
+        }
+
+        if state & Self::LEADER != 0 {
+            states.push("LEADER");
+        }
+
+        if state & Self::LOCKED_WAITING != 0 {
+            states.push("LOCKED_WAITING");
+        }
+
+        if state & Self::COMPLETE != 0 {
+            states.push("COMPLETE");
+        }
+
+        if states.is_empty() {
+            "NO_STATE".into()
+        } else {
+            states.join(" | ")
+        }
+    }
 }
 
 /// Writer is the calling threads write which holds a batch of operations.
@@ -56,14 +84,19 @@ pub(crate) struct Writer {
 
 // SAFETY:
 //
-// Writer may be shared across threads because all fields mutated after
-// publication use interior mutability: AtomicU8, AtomicPtr, Thread, etc.
+// Writer instances are shared between threads through intrusive queue links.
 //
-// The batch pointer is non-owning and must point to immutable Batch data
-// that outlives the Writer.
+// Mutable access to `state` is synchronized through atomic operations.
 //
-// Writer itself does not guarantee queue lifetime. That invariant is owned
-// by WriteThread.
+// Mutable access to `link_older` and `group_next` is externally serialized
+// by the WriteThread queue protocol such that no two threads concurrently
+// mutate the same link field.
+//
+// `batch` is immutable after Writer construction and guaranteed to outlive
+// the Writer.
+//
+// `write_group` is leader-owned transient state whose lifetime is bounded
+// by the write-thread processing phase.
 unsafe impl Sync for Writer {}
 
 impl Writer {
@@ -78,6 +111,8 @@ impl Writer {
             sync: true,
         }
     }
+
+    // TODO: Add bitfield methods to make semantic state clearer
 
     /// wait() is used when the calling thread of a write has joined the write_thread and becomes a follower in the group.
     ///
@@ -145,9 +180,70 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::{thread::scope, time::Duration};
 
     use super::*;
+
+    // ================================================================================================
+    // Writer Test Invariants
+    // ================================================================================================
+    //
+    // These tests validate Writer synchronization and waiting semantics in isolation
+    // from the full WriteThread queue implementation.
+    //
+    // Important invariants:
+    //
+    // 1. Writers are thread-owned
+    // ---------------------------
+    // A Writer captures thread::current() during construction:
+    //
+    //     thread_handle: Thread
+    //
+    // Therefore a Writer MUST be constructed inside the thread which may later
+    // call wait()/wait_and_block() and become parked.
+    //
+    // Constructing a Writer on one thread and parking on another would invalidate
+    // the wakeup protocol because unpark() would target the wrong thread.
+    //
+    //
+    // 2. Writers are shared through pointer publication
+    // -------------------------------------------------
+    // Concurrent tests publish Writer pointers through AtomicPtr using
+    // Release/Acquire synchronization.
+    //
+    // Writers remain stack allocated inside their owning thread.
+    //
+    // thread::scope() guarantees all spawned threads complete before stack
+    // teardown, making temporary shared raw pointers valid for the scoped lifetime.
+    //
+    //
+    // 3. Published Writers are concurrently shared
+    // --------------------------------------------
+    // After publication, Writers may be observed and mutated concurrently through:
+    //
+    //     - atomic state transitions
+    //     - intrusive queue links
+    //     - thread wakeup operations
+    //
+    // UnsafeCell fields are NOT independently synchronized and rely on higher-level
+    // protocol invariants for correctness.
+    //
+    //
+    // 4. These are protocol tests
+    // ---------------------------
+    // Tests here validate narrow synchronization edges such as:
+    //
+    //     - wait/wakeup correctness
+    //     - COMPLETE publication
+    //     - LEADER promotion
+    //     - parking semantics
+    //
+    // They intentionally avoid reconstructing the full WriteThread queue or
+    // DBImpl::Write() execution flow.
+    //
+    // ================================================================================================
 
     #[test]
     fn writer_state() {
@@ -160,45 +256,78 @@ mod tests {
     }
 
     #[test]
-    fn waiting_and_blocking() {
-        let batch = Batch::new();
-        let writer = Writer::new(&batch);
+    fn wait_and_block_wakes_after_complete() {
+        //
+        let follower: AtomicPtr<Writer> = AtomicPtr::new(ptr::null_mut());
 
-        thread::scope(|t| {
-            t.spawn(|| {
-                thread::sleep(Duration::from_millis(1000));
+        thread::scope(|s| {
+            s.spawn(|| {
+                //
+                loop {
+                    let f = follower.load(Ordering::Acquire);
+                    if f.is_null() {
+                        std::hint::spin_loop();
+                        continue;
+                    } else {
+                        debug_assert!(!f.is_null());
+                        let f = unsafe { &*f };
+                        while f.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING == 0 {
+                            std::hint::spin_loop();
+                        }
 
-                // In order for us to be able to use the writer as reference here and not get into borrow or thread boundry compilation mayhem
-                // we must ensure that Writer lives for longer than the thread scope
-                writer
-                    .state
-                    .fetch_or(WriterState::COMPLETE, Ordering::Release);
-
-                if writer.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING != 0 {
-                    writer.thread_handle.unpark();
+                        f.state.fetch_or(WriterState::COMPLETE, Ordering::Release);
+                        f.thread_handle.unpark();
+                        break;
+                    }
                 }
             });
-            writer.wait_and_block();
-            assert!(writer.state.load(Ordering::Acquire) & WriterState::COMPLETE != 0);
+
+            s.spawn(|| {
+                let batch = Batch::new();
+                let writer = Writer::new(&batch);
+                writer.state.fetch_or(WriterState::INIT, Ordering::Release);
+                follower.store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
+                writer.wait_and_block();
+
+                assert!(writer.state.load(Ordering::Acquire) & WriterState::COMPLETE != 0);
+                assert!(writer.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING != 0);
+            });
         });
     }
 
     #[test]
     fn follower_promoted_to_leader() {
-        let batch = Batch::new();
-        let writer = Writer::new(&batch);
+        let follower: AtomicPtr<Writer> = AtomicPtr::new(ptr::null_mut());
 
         thread::scope(|t| {
             t.spawn(|| {
-                thread::sleep(Duration::from_millis(10));
-                // simulate current leader handing off leadership
-                writer
-                    .state
-                    .fetch_or(WriterState::LEADER, Ordering::Release);
-                if writer.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING != 0 {
-                    writer.thread_handle.unpark();
+                loop {
+                    let f = follower.load(Ordering::Acquire);
+
+                    if f.is_null() {
+                        std::hint::spin_loop();
+                        continue;
+                    } else {
+                        // We have a follower - suppose we have processed a write group and this follower needs to be handed leadership
+                        // to process the next group
+
+                        let f = unsafe { &*f };
+
+                        while f.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING == 0 {
+                            std::hint::spin_loop();
+                        }
+
+                        f.state.fetch_or(WriterState::LEADER, Ordering::Release);
+                        f.thread_handle.unpark();
+                        break;
+                    }
                 }
+                //
             });
+
+            let batch = Batch::new();
+            let writer = Writer::new(&batch);
+            follower.store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
 
             writer.wait_and_block();
 

@@ -444,155 +444,18 @@ mod tests {
     use crate::db::writer::WriterState;
 
     use super::*;
+    use std::hint::spin_loop;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::thread::{self};
-    use std::time::Duration;
 
-    // TODO: Need to make this deterministic with while loop so we can enforce thread join order
     #[test]
-    fn writer_follower_to_leader() {
-        // XXX: Replace naive implementation with writer_thread methods - eventually move to integration test
-        //
-        let group: AtomicPtr<Writer> = AtomicPtr::new(ptr::null_mut());
-
-        // Want:
-        // leader -> follower 1 -> follower 2
-        // To become:
-        // follower 1 (new leader) -> follower 2
-
-        // To make this deterministic we'll make each spawned thread sleep so we can control the order
-        // We are testing logic->follower with third follower blocking on leader change
-
-        // Assertion state
-        let follower_1_state = AtomicU8::new(0);
-        let follower_2_state = AtomicU8::new(0);
-
-        thread::scope(|t| {
-            // Leader
-            t.spawn(|| {
-                let batch = Batch::new();
-                let mut writer_1 = Writer::new(&batch);
-
-                // No wait - we want this to be leader
-
-                group.store(&raw mut writer_1, Ordering::Release);
-
-                // Set as leader
-                writer_1
-                    .state
-                    .fetch_or(WriterState::LEADER, Ordering::Release);
-
-                // Now wait for 1000ms to simulate processing group write and then set next leader
-                thread::sleep(Duration::from_millis(1000));
-
-                // We don't need to unpark because the next follower is the one we want to make leader
-                // normally we'd traverse the linked list and process the group before either nulling the global head or
-                // assigning new leader
-
-                let follower = unsafe { *writer_1.group_next.get() };
-
-                assert!(!follower.is_null());
-                unsafe {
-                    (*follower)
-                        .state
-                        .fetch_or(WriterState::LEADER, Ordering::Release);
-                    (*follower).thread_handle.unpark();
-                }
-
-                //
-            });
-
-            // Follower 1 (next leader)
-            t.spawn(|| {
-                let batch = Batch::new();
-                let mut writer_2 = Writer::new(&batch);
-
-                thread::sleep(Duration::from_millis(10));
-
-                match group.compare_exchange(
-                    group.load(Ordering::Acquire),
-                    &raw mut writer_2,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(ptr) => {
-                        // We have pointer to the leader - we need to set it's back_link to us
-                        unsafe { *(*ptr).group_next.get() = &raw mut writer_2 }
-                        // Set our next pointer to ptr we just stole from group head
-                        unsafe { *writer_2.link_older.get() = ptr }
-                    }
-                    Err(_) => panic!(),
-                }
-
-                // Now block
-                writer_2.wait_and_block();
-                //
-
-                // If we do become leader (which we should) check, simulate work and unpark followers
-                if writer_2.is_leader() {
-                    // Simulate work
-
-                    thread::sleep(Duration::from_millis(1000));
-
-                    // assert out back link is not null
-                    assert!(!unsafe { *writer_2.group_next.get() }.is_null());
-                    let follower = unsafe { *writer_2.group_next.get() };
-
-                    unsafe {
-                        (*follower)
-                            .state
-                            .fetch_or(WriterState::COMPLETE, Ordering::Release);
-                        if (*follower).state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING
-                            != 0
-                        {
-                            (*follower).thread_handle.unpark();
-                        }
-                    }
-                }
-                // Before we exit - log our state for assertion
-                follower_1_state.store(writer_2.state.load(Ordering::Relaxed), Ordering::Relaxed);
-            });
-
-            // Follower 2
-            t.spawn(|| {
-                let batch = Batch::new();
-                let mut writer_3 = Writer::new(&batch);
-
-                thread::sleep(Duration::from_millis(20));
-
-                match group.compare_exchange(
-                    group.load(Ordering::Acquire),
-                    &raw mut writer_3,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(ptr) => {
-                        // We have pointer to the leader - we need to set it's back_link to us
-                        unsafe {
-                            *(*ptr).group_next.get() = &raw mut writer_3;
-                        }
-                        // Set our next pointer to ptr we just stole from group head
-                        unsafe { *writer_3.link_older.get() = ptr };
-                    }
-                    Err(_) => panic!(),
-                }
-
-                // Now block
-                writer_3.wait_and_block();
-                //
-
-                // Before we exit - log our state for assertion
-                follower_2_state.store(writer_3.state.load(Ordering::Relaxed), Ordering::Relaxed);
-            });
-        });
-
-        // assertions:
-        assert!(follower_1_state.load(Ordering::Relaxed) & WriterState::LEADER != 0);
-        assert!(follower_2_state.load(Ordering::Relaxed) & WriterState::COMPLETE != 0);
+    fn leader_handoff() {
+        todo!()
     }
 
     #[test]
     fn entering_as_group() {
+        //
         todo!()
     }
 }
