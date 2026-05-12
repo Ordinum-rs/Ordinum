@@ -142,7 +142,7 @@ impl WriteThread {
             if older.is_null()
                 // # SAFETY:
                 // if older was null we will have hit the first conditional check, therefore, older is safe to dereference here
-                || !(unsafe { (*older).group_next.get().is_null() })
+                || !(unsafe { (*(*older).group_next.get()).is_null() })
             {
                 debug_assert!(
                     (older.is_null()) || unsafe { *(*older).group_next.get() == current }
@@ -228,6 +228,7 @@ impl WriteThread {
             // - append rejected writers to `r_list` for handoff into the next group.
             unsafe {
                 // Don't group empty batches
+                // TODO: Need to detect empty batches better maybe through count?
                 if (*current_writer).batch.as_ref().is_empty() ||
                     // Remove batches which breach our max size
                     (*current_writer).batch.as_ref().batch_size() > max_size ||
@@ -389,6 +390,7 @@ impl WriteThread {
         let linked_writer = self.link_writer(w);
 
         if linked_writer {
+            writer.set_leader();
             debug_assert!(writer.is_leader());
 
             let mut write_group = WriteGroup::new(w);
@@ -412,6 +414,11 @@ mod tests {
     use std::hint::spin_loop;
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::thread::{self};
+
+    // Test Phases
+    // 1 - Pure single-threaded intrusive list tests
+    // 2 - Test sync points
+    // 3 - Loom for smaller concurrency scope
 
     #[test]
     fn leader_handoff() {
