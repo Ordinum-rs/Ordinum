@@ -1,6 +1,7 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
     cell::UnsafeCell,
-    fmt::Display,
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicU8, Ordering},
     thread::{self, Thread},
@@ -103,7 +104,7 @@ impl Writer {
     pub(crate) fn new(batch: &Batch) -> Self {
         Self {
             batch: NonNull::from(batch),
-            state: AtomicU8::new(0),
+            state: AtomicU8::new(WriterState::INIT),
             link_older: UnsafeCell::new(ptr::null_mut()),
             group_next: UnsafeCell::new(ptr::null_mut()),
             thread_handle: thread::current(),
@@ -113,6 +114,23 @@ impl Writer {
     }
 
     // TODO: Add bitfield methods to make semantic state clearer
+    //
+
+    pub(crate) fn set_complete(&self) {
+        let _ = self
+            .state
+            .fetch_or(WriterState::COMPLETE, Ordering::Release);
+    }
+
+    pub(crate) fn set_locked_waiting(&self) {
+        let _ = self
+            .state
+            .fetch_or(WriterState::LOCKED_WAITING, Ordering::Release);
+    }
+
+    pub(crate) fn set_leader(&self) {
+        let _ = self.state.fetch_or(WriterState::LEADER, Ordering::Release);
+    }
 
     /// wait() is used when the calling thread of a write has joined the write_thread and becomes a follower in the group.
     ///
@@ -156,6 +174,8 @@ impl Writer {
             thread::yield_now();
         }
 
+        // TODO: Add TEST_SYNC_POINTS here
+
         // Fall through to block
         self.wait_and_block();
     }
@@ -180,160 +200,141 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::{thread::scope, time::Duration};
+    use crate::sync::{AtomicBool, AtomicPtr};
+    use std::{
+        thread::{Scope, ScopedJoinHandle, scope},
+        time::Duration,
+    };
 
     use super::*;
 
-    // ================================================================================================
-    // Writer Test Invariants
-    // ================================================================================================
+    // Local Test Harness (Helpers)
     //
-    // These tests validate Writer synchronization and waiting semantics in isolation
-    // from the full WriteThread queue implementation.
-    //
-    // Important invariants:
-    //
-    // 1. Writers are thread-owned
-    // ---------------------------
-    // A Writer captures thread::current() during construction:
-    //
-    //     thread_handle: Thread
-    //
-    // Therefore a Writer MUST be constructed inside the thread which may later
-    // call wait()/wait_and_block() and become parked.
-    //
-    // Constructing a Writer on one thread and parking on another would invalidate
-    // the wakeup protocol because unpark() would target the wrong thread.
-    //
-    //
-    // 2. Writers are shared through pointer publication
-    // -------------------------------------------------
-    // Concurrent tests publish Writer pointers through AtomicPtr using
-    // Release/Acquire synchronization.
-    //
-    // Writers remain stack allocated inside their owning thread.
-    //
-    // thread::scope() guarantees all spawned threads complete before stack
-    // teardown, making temporary shared raw pointers valid for the scoped lifetime.
-    //
-    //
-    // 3. Published Writers are concurrently shared
-    // --------------------------------------------
-    // After publication, Writers may be observed and mutated concurrently through:
-    //
-    //     - atomic state transitions
-    //     - intrusive queue links
-    //     - thread wakeup operations
-    //
-    // UnsafeCell fields are NOT independently synchronized and rely on higher-level
-    // protocol invariants for correctness.
-    //
-    //
-    // 4. These are protocol tests
-    // ---------------------------
-    // Tests here validate narrow synchronization edges such as:
-    //
-    //     - wait/wakeup correctness
-    //     - COMPLETE publication
-    //     - LEADER promotion
-    //     - parking semantics
-    //
-    // They intentionally avoid reconstructing the full WriteThread queue or
-    // DBImpl::Write() execution flow.
-    //
-    // ================================================================================================
+    #[derive(Copy, Clone)]
+    enum BlockMode {
+        Block,
+        Wait,
+    }
 
-    #[test]
-    fn writer_state() {
-        let batch = Batch::new();
-        let writer = Writer::new(&batch);
+    enum Checkpoint {
+        Init,
+        Published,
+        ReleasedToWait,
+    }
 
-        writer.state.store(WriterState::LEADER, Ordering::Relaxed);
+    struct Harness {
+        writer: AtomicPtr<Writer>,
+        check_point: AtomicU8,
+    }
 
-        assert!(writer.is_leader());
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                writer: AtomicPtr::new(ptr::null_mut()),
+                check_point: AtomicU8::new(Checkpoint::Init as u8),
+            }
+        }
+
+        fn writer(&self) -> &Writer {
+            unsafe {
+                self.writer
+                    .load(Ordering::Acquire)
+                    .as_ref()
+                    .expect("writer not published")
+            }
+        }
+
+        fn spawn_writer<'scope>(&'scope self, s: &'scope Scope<'scope, '_>, block_mode: BlockMode) {
+            s.spawn(move || {
+                let batch = Batch::new();
+                let writer = Writer::new(&batch);
+
+                self.writer
+                    .store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
+
+                self.check_point
+                    .store(Checkpoint::Published as u8, Ordering::Release);
+
+                while self.check_point.load(Ordering::Acquire) != Checkpoint::ReleasedToWait as u8 {
+                    std::hint::spin_loop();
+                }
+
+                match block_mode {
+                    BlockMode::Block => writer.wait_and_block(),
+                    BlockMode::Wait => writer.wait(),
+                }
+            });
+        }
+
+        fn wait_until_published(&self) {
+            while self.check_point.load(Ordering::Acquire) != Checkpoint::Published as u8 {
+                std::hint::spin_loop();
+            }
+        }
+
+        fn complete(&self) {
+            let w = self.writer();
+            w.set_complete();
+            w.thread_handle.unpark();
+        }
+
+        fn promote(&self) {
+            let w = self.writer();
+            w.set_leader();
+            w.thread_handle.unpark();
+        }
+
+        fn resume(&self) {
+            self.check_point
+                .store(Checkpoint::ReleasedToWait as u8, Ordering::Release);
+        }
+
+        fn wait_until_state(&self, state: u8) {
+            while self.writer().state.load(Ordering::Acquire) & state == 0 {
+                std::hint::spin_loop();
+            }
+        }
     }
 
     #[test]
     fn wait_and_block_wakes_after_complete() {
-        //
-        let follower: AtomicPtr<Writer> = AtomicPtr::new(ptr::null_mut());
+        let harness = Harness::new();
 
-        thread::scope(|s| {
-            s.spawn(|| {
-                //
-                loop {
-                    let f = follower.load(Ordering::Acquire);
-                    if f.is_null() {
-                        std::hint::spin_loop();
-                        continue;
-                    } else {
-                        debug_assert!(!f.is_null());
-                        let f = unsafe { &*f };
-                        while f.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING == 0 {
-                            std::hint::spin_loop();
-                        }
+        thread::scope(|t| {
+            harness.spawn_writer(t, BlockMode::Block);
 
-                        f.state.fetch_or(WriterState::COMPLETE, Ordering::Release);
-                        f.thread_handle.unpark();
-                        break;
-                    }
-                }
-            });
+            harness.wait_until_published();
+            harness.resume();
 
-            s.spawn(|| {
-                let batch = Batch::new();
-                let writer = Writer::new(&batch);
-                writer.state.fetch_or(WriterState::INIT, Ordering::Release);
-                follower.store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
-                writer.wait_and_block();
+            harness.wait_until_state(WriterState::LOCKED_WAITING);
 
-                assert!(writer.state.load(Ordering::Acquire) & WriterState::COMPLETE != 0);
-                assert!(writer.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING != 0);
-            });
+            // Test writer being woken after changing it's state to complete
+            harness.complete();
+
+            harness.wait_until_state(WriterState::COMPLETE);
+            assert!(harness.writer().state.load(Ordering::Acquire) & WriterState::COMPLETE != 0);
         });
     }
 
     #[test]
-    fn follower_promoted_to_leader() {
-        let follower: AtomicPtr<Writer> = AtomicPtr::new(ptr::null_mut());
+    fn wait_and_block_promote_leader() {
+        let harness = Harness::new();
 
         thread::scope(|t| {
-            t.spawn(|| {
-                loop {
-                    let f = follower.load(Ordering::Acquire);
+            harness.spawn_writer(t, BlockMode::Block);
 
-                    if f.is_null() {
-                        std::hint::spin_loop();
-                        continue;
-                    } else {
-                        // We have a follower - suppose we have processed a write group and this follower needs to be handed leadership
-                        // to process the next group
+            harness.wait_until_published();
+            harness.resume();
 
-                        let f = unsafe { &*f };
+            harness.wait_until_state(WriterState::LOCKED_WAITING);
 
-                        while f.state.load(Ordering::Acquire) & WriterState::LOCKED_WAITING == 0 {
-                            std::hint::spin_loop();
-                        }
+            // Test writer being woken after changing it's state to leader
+            harness.promote();
 
-                        f.state.fetch_or(WriterState::LEADER, Ordering::Release);
-                        f.thread_handle.unpark();
-                        break;
-                    }
-                }
-                //
-            });
-
-            let batch = Batch::new();
-            let writer = Writer::new(&batch);
-            follower.store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
-
-            writer.wait_and_block();
-
-            // assert woke as leader not complete
-            assert!(writer.state.load(Ordering::Acquire) & WriterState::LEADER != 0);
-            assert!(writer.state.load(Ordering::Acquire) & WriterState::COMPLETE == 0);
+            harness.wait_until_state(WriterState::LEADER);
+            assert!(harness.writer().state.load(Ordering::Acquire) & WriterState::LEADER != 0);
         });
     }
+
+    // TODO: Once we have TEST_SYNC_POINTS - want to test wait() levels
 }

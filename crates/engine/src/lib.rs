@@ -11,3 +11,11 @@ mod versioning;
 pub mod block;
 pub mod tests;
 pub mod utils;
+
+mod sync {
+    #[cfg(feature = "loom")]
+    pub use loom::sync::atomic::*;
+
+    #[cfg(not(feature = "loom"))]
+    pub use std::sync::atomic::*;
+}

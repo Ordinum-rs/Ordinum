@@ -1,38 +1,3 @@
-// db.write(batch)
-//     │
-//     ├─ create Writer node on stack
-//     ├─ join writer queue
-//     │
-//     ├─ if FOLLOWER
-//     │      block on condvar
-//     │      wake up when done
-//     │      return
-//     │
-//     └─ if LEADER
-//            form write group
-//            assign sequence numbers
-//            WAL write
-//            apply group to memtables
-//            signal followers
-//            return
-//
-//
-// Logic:
-// db_impl  — orchestrates the whole flow on the calling thread
-//    │
-//    ├── write_thread — just coordination, am I leader or follower?
-//    │                  if follower: block here until signalled
-//    │                  if leader: return and let caller thread do the work
-//    │
-//    └── if leader: caller thread continues executing through db_impl
-//                   accessing self directly for WAL, memtables, CFs
-//
-//
-// Leader Cutoff
-// The leader determines cutoff during batch formation based on compatibility and size limits,
-// and a new leader starts either when newest_writer_ is set to null
-// or when the next writer's state is explicitly set to STATE_GROUP_LEADER
-
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::{ptr, sync::atomic::AtomicPtr};
