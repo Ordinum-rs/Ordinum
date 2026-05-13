@@ -95,7 +95,13 @@ impl WriteThread {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(ptr) => return ptr.is_null(),
+                Ok(ptr) => {
+                    if ptr.is_null() {
+                        unsafe { (&*writer).set_leader() }
+                        return true;
+                    }
+                    return false;
+                }
                 Err(ptr) => {
                     current_newest_writer = ptr;
                     continue;
@@ -390,7 +396,6 @@ impl WriteThread {
         let linked_writer = self.link_writer(w);
 
         if linked_writer {
-            writer.set_leader();
             debug_assert!(writer.is_leader());
 
             let mut write_group = WriteGroup::new(w);
@@ -408,17 +413,102 @@ impl WriteThread {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::writer::WriterState;
+    use std::thread;
 
-    use super::*;
-    use std::hint::spin_loop;
-    use std::sync::atomic::{AtomicU8, Ordering};
-    use std::thread::{self};
+    use helpers::*;
+
+    mod helpers {
+
+        use super::*;
+        use crate::db::write_batch::Batch;
+        use crate::db::write_thread::WriteThread;
+        use crate::db::writer::Writer;
+        use crate::sync::AtomicPtr;
+        use std::ptr;
+        use std::sync::atomic::AtomicU8;
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::thread::{self, Scope, ScopedJoinHandle};
+
+        pub(super) struct Gate {
+            open: Mutex<bool>,
+            cv: Condvar,
+        }
+
+        impl Gate {
+            fn wait(&self) {
+                let mut open = self.open.lock().unwrap();
+                while !*open {
+                    open = self.cv.wait(open).unwrap();
+                }
+            }
+
+            fn open(&self) {
+                *self.open.lock().unwrap() = true;
+                self.cv.notify_all();
+            }
+        }
+
+        pub(super) struct WriteHandle<'scope> {
+            scope: ScopedJoinHandle<'scope, ()>,
+            ptr: Arc<AtomicPtr<Writer>>,
+            reached: Arc<AtomicU8>,
+            start: Arc<Gate>,
+            finish: Arc<Gate>,
+        }
+
+        pub(super) struct Harness {
+            write_thread: WriteThread,
+            // TODO: Add sync points
+        }
+
+        impl Harness {
+            pub(super) fn new() -> Self {
+                Self {
+                    write_thread: WriteThread {
+                        newest_writer: AtomicPtr::new(ptr::null_mut()),
+                    },
+                }
+            }
+
+            pub(super) fn spawn_writer<'scope>(
+                &'_ self,
+                thread_scope: &'scope Scope<'scope, '_>,
+            ) -> &WriteHandle<'scope> {
+                thread_scope.spawn(move || {
+                    let batch = Batch::new();
+                    let writer = Writer::new(&batch);
+                });
+
+                unimplemented!()
+            }
+        }
+    }
 
     // Test Phases
     // 1 - Pure single-threaded intrusive list tests
     // 2 - Test sync points
     // 3 - Loom for smaller concurrency scope
+    //
+
+    #[test]
+    fn leader_election() {
+        // NOTE: Although we have a linked list of writers in here outside of thread scope - this should not be used to dereference writer pointers
+        // as in production the write_thread will form a write group which will take the writers from the global list and process them in scope
+        // so the global list should be replaced with ptr::null_mut() (or newest writers) on start of a write
+        let h = Harness::new();
+
+        thread::scope(move |s| {
+            //
+            // writer handle and ptr should not be able to escape this scope
+            let w1 = h.spawn_writer(s);
+            let w2 = h.spawn_writer(s);
+            //
+            //
+            //
+        });
+
+        //
+    }
 
     #[test]
     fn leader_handoff() {

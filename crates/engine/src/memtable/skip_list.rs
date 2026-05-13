@@ -475,14 +475,14 @@ impl SkipList {
                         pred = curr;
                         curr = Node::load_next(pred, level, Ordering::Relaxed);
                     }
-                    // Ord::Equal => {
-                    //     t.searched_node = Some(unsafe { NonNull::new_unchecked(curr) });
-                    //     break;
-                    // }
-                    // Ord::Greater => {
-                    //     println!("greater - curr: {:?}", curr);
-                    //     break;
-                    // }
+                    Ord::Equal => {
+                        t.searched_node = Some(unsafe { NonNull::new_unchecked(curr) });
+                        break;
+                    }
+                    Ord::Greater => {
+                        println!("greater - curr: {:?}", curr);
+                        break;
+                    }
                     _ => {
                         break;
                     }
@@ -825,6 +825,10 @@ mod tests {
     use super::*;
     use mem::allocator::*;
     use mem::arena::*;
+
+    mod helpers {}
+
+    //TODO: Add concurrent loom tests
 
     #[test]
     fn basic_node_layout() {

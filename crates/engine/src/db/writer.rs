@@ -200,98 +200,106 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::{AtomicBool, AtomicPtr};
-    use std::{
-        thread::{Scope, ScopedJoinHandle, scope},
-        time::Duration,
-    };
+    use helpers::*;
 
     use super::*;
 
-    // Local Test Harness (Helpers)
-    //
-    #[derive(Copy, Clone)]
-    enum BlockMode {
-        Block,
-        Wait,
-    }
+    mod helpers {
+        use super::*;
+        use crate::sync::{AtomicBool, AtomicPtr};
+        use std::thread::{Scope, ScopedJoinHandle, scope};
 
-    enum Checkpoint {
-        Init,
-        Published,
-        ReleasedToWait,
-    }
-
-    struct Harness {
-        writer: AtomicPtr<Writer>,
-        check_point: AtomicU8,
-    }
-
-    impl Harness {
-        fn new() -> Self {
-            Self {
-                writer: AtomicPtr::new(ptr::null_mut()),
-                check_point: AtomicU8::new(Checkpoint::Init as u8),
-            }
+        // Local Test Harness (Helpers)
+        //
+        #[derive(Copy, Clone)]
+        pub(super) enum BlockMode {
+            Block,
+            Wait,
         }
 
-        fn writer(&self) -> &Writer {
-            unsafe {
-                self.writer
-                    .load(Ordering::Acquire)
-                    .as_ref()
-                    .expect("writer not published")
-            }
+        pub(super) enum Checkpoint {
+            Init,
+            Published,
+            ReleasedToWait,
         }
 
-        fn spawn_writer<'scope>(&'scope self, s: &'scope Scope<'scope, '_>, block_mode: BlockMode) {
-            s.spawn(move || {
-                let batch = Batch::new();
-                let writer = Writer::new(&batch);
+        pub(super) struct Harness {
+            writer: AtomicPtr<Writer>,
+            check_point: AtomicU8,
+        }
 
-                self.writer
-                    .store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
+        impl Harness {
+            pub(super) fn new() -> Self {
+                Self {
+                    writer: AtomicPtr::new(ptr::null_mut()),
+                    check_point: AtomicU8::new(Checkpoint::Init as u8),
+                }
+            }
 
-                self.check_point
-                    .store(Checkpoint::Published as u8, Ordering::Release);
+            pub(super) fn writer(&self) -> &Writer {
+                unsafe {
+                    self.writer
+                        .load(Ordering::Acquire)
+                        .as_ref()
+                        .expect("writer not published")
+                }
+            }
 
-                while self.check_point.load(Ordering::Acquire) != Checkpoint::ReleasedToWait as u8 {
+            pub(super) fn spawn_writer<'scope>(
+                &'scope self,
+                s: &'scope Scope<'scope, '_>,
+                block_mode: BlockMode,
+            ) {
+                s.spawn(move || {
+                    let batch = Batch::new();
+                    let writer = Writer::new(&batch);
+
+                    self.writer
+                        .store(ptr::from_ref(&writer).cast_mut(), Ordering::Release);
+
+                    self.check_point
+                        .store(Checkpoint::Published as u8, Ordering::Release);
+
+                    while self.check_point.load(Ordering::Acquire)
+                        != Checkpoint::ReleasedToWait as u8
+                    {
+                        std::hint::spin_loop();
+                    }
+
+                    match block_mode {
+                        BlockMode::Block => writer.wait_and_block(),
+                        BlockMode::Wait => writer.wait(),
+                    }
+                });
+            }
+
+            pub(super) fn wait_until_published(&self) {
+                while self.check_point.load(Ordering::Acquire) != Checkpoint::Published as u8 {
                     std::hint::spin_loop();
                 }
-
-                match block_mode {
-                    BlockMode::Block => writer.wait_and_block(),
-                    BlockMode::Wait => writer.wait(),
-                }
-            });
-        }
-
-        fn wait_until_published(&self) {
-            while self.check_point.load(Ordering::Acquire) != Checkpoint::Published as u8 {
-                std::hint::spin_loop();
             }
-        }
 
-        fn complete(&self) {
-            let w = self.writer();
-            w.set_complete();
-            w.thread_handle.unpark();
-        }
+            pub(super) fn complete(&self) {
+                let w = self.writer();
+                w.set_complete();
+                w.thread_handle.unpark();
+            }
 
-        fn promote(&self) {
-            let w = self.writer();
-            w.set_leader();
-            w.thread_handle.unpark();
-        }
+            pub(super) fn promote(&self) {
+                let w = self.writer();
+                w.set_leader();
+                w.thread_handle.unpark();
+            }
 
-        fn resume(&self) {
-            self.check_point
-                .store(Checkpoint::ReleasedToWait as u8, Ordering::Release);
-        }
+            pub(super) fn resume(&self) {
+                self.check_point
+                    .store(Checkpoint::ReleasedToWait as u8, Ordering::Release);
+            }
 
-        fn wait_until_state(&self, state: u8) {
-            while self.writer().state.load(Ordering::Acquire) & state == 0 {
-                std::hint::spin_loop();
+            pub(super) fn wait_until_state(&self, state: u8) {
+                while self.writer().state.load(Ordering::Acquire) & state == 0 {
+                    std::hint::spin_loop();
+                }
             }
         }
     }
