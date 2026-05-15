@@ -13,10 +13,13 @@
 // b.commit(b) // commit moves batch into it's scope and transitions state
 //
 
+use std::ops::Deref;
+use std::ptr;
 use std::ptr::NonNull;
 use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
+use crate::db::write_batch::Batch;
 use crate::db::{self, db_impl::DbImpl};
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
@@ -49,9 +52,13 @@ impl Batch<UnCommitted> {
             inner: batch,
         }
     }
+
+    pub(crate) fn as_ref(&self) -> &BatchInner {
+        &self.inner
+    }
 }
 
-struct BatchInner {
+pub(super) struct BatchInner {
     data: Vec<u8>,
     max_batch_size: usize,
     count: u64,

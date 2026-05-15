@@ -12,6 +12,12 @@ pub(crate) struct CachePadded<T> {
     value: T,
 }
 
+impl<T> CachePadded<T> {
+    pub(crate) fn new(t: T) -> Self {
+        Self { value: t }
+    }
+}
+
 unsafe impl<T> Send for CachePadded<T> {}
 unsafe impl<T> Sync for CachePadded<T> {}
 
