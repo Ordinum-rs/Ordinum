@@ -192,6 +192,17 @@ pub(super) struct MemtableInner {
     skiplist: SkipList,
 }
 
+// SAFETY:
+//
+// All node memory is arena-backed and never moved.
+// Nodes are only reclaimed when the memtable is dropped.
+// Forward links are atomic.
+// Insert/search operations use proper memory ordering.
+// No mutable references to nodes are exposed externally.
+//
+unsafe impl Send for MemtableInner {}
+unsafe impl Sync for MemtableInner {}
+
 impl Display for MemtableInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

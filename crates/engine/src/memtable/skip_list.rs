@@ -249,6 +249,7 @@ impl Node {
     }
 }
 
+// TODO: Remove this and use the utils::cache_padded instead
 // NOTE:
 // For the SkipList we want to make sure that certain fields which are concurrently accessed often are given their own cache line
 // A great explanation and gathering of sources is in crossbema -> https://github.com/crossbeam-rs/crossbeam/blob/master/crossbeam-utils/src/cache_padded.rs#L150
@@ -480,7 +481,6 @@ impl SkipList {
                         break;
                     }
                     Ord::Greater => {
-                        println!("greater - curr: {:?}", curr);
                         break;
                     }
                     _ => {

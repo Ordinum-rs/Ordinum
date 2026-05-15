@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
 
+    use crate::iterator::internal_iterator::InternalIterator;
     use crate::key::comparator::InternalKeyComparator;
     use crate::key::internal_key::OperationType;
     use crate::key::lookup_key::{LookUpInternalKey, LookUpKey};
@@ -44,6 +45,113 @@ mod tests {
         let search_key: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 3, OperationType::Max);
         let result = mem.get(search_key.as_ref());
         assert!(matches!(result, MemReturn::Value(b"value_3")));
+    }
+
+    #[test]
+    fn memtable_concurrent_writers_same_key() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const THREADS: u64 = 8;
+        const OPS_PER_THREAD: u64 = 100;
+        const MAX_SEQ: u64 = (1 << 56) - 1;
+
+        let mem = Arc::new(Memtable::new(
+            0,
+            ArenaPolicy {
+                block_size: 1024 * 64,
+                cap: 1024 * 1024,
+            },
+            Allocator::System(SystemAllocator::new()),
+            InternalKeyComparator::new(),
+        ));
+
+        thread::scope(|scope| {
+            for t in 0..THREADS {
+                let mem = mem.clone();
+
+                scope.spawn(move || {
+                    for i in 0..OPS_PER_THREAD {
+                        let seq = (t * OPS_PER_THREAD) + i + 1;
+
+                        let key = LookUpInternalKey::new(b"51.1.User1001", seq, OperationType::Put);
+
+                        let value = format!("value_{seq}");
+
+                        mem.insert(key.as_ref(), value.as_bytes());
+                    }
+                });
+            }
+        });
+
+        //
+        // 1. Walk the whole skiplist.
+        //    This tells us if nodes vanished or ordering is broken.
+        //
+        let mut iter = mem.iter();
+        iter.seek_to_first();
+
+        let expected_total = THREADS * OPS_PER_THREAD;
+
+        let mut count = 0;
+        let mut previous_seq = u64::MAX;
+
+        while iter.valid() {
+            let internal = iter.internal_key().unwrap();
+
+            // Must be strictly descending for same user key
+            assert!(
+                internal.seq_no < previous_seq,
+                "skiplist ordering corrupted: {} came after {}",
+                internal.seq_no,
+                previous_seq,
+            );
+
+            previous_seq = internal.seq_no;
+
+            count += 1;
+
+            iter.next();
+        }
+
+        // No lost nodes
+        assert_eq!(count, expected_total, "lost nodes during concurrent insert",);
+
+        //
+        // 2. Latest version must be highest sequence.
+        //
+        let search_key = LookUpInternalKey::new(b"51.1.User1001", MAX_SEQ, OperationType::Max);
+
+        let result = mem.get(search_key.as_ref());
+
+        let expected_latest = format!("value_{expected_total}");
+
+        assert!(
+            matches!(
+                result,
+                MemReturn::Value(v) if v == expected_latest.as_bytes()
+            ),
+            "latest version lookup returned wrong value",
+        );
+
+        //
+        // 3. Snapshot lookup in middle of version chain.
+        //
+        let snapshot_seq = 250;
+
+        let search_key = LookUpInternalKey::new(b"51.1.User1001", snapshot_seq, OperationType::Max);
+
+        let result = mem.get(search_key.as_ref());
+
+        let expected_snapshot = format!("value_{snapshot_seq}");
+
+        assert!(
+            matches!(
+                result,
+                MemReturn::Value(v) if v == expected_snapshot.as_bytes()
+            ),
+            "snapshot lookup returned wrong value",
+        );
     }
 
     #[test]
