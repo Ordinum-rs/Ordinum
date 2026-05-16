@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::db::{
-    write_batch::Batch,
+    write_batch::WBatch,
     write_thread::{WriteGroup, WriteThread},
 };
 
@@ -62,7 +62,7 @@ impl WriterState {
 ///
 /// Caller must guarantee batch outlives this Writer
 pub(crate) struct Writer {
-    pub(super) batch: NonNull<Batch>,
+    pub(super) batch: NonNull<WBatch>,
     pub(super) state: AtomicU8,
     // Writers which entered the queue before this Writer [newest_writer -> W3 -> W2 -> W1 -> leader]
     pub(super) link_older: UnsafeCell<*mut Writer>,
@@ -101,7 +101,7 @@ pub(crate) struct Writer {
 unsafe impl Sync for Writer {}
 
 impl Writer {
-    pub(crate) fn new(batch: &Batch) -> Self {
+    pub(crate) fn new(batch: &WBatch) -> Self {
         Self {
             batch: NonNull::from(batch),
             state: AtomicU8::new(WriterState::INIT),
@@ -251,7 +251,7 @@ mod tests {
                 block_mode: BlockMode,
             ) {
                 s.spawn(move || {
-                    let batch = Batch::new();
+                    let batch = WBatch::new();
                     let writer = Writer::new(&batch);
 
                     self.writer

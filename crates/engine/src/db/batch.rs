@@ -16,24 +16,30 @@
 use std::ops::Deref;
 use std::ptr;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
-use crate::db::write_batch::Batch;
+use crate::db::write_batch::WBatch;
 use crate::db::{self, db_impl::DbImpl};
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
 
 pub(crate) trait BatchCommitState {}
+
 pub(crate) struct UnCommitted {}
+
 impl BatchCommitState for UnCommitted {}
+
 pub(crate) struct Sealed {}
+
 impl BatchCommitState for Sealed {}
 
 pub(crate) struct Batch<B: BatchCommitState> {
     state: PhantomData<B>,
     inner: BatchInner,
+    applied: AtomicBool,
 }
 
 impl Batch<UnCommitted> {
@@ -42,6 +48,7 @@ impl Batch<UnCommitted> {
         Self {
             state: PhantomData,
             inner: batch,
+            applied: AtomicBool::new(false),
         }
     }
 
@@ -50,11 +57,26 @@ impl Batch<UnCommitted> {
         Self {
             state: PhantomData,
             inner: batch,
+            applied: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn as_ref(&self) -> &BatchInner {
         &self.inner
+    }
+
+    pub(crate) fn seal(self) -> Batch<Sealed> {
+        Batch {
+            state: PhantomData,
+            inner: self.inner,
+            applied: self.applied,
+        }
+    }
+}
+
+impl Batch<Sealed> {
+    pub(crate) fn is_applied(&self, ordering: Ordering) -> bool {
+        self.applied.load(ordering)
     }
 }
 

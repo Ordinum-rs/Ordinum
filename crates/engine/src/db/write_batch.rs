@@ -131,7 +131,7 @@ impl BatchOpType {
     }
 }
 
-pub(crate) struct Batch {
+pub(crate) struct WBatch {
     data: Vec<u8>,
     // content_flags
     // protection_info
@@ -151,7 +151,7 @@ pub(crate) struct Batch {
 // TODO: Do we want apply_batch on the memtable? and then memtable can handle the insert and handle if direct or not
 //
 
-impl Batch {
+impl WBatch {
     //
     // As a default, a batch is initialised with 1KB (taken from Pebble - https://github.com/cockroachdb/pebble/blob/a3b8dfe9/batch.go#L38)
     pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn input_test() {
         let word = "word";
-        let mut batch = Batch::new();
+        let mut batch = WBatch::new();
 
         batch.put(word, "");
 

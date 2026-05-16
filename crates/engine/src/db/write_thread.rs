@@ -4,7 +4,7 @@ use std::{ptr, sync::atomic::AtomicPtr};
 
 use crate::db::writer::WriterState;
 
-use super::write_batch::Batch;
+use super::write_batch::WBatch;
 use super::writer::Writer;
 
 pub(crate) struct WriteGroup {
@@ -420,7 +420,7 @@ mod tests {
     mod helpers {
 
         use super::*;
-        use crate::db::write_batch::Batch;
+        use crate::db::write_batch::WBatch;
         use crate::db::write_thread::WriteThread;
         use crate::db::writer::Writer;
         use crate::sync::AtomicPtr;
@@ -475,7 +475,7 @@ mod tests {
                 thread_scope: &'scope Scope<'scope, '_>,
             ) -> &WriteHandle<'scope> {
                 thread_scope.spawn(move || {
-                    let batch = Batch::new();
+                    let batch = WBatch::new();
                     let writer = Writer::new(&batch);
                 });
 

@@ -1,4 +1,4 @@
-use crate::db::write_batch::Batch;
+use crate::db::write_batch::WBatch;
 
 use super::write_thread::WriteThread;
 use std::marker::PhantomData;
@@ -12,7 +12,7 @@ impl DbImpl {
     //
     //
     //
-    pub(crate) fn write(&self, batch: &Batch /* Other params? */) -> Result<(), ()> {
+    pub(crate) fn write(&self, batch: &WBatch /* Other params? */) -> Result<(), ()> {
         // What would i like?
         //
 

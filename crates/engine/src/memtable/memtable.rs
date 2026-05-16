@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::atomic::{AtomicU8, AtomicU16};
 
-use crate::db::write_batch::Batch;
+use crate::db::write_batch::WBatch;
 use crate::iterator::internal_iterator::InternalIterator;
 use crate::key::comparator::Comparator;
 use crate::key::internal_key::{InternalKeyRef, OperationType, encode_trailer};

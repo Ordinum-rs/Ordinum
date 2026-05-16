@@ -4,7 +4,7 @@
 
 use std::{
     array,
-    ptr::null_mut,
+    ptr::{NonNull, null_mut},
     sync::{
         Condvar, Mutex,
         atomic::{AtomicPtr, AtomicU64},
@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    db::batch::BatchInner,
+    db::batch::{Batch, BatchInner, Sealed},
     utils::{self, cache_padded::CachePadded},
 };
 
@@ -77,12 +77,17 @@ impl HeadTail {
 
 // Referencing
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9/commit.go#L24
+#[derive(Debug)]
 struct BatchQueue<const N: usize> {
     head_tail: CachePadded<AtomicU64>,
-    slots: [AtomicPtr<BatchInner>; N],
+    slots: [AtomicPtr<Batch<Sealed>>; N],
 }
 
 impl<const N: usize> BatchQueue<N> {
+    pub(crate) const fn size() -> usize {
+        N
+    }
+
     pub(crate) fn new() -> Self {
         assert!(N.is_power_of_two());
         assert!(N <= 1024); // TODO: Make constant MAX Queue size
@@ -90,6 +95,14 @@ impl<const N: usize> BatchQueue<N> {
             head_tail: CachePadded::new(AtomicU64::new(0)),
             slots: array::from_fn(|_| AtomicPtr::new(null_mut())),
         }
+    }
+
+    pub(crate) fn enqueue(&self, batch: NonNull<Batch<Sealed>>) {
+        //
+        //
+        //
+        // TODO: Finish queue logic
+        todo!()
     }
 }
 
@@ -107,6 +120,19 @@ pub(crate) struct WritePipeline {
     signal: Condvar,
 }
 
+impl WritePipeline {
+    pub(crate) fn new() -> Self {
+        Self {
+            batch_queue: BatchQueueDefault::new(),
+            batch_permits: AtomicU64::new(WRITE_PIPELINE_SIZE as u64),
+            mu: Mutex::new(()),
+            signal: Condvar::new(),
+        }
+    }
+
+    //
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ptr, thread};
@@ -116,11 +142,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn batch_size() {
+        assert_eq!(BatchQueue::<4>::size(), 4);
+    }
+
+    #[test]
     fn head_tail_masking() {
         let head = 2;
         let tail = 4;
 
-        let mut packed = HeadTail::pack(head, tail);
+        let packed = HeadTail::pack(head, tail);
 
         let (h, t) = packed.unpack();
         assert!(h == 2);
@@ -150,26 +181,20 @@ mod tests {
             // Batch 1
             s.spawn(|| {
                 //
-                let b1 = Batch::new();
+                let mut b1 = Batch::new().seal();
 
                 // We would be taking the mutex here after reserving space
-                global_queue.slots[0].store(
-                    ptr::from_ref(b1.as_ref()).cast_mut(),
-                    std::sync::atomic::Ordering::Release,
-                );
+                global_queue.slots[0].store(&raw mut b1, std::sync::atomic::Ordering::Release);
 
                 // Need to null global pointer
             });
 
             // Batch 2
             s.spawn(|| {
-                let b2 = Batch::new();
+                let mut b2 = Batch::new().seal();
 
                 // We would be taking the mutex here after reserving space
-                global_queue.slots[1].store(
-                    ptr::from_ref(b2.as_ref()).cast_mut(),
-                    std::sync::atomic::Ordering::Release,
-                );
+                global_queue.slots[1].store(&raw mut b2, std::sync::atomic::Ordering::Release);
                 //
 
                 // Need to null global pointer
