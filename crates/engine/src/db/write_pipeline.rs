@@ -4,10 +4,11 @@
 
 use std::{
     array,
+    hint::spin_loop,
     ptr::{NonNull, null_mut},
     sync::{
         Condvar, Mutex,
-        atomic::{AtomicPtr, AtomicU64},
+        atomic::{AtomicPtr, AtomicU64, Ordering},
     },
 };
 
@@ -20,6 +21,14 @@ use crate::{
 // We'd want this compile time constant but may want it also to configurable
 // CONFIG: Compile constant choices for config?
 pub(crate) const WRITE_PIPELINE_SIZE: usize = 64;
+
+//
+//
+// HeadTail
+// +-------------------+-------------------+
+// |   head (upper)    |   tail (lower)    |
+// +-------------------+-------------------+
+// 63                32 31                0
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeadTail(u64);
@@ -37,6 +46,14 @@ impl HeadTail {
     fn unpack(self) -> (u32, u32) {
         let head = ((self.0 >> Self::DEQUEUE_BITS) & Self::MASK) as u32;
         let tail = (self.0 & Self::MASK) as u32;
+
+        (head, tail)
+    }
+
+    #[inline(always)]
+    fn unpack_unchecked(packed: u64) -> (u32, u32) {
+        let head = ((packed >> Self::DEQUEUE_BITS) & Self::MASK) as u32;
+        let tail = (packed & Self::MASK) as u32;
 
         (head, tail)
     }
@@ -77,6 +94,27 @@ impl HeadTail {
 
 // Referencing
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9/commit.go#L24
+//
+/// BatchQueue is a bounded SPMC (single-producer, multi-consumer)
+/// ring buffer of commit-ready batches.
+///
+/// Producer-side invariants:
+/// - The queue itself does not synchronize producers.
+/// - The commit pipeline guarantees that only one producer may call
+///   `enqueue()` at a time (typically via the commit mutex).
+/// - The producer owns the slot at `head` until `head` is advanced,
+///   at which point ownership transfers to consumers.
+///
+/// Consumer-side invariants:
+/// - Consumers run lock-free and may concurrently inspect and dequeue
+///   published batches.
+/// - Consumers compete to atomically advance `tail` via CAS.
+/// - Once a consumer successfully claims a slot, it clears the slot,
+///   returning ownership back to the producer for reuse.
+///
+/// `head_tail` packs:
+/// - upper 32 bits: next logical head position (producer-owned)
+/// - lower 32 bits: oldest logical tail position (consumer-owned)
 #[derive(Debug)]
 struct BatchQueue<const N: usize> {
     head_tail: CachePadded<AtomicU64>,
@@ -84,6 +122,7 @@ struct BatchQueue<const N: usize> {
 }
 
 impl<const N: usize> BatchQueue<N> {
+    //
     pub(crate) const fn size() -> usize {
         N
     }
@@ -97,11 +136,35 @@ impl<const N: usize> BatchQueue<N> {
         }
     }
 
+    // Enqueueing into the BatchQueue should be done under a Mutex lock
     pub(crate) fn enqueue(&self, batch: NonNull<Batch<Sealed>>) {
-        //
-        //
-        //
-        // TODO: Finish queue logic
+        let (head, tail) = HeadTail::unpack_unchecked(self.head_tail.load(Ordering::Relaxed));
+
+        let slot_len = self.slots.len() as u32;
+
+        // Queue should not be full as we should have reserved space already - if it is we need to panic
+        if tail.wrapping_add(slot_len) == head {
+            panic!("Queue full - reservation failed")
+        }
+
+        let slot = &self.slots[((head & slot_len) - 1) as usize];
+
+        // Need to check if the slot is null - if is not, then another consumer is still processing and we must wait
+        if !slot.load(Ordering::Acquire).is_null() {
+            spin_loop();
+            //
+        }
+
+        // Once we're here we own the slot - all consumers are finished on it
+        slot.store(batch.as_ptr(), Ordering::Release);
+
+        // Increment the head for the next producer and trasnfers ownership to consumers which will see the newly published slot and be
+        // able to load it
+        self.head_tail
+            .fetch_add(1u64 << HeadTail::DEQUEUE_BITS, Ordering::Release);
+    }
+
+    pub(crate) fn dequeue_applied(&self) -> *const Batch<Sealed> {
         todo!()
     }
 }
@@ -147,6 +210,14 @@ mod tests {
     }
 
     #[test]
+    fn overflow() {
+        let head = 0;
+        let q_len = 0;
+
+        println!("{}", head & q_len - 1);
+    }
+
+    #[test]
     fn head_tail_masking() {
         let head = 2;
         let tail = 4;
@@ -156,6 +227,33 @@ mod tests {
         let (h, t) = packed.unpack();
         assert!(h == 2);
         assert!(t == 4);
+    }
+
+    #[test]
+    #[should_panic]
+    fn full_queue() {
+        // [B1, B2, B3, B4]
+        //  T            H
+        //
+        let ht = HeadTail::pack(5, 1);
+
+        let batch_q = BatchQueue::<4>::new();
+        batch_q.head_tail.store(ht.raw(), Ordering::Release);
+
+        let batch = Batch::new().seal();
+
+        batch_q.enqueue(unsafe { NonNull::new_unchecked(ptr::from_ref(&batch).cast_mut()) });
+    }
+
+    #[test]
+    fn enqueue_batch() {
+        let batch = Batch::new().seal();
+
+        let batch_q = BatchQueue::<4>::new();
+
+        batch_q.enqueue(batch.non_null_ptr());
+
+        // assert!(batch_q.slots[0].load(Ordering::Relaxed) == ptr::from_ref(&batch).cast_mut());
     }
 
     #[test]

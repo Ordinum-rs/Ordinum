@@ -78,6 +78,24 @@ impl Batch<Sealed> {
     pub(crate) fn is_applied(&self, ordering: Ordering) -> bool {
         self.applied.load(ordering)
     }
+
+    pub(crate) fn non_null_ptr(&self) -> NonNull<Self> {
+        // SAFETY:
+        //
+        // `ptr::from_ref(self)` produces a non-null pointer to `self`.
+        //
+        // Casting to `*mut` is sound because this does not create an
+        // exclusive `&mut Self`; it only produces a raw pointer for
+        // publication into the commit queue.
+        //
+        // The caller must uphold:
+        //
+        // - `self` remains alive for the duration of queue publication.
+        // - `self` is not moved after its pointer is published.
+        // - Any cross-thread mutation of `Batch<Sealed>` occurs only
+        //   through atomics or other synchronization primitives.
+        unsafe { NonNull::new_unchecked(ptr::from_ref(self).cast_mut()) }
+    }
 }
 
 pub(super) struct BatchInner {
