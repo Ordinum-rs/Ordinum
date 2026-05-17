@@ -5,7 +5,7 @@
 use std::{
     array,
     hint::spin_loop,
-    ptr::{NonNull, null_mut},
+    ptr::{self, NonNull, null_mut},
     sync::{
         Condvar, Mutex,
         atomic::{AtomicPtr, AtomicU64, Ordering},
@@ -140,14 +140,12 @@ impl<const N: usize> BatchQueue<N> {
     pub(crate) fn enqueue(&self, batch: NonNull<Batch<Sealed>>) {
         let (head, tail) = HeadTail::unpack_unchecked(self.head_tail.load(Ordering::Relaxed));
 
-        let slot_len = self.slots.len() as u32;
-
         // Queue should not be full as we should have reserved space already - if it is we need to panic
-        if tail.wrapping_add(slot_len) == head {
+        if tail.wrapping_add(N as u32) == head {
             panic!("Queue full - reservation failed")
         }
 
-        let slot = &self.slots[((head & slot_len) - 1) as usize];
+        let slot = &self.slots[(head & N as u32 - 1) as usize];
 
         // Need to check if the slot is null - if is not, then another consumer is still processing and we must wait
         if !slot.load(Ordering::Acquire).is_null() {
@@ -164,8 +162,44 @@ impl<const N: usize> BatchQueue<N> {
             .fetch_add(1u64 << HeadTail::DEQUEUE_BITS, Ordering::Release);
     }
 
-    pub(crate) fn dequeue_applied(&self) -> *const Batch<Sealed> {
-        todo!()
+    // try_dequeue attempts to remove the oldest batch in the queue and advance the tail if the batch is applied
+    //
+    // If an earlier batch is not yet applied or the queue is empty then we return nil
+    pub(crate) fn try_dequeue(&self) -> *mut Batch<Sealed> {
+        //
+        let mut ht = HeadTail::from_raw(self.head_tail.load(Ordering::Acquire)).raw();
+
+        loop {
+            let (head, tail) = HeadTail::unpack_unchecked(ht);
+            if tail == head {
+                return ptr::null_mut();
+            }
+
+            // Get the slot
+            let slot = &self.slots[(tail & N as u32 - 1) as usize];
+            let batch = slot.load(Ordering::Acquire);
+
+            // If batch is null then it has been dequeue by another, if the batch is not yet applied then it is not ready
+            if batch.is_null() || !unsafe { &*batch }.is_applied(Ordering::Acquire) {
+                return ptr::null_mut();
+            }
+
+            let new_ht = HeadTail::pack(head, tail.wrapping_add(1)).raw();
+
+            match self
+                .head_tail
+                .compare_exchange(ht, new_ht, Ordering::AcqRel, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    // We won ownership of this tail slot. Clearing the slot returns
+                    // physical slot ownership to the producer so it may be reused
+                    // after wraparound.
+                    slot.store(ptr::null_mut(), Ordering::Release);
+                    return batch;
+                }
+                Err(actual_ht) => ht = actual_ht,
+            }
+        }
     }
 }
 
@@ -203,6 +237,26 @@ mod tests {
     use crate::db::batch::Batch;
 
     use super::*;
+
+    mod queue_harness {
+        use std::sync::Barrier;
+
+        use crate::db::write_pipeline::BatchQueue;
+
+        pub(super) struct Harness<const N: usize> {
+            queue: BatchQueue<N>,
+            barrier: Barrier,
+        }
+
+        impl<const N: usize> Harness<N> {
+            pub(super) fn new(thread_count: usize) -> Self {
+                Self {
+                    queue: BatchQueue::<N>::new(),
+                    barrier: Barrier::new(thread_count),
+                }
+            }
+        }
+    }
 
     #[test]
     fn batch_size() {
@@ -253,7 +307,9 @@ mod tests {
 
         batch_q.enqueue(batch.non_null_ptr());
 
-        // assert!(batch_q.slots[0].load(Ordering::Relaxed) == ptr::from_ref(&batch).cast_mut());
+        assert!(batch_q.slots[0].load(Ordering::Relaxed) == ptr::from_ref(&batch).cast_mut());
+        let (h, _) = HeadTail::unpack_unchecked(batch_q.head_tail.load(Ordering::Relaxed));
+        assert!(h == 1);
     }
 
     #[test]

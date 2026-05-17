@@ -32,51 +32,55 @@ pub(crate) struct UnCommitted {}
 
 impl BatchCommitState for UnCommitted {}
 
-pub(crate) struct Sealed {}
+pub(crate) struct Sealed {
+    applied: AtomicBool,
+    published: AtomicBool,
+    waiter: Thread,
+}
 
 impl BatchCommitState for Sealed {}
 
 pub(crate) struct Batch<B: BatchCommitState> {
-    state: PhantomData<B>,
+    state: B,
     inner: BatchInner,
-    applied: AtomicBool,
 }
 
 impl Batch<UnCommitted> {
     pub(crate) fn new() -> Self {
         let batch = BatchInner::new();
         Self {
-            state: PhantomData,
+            state: UnCommitted {},
             inner: batch,
-            applied: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn new_with_capacity(cap: usize) -> Self {
         let batch = BatchInner::new_with_capacity(cap);
         Self {
-            state: PhantomData,
+            state: UnCommitted {},
             inner: batch,
-            applied: AtomicBool::new(false),
         }
-    }
-
-    pub(crate) fn as_ref(&self) -> &BatchInner {
-        &self.inner
     }
 
     pub(crate) fn seal(self) -> Batch<Sealed> {
         Batch {
-            state: PhantomData,
+            state: Sealed {
+                applied: AtomicBool::new(false),
+                published: AtomicBool::new(false),
+                waiter: thread::current(),
+            },
             inner: self.inner,
-            applied: self.applied,
         }
     }
 }
 
 impl Batch<Sealed> {
     pub(crate) fn is_applied(&self, ordering: Ordering) -> bool {
-        self.applied.load(ordering)
+        self.state.applied.load(ordering)
+    }
+
+    pub(crate) fn is_published(&self, ordering: Ordering) -> bool {
+        self.state.published.load(ordering)
     }
 
     pub(crate) fn non_null_ptr(&self) -> NonNull<Self> {
@@ -104,7 +108,6 @@ pub(super) struct BatchInner {
     count: u64,
     flushable: bool, // NOTE: bool for now until we implement flushable batches
     runtime_commit_state: AtomicU8,
-    waiter: Thread,
     //
 }
 
@@ -121,7 +124,6 @@ impl BatchInner {
             count: 0,
             flushable: false,
             runtime_commit_state: AtomicU8::new(0),
-            waiter: thread::current(),
         }
     }
 
@@ -135,7 +137,6 @@ impl BatchInner {
             count: 0,
             flushable: false,
             runtime_commit_state: AtomicU8::new(0),
-            waiter: thread::current(),
         }
     }
 }
