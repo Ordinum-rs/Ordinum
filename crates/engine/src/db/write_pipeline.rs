@@ -165,23 +165,23 @@ impl<const N: usize> BatchQueue<N> {
     // try_dequeue attempts to remove the oldest batch in the queue and advance the tail if the batch is applied
     //
     // If an earlier batch is not yet applied or the queue is empty then we return nil
-    pub(crate) fn try_dequeue(&self) -> *mut Batch<Sealed> {
+    pub(crate) fn try_dequeue(&self) -> Option<NonNull<Batch<Sealed>>> {
         //
         let mut ht = HeadTail::from_raw(self.head_tail.load(Ordering::Acquire)).raw();
 
         loop {
             let (head, tail) = HeadTail::unpack_unchecked(ht);
             if tail == head {
-                return ptr::null_mut();
+                return None;
             }
 
             // Get the slot
-            let slot = &self.slots[(tail & N as u32 - 1) as usize];
+            let slot = &self.slots[(tail & (N as u32) - 1) as usize];
             let batch = slot.load(Ordering::Acquire);
 
             // If batch is null then it has been dequeue by another, if the batch is not yet applied then it is not ready
             if batch.is_null() || !unsafe { &*batch }.is_applied(Ordering::Acquire) {
-                return ptr::null_mut();
+                return None;
             }
 
             let new_ht = HeadTail::pack(head, tail.wrapping_add(1)).raw();
@@ -195,7 +195,7 @@ impl<const N: usize> BatchQueue<N> {
                     // physical slot ownership to the producer so it may be reused
                     // after wraparound.
                     slot.store(ptr::null_mut(), Ordering::Release);
-                    return batch;
+                    return Some(unsafe { NonNull::new_unchecked(batch) });
                 }
                 Err(actual_ht) => ht = actual_ht,
             }
@@ -206,11 +206,23 @@ impl<const N: usize> BatchQueue<N> {
 // NOTE: Think about this more - needs to be cleaner
 pub(crate) type BatchQueueDefault = BatchQueue<WRITE_PIPELINE_SIZE>;
 
+/// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
+/// Batches are queued into a Single-Producer-Multi-Consumer queue and committed through stages of a state machine
+///
+/// 1 - Synchronised Producers enqueue to preserve order
+/// 2 - Sequence numbers are reserved and assigned to batches
+/// 3 - Batches are written to the WAL
+/// 4 - Caller threads concurrently insert their batches into memtables
+/// 5 - Batches are made visible to Readers by dequeuing batches that have been applied whilst retaining order
+///
+/// Maintaining order is the key. Batches with a higher sequence number that are applied sooner than those with a lesser sequence number in the queue will not
+/// be dequeued but must wait until previous batches in the queue have completed and made their sequence numbers visible to readers
+/// This preserves the logical ordering of data which is committed and applied to the database
+///
+/// DOCS: Continue to work on the DOC
 pub(crate) struct WritePipeline {
     batch_queue: BatchQueueDefault,
     batch_permits: AtomicU64,
-
-    // NOTE: Need some sort of capacity reservation for batch queue
 
     //
     mu: Mutex<()>,
@@ -227,6 +239,24 @@ impl WritePipeline {
         }
     }
 
+    // TODO: Need try_acquire_token()
+    // TODO: Need wait()
+
+    pub(crate) fn commit(
+        &self,
+        batch: NonNull<Batch<Sealed>>,
+        sync_wal: bool, /* NOTE: can possibly use options struct or config here */
+    ) -> Result<(), ()> {
+        // NOTE: Any assertions here?
+
+        // Need to try_acquire a token - if not we wait()
+
+        //
+        //
+        //
+        todo!()
+    }
+
     //
 }
 
@@ -234,41 +264,171 @@ impl WritePipeline {
 mod tests {
     use std::{ptr, thread};
 
-    use crate::db::batch::Batch;
+    use crate::db::{batch::Batch, write_pipeline::tests::queue_harness::Harness};
 
     use super::*;
 
     mod queue_harness {
-        use std::sync::Barrier;
+        use std::{
+            ptr::NonNull,
+            sync::{Condvar, Mutex},
+            thread::{self, Scope, ScopedJoinHandle},
+        };
 
-        use crate::db::write_pipeline::BatchQueue;
+        use crate::db::{
+            batch::{Batch, Sealed},
+            write_pipeline::BatchQueue,
+        };
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(super) enum Stage {
+            Init,
+            Enqueued,
+            Ready,
+            Done,
+        }
+
+        #[derive(Debug)]
+        struct GateState {
+            stages: Vec<Stage>,
+            permits: Vec<u64>,
+        }
 
         pub(super) struct Harness<const N: usize> {
-            queue: BatchQueue<N>,
-            barrier: Barrier,
+            pub(super) queue: BatchQueue<N>,
+            mu: Mutex<GateState>,
+            cv: Condvar,
+        }
+
+        #[derive(Debug)]
+        pub(super) struct ConsumerCtx {
+            pub(super) published: bool,
+            pub(super) applied: bool,
+            pub(super) self_dequeued: bool,
+            pub(super) did_dequeue: bool,
         }
 
         impl<const N: usize> Harness<N> {
-            pub(super) fn new(thread_count: usize) -> Self {
+            pub(super) fn new(writer_count: usize) -> Self {
                 Self {
                     queue: BatchQueue::<N>::new(),
-                    barrier: Barrier::new(thread_count),
+                    mu: Mutex::new(GateState {
+                        stages: vec![Stage::Init; writer_count],
+                        permits: vec![0u64; writer_count],
+                    }),
+                    cv: Condvar::new(),
                 }
+            }
+
+            fn set_stage(&self, id: usize, stage: Stage) {
+                let mut g = self.mu.lock().unwrap();
+                g.stages[id] = stage;
+                self.cv.notify_all();
+            }
+
+            pub(super) fn wait_until(&self, id: usize, stage: Stage) {
+                let mut g = self.mu.lock().unwrap();
+
+                while g.stages[id] != stage {
+                    g = self.cv.wait(g).unwrap();
+                }
+            }
+
+            pub(super) fn release(&self, id: usize) {
+                let mut g = self.mu.lock().unwrap();
+                g.permits[id] += 1;
+                self.cv.notify_all();
+            }
+
+            fn wait_released(&self, id: usize, permit: u64) {
+                let mut g = self.mu.lock().unwrap();
+
+                while g.permits[id] < permit {
+                    g = self.cv.wait(g).unwrap();
+                }
+            }
+
+            pub(super) fn spawn_batch<'scope, F, C>(
+                &'scope self,
+                scope: &'scope Scope<'scope, '_>,
+                id: usize,
+                config: C,
+                f: F,
+            ) -> ScopedJoinHandle<'scope, ConsumerCtx>
+            where
+                F: FnOnce(NonNull<Batch<Sealed>>, &BatchQueue<N>) -> Option<NonNull<Batch<Sealed>>>
+                    + Send
+                    + 'scope,
+                C: FnOnce(&Batch<Sealed>) + Send + 'scope,
+            {
+                scope.spawn(move || {
+                    let batch = Batch::new().seal();
+                    let b_ptr = batch.non_null_ptr();
+
+                    self.wait_released(id, 1);
+                    self.queue.enqueue(b_ptr);
+                    self.set_stage(id, Stage::Enqueued);
+
+                    config(&batch);
+
+                    self.wait_released(id, 2);
+                    self.set_stage(id, Stage::Ready);
+
+                    let r = f(b_ptr, &self.queue);
+
+                    let self_dq = matches!(r, Some(ptr) if ptr == b_ptr);
+
+                    self.set_stage(id, Stage::Done);
+
+                    ConsumerCtx {
+                        published: batch.is_published(std::sync::atomic::Ordering::Relaxed),
+                        applied: batch.is_applied(std::sync::atomic::Ordering::Relaxed),
+                        self_dequeued: self_dq,
+                        did_dequeue: r.is_some(),
+                    }
+                })
             }
         }
     }
 
     #[test]
-    fn batch_size() {
-        assert_eq!(BatchQueue::<4>::size(), 4);
+    fn two_consumers_race_dequeue() {
+        //
+        let h = Harness::<2>::new(2);
+
+        thread::scope(|s| {
+            let b1 = h.spawn_batch(
+                s,
+                0,
+                |b| {
+                    b.mark_applied(Ordering::Relaxed);
+                },
+                |ptr, q| q.try_dequeue(),
+            );
+            let b2 = h.spawn_batch(s, 1, |_| {}, |ptr, q| q.try_dequeue());
+
+            h.release(0);
+            h.wait_until(0, queue_harness::Stage::Enqueued);
+
+            h.release(1);
+            h.wait_until(1, queue_harness::Stage::Enqueued);
+
+            h.release(0);
+            h.release(1);
+
+            let r1 = b1.join().unwrap();
+            let r2 = b2.join().unwrap();
+
+            // B1 should have applied and dequeued successfully while B2 should not have
+
+            assert!(r1.did_dequeue == true);
+            assert!(r2.did_dequeue == false);
+        })
     }
 
     #[test]
-    fn overflow() {
-        let head = 0;
-        let q_len = 0;
-
-        println!("{}", head & q_len - 1);
+    fn batch_size() {
+        assert_eq!(BatchQueue::<4>::size(), 4);
     }
 
     #[test]

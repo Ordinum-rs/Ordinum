@@ -79,6 +79,10 @@ impl Batch<Sealed> {
         self.state.applied.load(ordering)
     }
 
+    pub(crate) fn mark_applied(&self, ordering: Ordering) {
+        self.state.applied.store(true, ordering);
+    }
+
     pub(crate) fn is_published(&self, ordering: Ordering) -> bool {
         self.state.published.load(ordering)
     }
