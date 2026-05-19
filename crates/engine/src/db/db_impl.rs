@@ -1,11 +1,12 @@
-use crate::db::write_batch::WBatch;
+use crate::{column_family::cf::ColumnFamilyData, db::write_batch::WBatch};
 
 use super::write_thread::WriteThread;
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
 
 pub(crate) struct DbImpl {
     _p: PhantomData<()>,
     write_thread: WriteThread,
+    cf_data: Arc<ColumnFamilyData>,
 }
 
 impl DbImpl {

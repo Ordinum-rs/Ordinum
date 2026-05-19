@@ -5,6 +5,7 @@
 use std::sync::{Arc, atomic::AtomicPtr};
 
 use crate::{
+    column_family::cf_options::CFOptions,
     memtable::memtable::{Memtable, Mutable},
     versioning::{memtable_list::MemTableList, superversion::Superversion},
 };
@@ -15,6 +16,7 @@ pub(crate) struct ColumnFamilySet {}
 pub(crate) struct ColumnFamilyData {
     id: u64,
     name: String,
+    options: CFOptions,
     //
     // Write Path
     mem: Memtable<Mutable>,

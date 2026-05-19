@@ -14,13 +14,9 @@ use std::{
 
 use crate::{
     db::batch::{Batch, BatchInner, Sealed},
+    db::options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     utils::{self, cache_padded::CachePadded},
 };
-
-// NOTE:
-// We'd want this compile time constant but may want it also to configurable
-// CONFIG: Compile constant choices for config?
-pub(crate) const WRITE_PIPELINE_SIZE: usize = 64;
 
 //
 //
@@ -91,6 +87,9 @@ impl HeadTail {
 // Non Null  = Consumer Owns Slot
 //
 //
+
+// XXX: Later we may want to move this to a configurable type
+pub(crate) type BatchQueueDefault = BatchQueue<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE>;
 
 // Referencing
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9/commit.go#L24
@@ -203,9 +202,6 @@ impl<const N: usize> BatchQueue<N> {
     }
 }
 
-// NOTE: Think about this more - needs to be cleaner
-pub(crate) type BatchQueueDefault = BatchQueue<WRITE_PIPELINE_SIZE>;
-
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
 /// Batches are queued into a Single-Producer-Multi-Consumer queue and committed through stages of a state machine
 ///
@@ -233,7 +229,7 @@ impl WritePipeline {
     pub(crate) fn new() -> Self {
         Self {
             batch_queue: BatchQueueDefault::new(),
-            batch_permits: AtomicU64::new(WRITE_PIPELINE_SIZE as u64),
+            batch_permits: AtomicU64::new(DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE as u64),
             mu: Mutex::new(()),
             signal: Condvar::new(),
         }

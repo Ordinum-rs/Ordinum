@@ -20,8 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
+use crate::db::DEFAULT_CF_ID;
 use crate::db::write_batch::WBatch;
 use crate::db::{self, db_impl::DbImpl};
+use crate::utils::var_int::VarInt;
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
@@ -32,10 +34,6 @@ pub(crate) struct UnCommitted {}
 
 impl BatchCommitState for UnCommitted {}
 
-pub(crate) struct Flushable {}
-
-impl BatchCommitState for Flushable {}
-
 pub(crate) struct Sealed {
     applied: AtomicBool,
     published: AtomicBool,
@@ -44,9 +42,57 @@ pub(crate) struct Sealed {
 
 impl BatchCommitState for Sealed {}
 
+#[repr(align(8))]
+#[derive(Debug)]
+pub(crate) enum BatchOp {
+    Put,
+    Delete,
+    Merge,
+    // XXX: More operations in later updates
+}
+
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 //
+// Batch:
+// | --------- 12 byte header ----------|--------- Operations ---------|
+// | Seq No (8 bytes) | Count (4 bytes) | Operation 1 ... Operation 2...
+//
+//
+// Operation:
+// | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
 
+/// Batches use a compact binary representation where all operations are encoded sequentially into a byte slice
+/// the binary representation is so that batches can form the records of the WAL without any additional changes
+/// We are free to choose the endianness and for optimisation on x86 architectures we choose little endian here.
+/// This applies only to the structure of the batch i.e batch count, varint and column_family_id. For the internal key, we defer to the endianness it uses which is
+/// big endian for seq number comparison
+///
+/// A batch holds a set of operations to be committed atomically as part of the write path.
+/// Each operation is binary encoded and appended to a contiguous Vec<u8> buffer.
+/// The buffer begins with a 12-byte header:
+///   - 8 bytes: starting sequence number (assigned at commit time)
+///   - 4 bytes: operation count
+///
+/// Batches are created both implicitly (e.g. DB::put) and explicitly by users.
+///
+/// A single DB::put() creates a batch containing one operation, allowing the
+/// write path to uniformly operate on batches regardless of origin.
+///
+/// Example (Pseudo code):
+///
+/// ```
+/// DB::put("key1", "value1");
+///
+/// // Internally:
+///
+/// fn put(&self, key: &[u8], value: &[u8]) {
+///     let mut batch = Batch::new();
+///     batch.put(DEFAULT_CF, key, value);
+///     self.write(batch);
+/// }
+///
+/// ```
+///
 /// Batch holds a group of operations for a writer/caller thread. [Put, Delete, Merge ...].
 ///
 /// A batch should be 1:1 with a writer thread. A writer/caller should create a batch and push operations into the batch
@@ -63,6 +109,10 @@ pub(crate) struct Batch<B: BatchCommitState> {
 }
 
 impl Batch<UnCommitted> {
+    fn default_cf() -> VarInt {
+        VarInt::new(DEFAULT_CF_ID)
+    }
+
     pub(crate) fn new() -> Self {
         let batch = BatchInner::new();
         Self {
@@ -82,13 +132,26 @@ impl Batch<UnCommitted> {
         }
     }
 
-    pub(crate) fn estimate_size(&self) -> usize {
-        todo!()
+    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    // XXX: Do we want this to return a Result with an Error?
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        // Any assertions
+        self.put_cf(Self::default_cf(), key, value);
+    }
+
+    pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
+    // XXX: Result?
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        //
     }
 
     pub(crate) fn seal(self) -> Batch<Sealed> {
-        // Checks sizes for if flushable
-
         Batch {
             state: Sealed {
                 applied: AtomicBool::new(false),
@@ -96,16 +159,6 @@ impl Batch<UnCommitted> {
                 waiter: thread::current(),
             },
             inner: self.inner,
-        }
-    }
-
-    pub(crate) fn seal_batch(self) -> Batch<impl BatchCommitState> {
-        // match self.estimate_size() {
-        //      if
-        // }
-        Batch {
-            inner: self.inner,
-            state: Flushable {},
         }
     }
 }
@@ -145,6 +198,25 @@ impl Batch<Sealed> {
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct BatchInner {
     data: Vec<u8>,
+    /// The maximum total serialized size allowed for a single atomic WriteBatch.
+    ///
+    /// This limit is a global operational safety bound, not a memtable-fit constraint.
+    ///
+    /// A WriteBatch may span multiple column families, and its contents are applied
+    /// independently into each destination memtable. As a result, the total batch
+    /// size may legitimately exceed the configured write buffer size of any single
+    /// column family.
+    ///
+    /// This limit exists to:
+    /// - bound WAL write latency and recovery cost,
+    /// - prevent pathological memory pressure during commit/replay,
+    /// - avoid extremely large sequence reservations,
+    /// - preserve fairness for concurrent writers,
+    /// - and protect the write pipeline from oversized atomic operations.
+    ///
+    /// Memtable flush and large-batch heuristics are evaluated separately on a
+    /// per-column-family basis using the batch footprint for each destination
+    /// memtable.
     max_batch_size: usize,
     count: u64,
     flushable: bool, // NOTE: bool for now until we implement flushable batches
@@ -181,6 +253,15 @@ impl BatchInner {
         }
     }
 }
+
+// ---------------------- CF Grouping within Batch ---------------------- //
+//
+
+// A Batch can contain multiple column families appended in the log together - identified by their cf_id which is
+// encoded in the binary representation of an individual batch record
+
+// TODO: Research how CF's are grouped within a batch
+//
 
 #[cfg(test)]
 mod tests {
