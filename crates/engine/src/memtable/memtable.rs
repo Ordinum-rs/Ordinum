@@ -14,7 +14,6 @@ use crate::key::comparator::Comparator;
 use crate::key::internal_key::{InternalKeyRef, OperationType, encode_trailer};
 use crate::memtable::skip_list::{Iter, Node, SkipList};
 use mem::allocator::Allocator;
-use mem::arena::ArenaSize;
 use mem::arena::{Arena, ArenaPolicy};
 
 pub(crate) type MemID = u64;

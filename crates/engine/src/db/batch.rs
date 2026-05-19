@@ -32,6 +32,10 @@ pub(crate) struct UnCommitted {}
 
 impl BatchCommitState for UnCommitted {}
 
+pub(crate) struct Flushable {}
+
+impl BatchCommitState for Flushable {}
+
 pub(crate) struct Sealed {
     applied: AtomicBool,
     published: AtomicBool,
@@ -40,6 +44,19 @@ pub(crate) struct Sealed {
 
 impl BatchCommitState for Sealed {}
 
+// https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
+//
+
+/// Batch holds a group of operations for a writer/caller thread. [Put, Delete, Merge ...].
+///
+/// A batch should be 1:1 with a writer thread. A writer/caller should create a batch and push operations into the batch
+/// before calling Commit to have the batch processed by the [write_pipeline.rs]('WritePipeline').
+///
+/// Batches are stack allocated. Ownership of the Batch is moved into Commit and passed to the WritePipeline once it is Sealed. Writers should
+/// call Seal on the Batch to Commit.
+///
+/// Batches are safe to be accessed between threads because their lifetime is guranteed to outlive references and the stack allocation scope extends beyond
+/// the objects and references which may store or reference it.
 pub(crate) struct Batch<B: BatchCommitState> {
     state: B,
     inner: BatchInner,
@@ -56,13 +73,22 @@ impl Batch<UnCommitted> {
 
     pub(crate) fn new_with_capacity(cap: usize) -> Self {
         let batch = BatchInner::new_with_capacity(cap);
+
+        //
+
         Self {
             state: UnCommitted {},
             inner: batch,
         }
     }
 
+    pub(crate) fn estimate_size(&self) -> usize {
+        todo!()
+    }
+
     pub(crate) fn seal(self) -> Batch<Sealed> {
+        // Checks sizes for if flushable
+
         Batch {
             state: Sealed {
                 applied: AtomicBool::new(false),
@@ -70,6 +96,16 @@ impl Batch<UnCommitted> {
                 waiter: thread::current(),
             },
             inner: self.inner,
+        }
+    }
+
+    pub(crate) fn seal_batch(self) -> Batch<impl BatchCommitState> {
+        // match self.estimate_size() {
+        //      if
+        // }
+        Batch {
+            inner: self.inner,
+            state: Flushable {},
         }
     }
 }
@@ -106,6 +142,7 @@ impl Batch<Sealed> {
     }
 }
 
+// https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct BatchInner {
     data: Vec<u8>,
     max_batch_size: usize,
