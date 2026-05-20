@@ -1,4 +1,10 @@
-use crate::{column_family::cf::ColumnFamilyData, db::write_batch::WBatch};
+use crate::{
+    column_family::cf::ColumnFamilyData,
+    db::{
+        batch::{Batch, Sealed},
+        write_batch::WBatch,
+    },
+};
 
 use super::write_thread::WriteThread;
 use std::{marker::PhantomData, sync::Arc};
@@ -13,21 +19,16 @@ impl DbImpl {
     //
     //
     //
-    pub(crate) fn write(&self, batch: &WBatch /* Other params? */) -> Result<(), ()> {
-        // What would i like?
-        //
+    pub(crate) fn write(&self, batch: &Batch<Sealed> /* Other params? */) -> Result<(), ()> {
+        // Order of operations - process flow
 
-        // let writer = Writer::new(batch);
-        //
-        // self.write_thread.join(&writer);
-        //
-        // if writer.is_leader() {
-        //
-        // // We are leader
-        // // Continue with the write
-        //
-        // }
-        //
+        // validate the batch
+
+        // Does DB assertions and checks
+
+        // self.write_pipeline.commit(batch, /* Pass in writer trait? */)
+        // Inside commit
+        //      - Enqueue -> Prepare -> Call trait to insert WAL -> Call trait to insert memtable -> try_apply()
 
         Ok(())
     }

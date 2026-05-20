@@ -202,6 +202,35 @@ impl<const N: usize> BatchQueue<N> {
     }
 }
 
+// ------------------------- WriterEnv ------------------------- //
+//
+// The WriterEnv trait provides the boundary where the WritePipeline hands
+// execution back to the storage engine once commit ordering has been
+// established.
+//
+// Commit flow:
+//
+// 1. WritePipeline reserves queue capacity and establishes commit order
+// 2. Sequence numbers are reserved and assigned to the batch
+// 3. WriterEnv prepares storage state for the write
+//      - detect/write stall if necessary
+//      - rotate mutable memtables if required
+//      - append batch to WAL
+// 4. WriterEnv applies batch mutations into memtables
+// 5. WritePipeline publishes completed batches in sequence order
+//
+// This separation keeps the WritePipeline focused on ordering semantics
+// while allowing the DB layer to retain ownership of storage policy and
+// lifecycle management.
+
+// TODO: Finish the trait
+pub(crate) trait WriterEnv {
+    //
+    // fn prepare_commit(&BatchSealed>) -> Result<(),()>
+    //
+    // fn apply_commit(&BatchSealed>) -> Result<(),()>
+}
+
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
 /// Batches are queued into a Single-Producer-Multi-Consumer queue and committed through stages of a state machine
 ///
@@ -247,9 +276,15 @@ impl WritePipeline {
 
         // Need to try_acquire a token - if not we wait()
 
+        // Hand off to DB which will carry out the write
+
         //
         //
         //
+        todo!()
+    }
+
+    pub(crate) fn prepare_commit(&self, batch: NonNull<Batch<Sealed>>) -> Result<(), ()> {
         todo!()
     }
 

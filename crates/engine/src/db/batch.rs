@@ -254,15 +254,6 @@ impl BatchInner {
     }
 }
 
-// ---------------------- CF Grouping within Batch ---------------------- //
-//
-
-// A Batch can contain multiple column families appended in the log together - identified by their cf_id which is
-// encoded in the binary representation of an individual batch record
-
-// TODO: Research how CF's are grouped within a batch
-//
-
 #[cfg(test)]
 mod tests {
     use super::*;

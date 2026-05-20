@@ -186,6 +186,7 @@ pub(super) struct MemtableInner {
     highest_seqno: AtomicU64,
     size: AtomicU64,
     requested_rotation: AtomicBool,
+    // NOTE: May want in-flight writers to drain when moving to freezing
     lifecycle: AtomicU8,
     arena: Arena,
     skiplist: SkipList,
