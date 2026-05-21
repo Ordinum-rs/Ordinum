@@ -221,6 +221,8 @@ pub(super) struct BatchInner {
     count: u64,
     flushable: bool, // NOTE: bool for now until we implement flushable batches
     runtime_commit_state: AtomicU8,
+    // NOTE:
+    // Need inline array for touched column families in this batch
     //
 }
 

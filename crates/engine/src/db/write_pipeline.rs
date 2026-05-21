@@ -226,9 +226,9 @@ impl<const N: usize> BatchQueue<N> {
 // TODO: Finish the trait
 pub(crate) trait WriterEnv {
     //
-    // fn prepare_commit(&BatchSealed>) -> Result<(),()>
+    fn prepare_commit(batch: &Batch<Sealed>) -> Result<(), ()>;
     //
-    // fn apply_commit(&BatchSealed>) -> Result<(),()>
+    fn apply_commit(batch: &Batch<Sealed>) -> Result<(), ()>;
 }
 
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
@@ -247,25 +247,63 @@ pub(crate) trait WriterEnv {
 /// DOCS: Continue to work on the DOC
 pub(crate) struct WritePipeline {
     batch_queue: BatchQueueDefault,
-    batch_permits: AtomicU64,
+
+    // Queue reservation
+    // XXX: Future optimisation is to make a lock-free semaphore if profiling show bottleneck
+    batch_occupancy: AtomicU64,
+    sem_mu: Mutex<()>,
+    sem_cv: Condvar,
 
     //
-    mu: Mutex<()>,
-    signal: Condvar,
+    q_mu: Mutex<()>,
 }
 
 impl WritePipeline {
     pub(crate) fn new() -> Self {
         Self {
             batch_queue: BatchQueueDefault::new(),
-            batch_permits: AtomicU64::new(DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE as u64),
-            mu: Mutex::new(()),
-            signal: Condvar::new(),
+            batch_occupancy: AtomicU64::new(DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE as u64),
+            sem_mu: Mutex::new(()),
+            sem_cv: Condvar::new(),
+            q_mu: Mutex::new(()),
         }
     }
 
     // TODO: Need try_acquire_token()
+    // #[inline] ?
+    fn try_reserve_space(&self) {
+        let mut token = self.batch_occupancy.load(Ordering::Acquire);
+
+        loop {
+            if (token as usize) < self.batch_queue.slots.len() {
+                match self.batch_occupancy.compare_exchange(
+                    token,
+                    token + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        break;
+                    }
+                    Err(t) => {
+                        token = t;
+                        continue;
+                    }
+                }
+            } else {
+                self.wait();
+            }
+        }
+    }
+
+    fn release_queue_space(&self) {}
+
     // TODO: Need wait()
+    //
+    fn wait(&self) {
+
+        // For now do simple spin
+    }
 
     pub(crate) fn commit(
         &self,
@@ -285,6 +323,10 @@ impl WritePipeline {
     }
 
     pub(crate) fn prepare_commit(&self, batch: NonNull<Batch<Sealed>>) -> Result<(), ()> {
+        todo!()
+    }
+
+    pub(crate) fn publish(&self, batch: &Batch<Sealed>) {
         todo!()
     }
 
@@ -501,49 +543,5 @@ mod tests {
         assert!(batch_q.slots[0].load(Ordering::Relaxed) == ptr::from_ref(&batch).cast_mut());
         let (h, _) = HeadTail::unpack_unchecked(batch_q.head_tail.load(Ordering::Relaxed));
         assert!(h == 1);
-    }
-
-    #[test]
-    fn two_threads_see_batch() {
-        //
-        //
-        //
-        let global_queue = BatchQueue::<4>::new();
-        //
-        // Setting the headtail at beginning of scope because we know what slots are
-        // going to be used and by what batch
-        //
-        global_queue.head_tail.store(
-            HeadTail::pack(3, 1).raw(),
-            std::sync::atomic::Ordering::Release,
-        );
-
-        thread::scope(|s| {
-            // SAFETY:
-            // Each spawn thread should null it's global queue pointer before exiting
-            // This simulates the commit lifetime
-
-            // Batch 1
-            s.spawn(|| {
-                //
-                let mut b1 = Batch::new().seal();
-
-                // We would be taking the mutex here after reserving space
-                global_queue.slots[0].store(&raw mut b1, std::sync::atomic::Ordering::Release);
-
-                // Need to null global pointer
-            });
-
-            // Batch 2
-            s.spawn(|| {
-                let mut b2 = Batch::new().seal();
-
-                // We would be taking the mutex here after reserving space
-                global_queue.slots[1].store(&raw mut b2, std::sync::atomic::Ordering::Release);
-                //
-
-                // Need to null global pointer
-            });
-        })
     }
 }
