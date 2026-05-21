@@ -1,3 +1,10 @@
+#![allow(warnings)]
+
+//
+//
+//
+//
+//
 mod column_family;
 mod db;
 mod iterator;

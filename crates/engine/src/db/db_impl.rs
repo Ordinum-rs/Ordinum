@@ -19,7 +19,7 @@ impl DbImpl {
     //
     //
     //
-    pub(crate) fn write(&self, batch: &Batch<Sealed> /* Other params? */) -> Result<(), ()> {
+    pub(crate) fn write(&self, batch: Batch<Sealed> /* Other params? */) -> Result<(), ()> {
         // Order of operations - process flow
 
         // validate the batch

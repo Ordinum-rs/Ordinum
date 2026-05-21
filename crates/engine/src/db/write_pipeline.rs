@@ -7,7 +7,7 @@ use std::{
     hint::spin_loop,
     ptr::{self, NonNull, null_mut},
     sync::{
-        Condvar, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicPtr, AtomicU64, Ordering},
     },
 };
@@ -122,7 +122,9 @@ struct BatchQueue<const N: usize> {
 
 impl<const N: usize> BatchQueue<N> {
     //
-    pub(crate) const fn size() -> usize {
+    pub(crate) const SIZE: usize = N;
+
+    pub(crate) const fn size(&self) -> usize {
         N
     }
 
@@ -224,11 +226,11 @@ impl<const N: usize> BatchQueue<N> {
 // lifecycle management.
 
 // TODO: Finish the trait
-pub(crate) trait WriterEnv {
+pub(crate) trait WriterEnv: Send + Sync {
     //
-    fn prepare_commit(batch: &Batch<Sealed>) -> Result<(), ()>;
+    fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()>;
     //
-    fn apply_commit(batch: &Batch<Sealed>) -> Result<(), ()>;
+    fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()>;
 }
 
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
@@ -245,8 +247,8 @@ pub(crate) trait WriterEnv {
 /// This preserves the logical ordering of data which is committed and applied to the database
 ///
 /// DOCS: Continue to work on the DOC
-pub(crate) struct WritePipeline {
-    batch_queue: BatchQueueDefault,
+pub(crate) struct WritePipeline<const N: usize> {
+    batch_queue: BatchQueue<N>,
 
     // Queue reservation
     // XXX: Future optimisation is to make a lock-free semaphore if profiling show bottleneck
@@ -254,18 +256,35 @@ pub(crate) struct WritePipeline {
     sem_mu: Mutex<()>,
     sem_cv: Condvar,
 
+    // Env trait
+    env: Arc<dyn WriterEnv>,
+
     //
     q_mu: Mutex<()>,
+
+    #[cfg(test)]
+    condvar_waiters: AtomicU64,
 }
 
-impl WritePipeline {
-    pub(crate) fn new() -> Self {
+impl WritePipeline<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE> {
+    // New with specific size
+    pub(crate) fn new(env: Arc<dyn WriterEnv>) -> Self {
+        Self::new_with_size(env)
+    }
+}
+
+impl<const N: usize> WritePipeline<N> {
+    pub(crate) fn new_with_size(env: Arc<dyn WriterEnv>) -> Self {
         Self {
-            batch_queue: BatchQueueDefault::new(),
-            batch_occupancy: AtomicU64::new(DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE as u64),
+            batch_queue: BatchQueue::<N>::new(),
+            batch_occupancy: AtomicU64::new(0 as u64),
             sem_mu: Mutex::new(()),
             sem_cv: Condvar::new(),
+            env,
             q_mu: Mutex::new(()),
+
+            #[cfg(test)]
+            condvar_waiters: AtomicU64::new(0),
         }
     }
 
@@ -275,7 +294,7 @@ impl WritePipeline {
         let mut token = self.batch_occupancy.load(Ordering::Acquire);
 
         loop {
-            if (token as usize) < self.batch_queue.slots.len() {
+            if (token as usize) < self.batch_queue.size() {
                 match self.batch_occupancy.compare_exchange(
                     token,
                     token + 1,
@@ -292,6 +311,7 @@ impl WritePipeline {
                 }
             } else {
                 self.wait();
+                token = self.batch_occupancy.load(Ordering::Acquire);
             }
         }
     }
@@ -301,12 +321,40 @@ impl WritePipeline {
     // TODO: Need wait()
     //
     fn wait(&self) {
+        //
+        //
+        // 1. loop 200 times using a "pause" for 1 micro sec
+        // 2. Thread::yield()
+        // 3. Thread parking (rocks uses Mutex and CondVar)
+        //
+        // This is inspired by Rocks code see: https://github.com/facebook/rocksdb/blob/763401b595c8c1647908356e42525aadd0b90eae/db/write_thread.cc#L64
+        for _ in 0..200 {
+            if (self.batch_occupancy.load(Ordering::Acquire) as usize) < self.batch_queue.size() {
+                return;
+            }
+            spin_loop();
+        }
 
-        // For now do simple spin
+        // Long wait
+        // NOTE: Match on Result to avoid unwrap()?
+        let mut guard = self.sem_mu.lock().unwrap();
+
+        while self.batch_occupancy.load(Ordering::Acquire) as usize >= self.batch_queue.size() {
+            //
+            // Test invariant
+            // TODO: To be replaced with SyncPoints
+            #[cfg(test)]
+            self.condvar_waiters.fetch_add(1, Ordering::Release);
+            //
+
+            // NOTE: Match on Result to avoid unwrap()?
+            guard = self.sem_cv.wait(guard).unwrap();
+        }
     }
 
     pub(crate) fn commit(
         &self,
+        // NOTE: Should we take Batch<Sealed>?
         batch: NonNull<Batch<Sealed>>,
         sync_wal: bool, /* NOTE: can possibly use options struct or config here */
     ) -> Result<(), ()> {
@@ -335,7 +383,12 @@ impl WritePipeline {
 
 #[cfg(test)]
 mod tests {
-    use std::{ptr, thread};
+    use std::{
+        ptr,
+        sync::{Barrier, atomic::AtomicBool},
+        thread,
+        time::Duration,
+    };
 
     use crate::db::{batch::Batch, write_pipeline::tests::queue_harness::Harness};
 
@@ -464,6 +517,8 @@ mod tests {
         }
     }
 
+    mod pipeline_harness {}
+
     #[test]
     fn two_consumers_race_dequeue() {
         //
@@ -497,11 +552,6 @@ mod tests {
             assert!(r1.did_dequeue == true);
             assert!(r2.did_dequeue == false);
         })
-    }
-
-    #[test]
-    fn batch_size() {
-        assert_eq!(BatchQueue::<4>::size(), 4);
     }
 
     #[test]
@@ -543,5 +593,69 @@ mod tests {
         assert!(batch_q.slots[0].load(Ordering::Relaxed) == ptr::from_ref(&batch).cast_mut());
         let (h, _) = HeadTail::unpack_unchecked(batch_q.head_tail.load(Ordering::Relaxed));
         assert!(h == 1);
+    }
+
+    // -------- Pipeline Tests -------- //
+
+    #[test]
+    fn try_reserve() {
+        //
+        struct EnvStub;
+        impl WriterEnv for EnvStub {
+            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+                Ok(())
+            }
+            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+                Ok(())
+            }
+        }
+
+        let env = EnvStub {};
+
+        let wp = WritePipeline::<1>::new_with_size(Arc::new(env));
+
+        assert!(wp.batch_queue.size() == 1);
+
+        // The maint outer scope will be the base writer thread just to occupy the queue and make scoped thread wait on try_reserve
+
+        wp.try_reserve_space();
+        assert!(wp.batch_occupancy.load(Ordering::Acquire) == 1);
+
+        let barrier = Barrier::new(2);
+        let reserved = AtomicBool::new(false);
+
+        thread::scope(|s| {
+            // Thread which will try and reserve and should be caused to wait
+            //
+
+            s.spawn(|| {
+                //
+                barrier.wait();
+
+                wp.try_reserve_space();
+                reserved.store(true, Ordering::Release);
+            });
+
+            barrier.wait();
+
+            // I should be able to decrement the token and the scoped thread should be waiting
+
+            while wp.condvar_waiters.load(Ordering::Acquire) == 0 {
+                spin_loop();
+            }
+
+            let old = wp.batch_occupancy.fetch_sub(1, Ordering::AcqRel);
+            assert_eq!(old, 1);
+            assert!(wp.batch_occupancy.load(Ordering::Acquire) == 0);
+
+            wp.sem_cv.notify_all();
+
+            //
+        });
+
+        assert!(reserved.load(Ordering::Acquire) == true);
+        assert!(wp.batch_occupancy.load(Ordering::Acquire) == 1);
+
+        //
     }
 }
