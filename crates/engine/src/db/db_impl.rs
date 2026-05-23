@@ -1,17 +1,18 @@
 use crate::{
     column_family::cf::ColumnFamilyData,
+    db::options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     db::{
         batch::{Batch, Sealed},
         write_batch::WBatch,
+        write_pipeline::WritePipeline,
     },
 };
 
-use super::write_thread::WriteThread;
 use std::{marker::PhantomData, sync::Arc};
 
 pub(crate) struct DbImpl {
     _p: PhantomData<()>,
-    write_thread: WriteThread,
+    write_pipeline: WritePipeline<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE>,
     cf_data: Arc<ColumnFamilyData>,
 }
 

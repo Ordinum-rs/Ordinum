@@ -5,12 +5,13 @@ edition.workspace = true
 
 [dependencies]
 mem = { path = "../mem" }
-loom = { workspace = true, optional = true }
 
+[dev-dependencies]
+loom = { workspace = true }
 
 [features]
 default = ["arena_direct"]
+
 arena_direct = []
 buffered_key_writer = []
-
-loom = ["dep:loom"]
+loom = []

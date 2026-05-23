@@ -13,15 +13,14 @@
 // b.commit(b) // commit moves batch into it's scope and transitions state
 //
 
+use crate::sync::atomic::{AtomicBool, Ordering};
 use std::ops::Deref;
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::db::DEFAULT_CF_ID;
-use crate::db::write_batch::WBatch;
 use crate::db::{self, db_impl::DbImpl};
 use crate::utils::var_int::VarInt;
 

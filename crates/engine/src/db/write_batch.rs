@@ -148,7 +148,6 @@ pub(crate) struct WBatch {
 // DeleteCF()
 //
 
-// TODO: Do we want apply_batch on the memtable? and then memtable can handle the insert and handle if direct or not
 //
 
 impl WBatch {

@@ -4,17 +4,20 @@
 
 use std::{
     array,
-    hint::spin_loop,
     ptr::{self, NonNull, null_mut},
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-    },
+};
+
+use crate::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
 use crate::{
-    db::batch::{Batch, BatchInner, Sealed},
-    db::options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
+    db::{
+        batch::{Batch, BatchInner, Sealed},
+        options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
+    },
+    sync::spin_loop,
     utils::{self, cache_padded::CachePadded},
 };
 
@@ -82,14 +85,11 @@ impl HeadTail {
 // tail = 1
 // Range = [tail, head) i.e. [1,3)
 //
-// Each slot = AtomicPtr<BatchInner>
+// Each slot = AtomicPtr<Batch<Sealed>>
 // Null slot = Producer Owns Slot
 // Non Null  = Consumer Owns Slot
 //
 //
-
-// XXX: Later we may want to move this to a configurable type
-pub(crate) type BatchQueueDefault = BatchQueue<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE>;
 
 // Referencing
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9/commit.go#L24
@@ -247,7 +247,7 @@ pub(crate) trait WriterEnv: Send + Sync {
 /// This preserves the logical ordering of data which is committed and applied to the database
 ///
 /// DOCS: Continue to work on the DOC
-pub(crate) struct WritePipeline<const N: usize> {
+pub(crate) struct WritePipeline<const N: usize, E: WriterEnv + ?Sized = dyn WriterEnv> {
     batch_queue: BatchQueue<N>,
 
     // Queue reservation
@@ -257,7 +257,7 @@ pub(crate) struct WritePipeline<const N: usize> {
     sem_cv: Condvar,
 
     // Env trait
-    env: Arc<dyn WriterEnv>,
+    env: Arc<E>,
 
     //
     q_mu: Mutex<()>,
@@ -266,15 +266,21 @@ pub(crate) struct WritePipeline<const N: usize> {
     condvar_waiters: AtomicU64,
 }
 
-impl WritePipeline<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE> {
+impl<E> WritePipeline<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE, E>
+where
+    E: WriterEnv + ?Sized,
+{
     // New with specific size
-    pub(crate) fn new(env: Arc<dyn WriterEnv>) -> Self {
+    pub(crate) fn new(env: Arc<E>) -> Self {
         Self::new_with_size(env)
     }
 }
 
-impl<const N: usize> WritePipeline<N> {
-    pub(crate) fn new_with_size(env: Arc<dyn WriterEnv>) -> Self {
+impl<const N: usize, E> WritePipeline<N, E>
+where
+    E: WriterEnv + ?Sized,
+{
+    pub(crate) fn new_with_size(env: Arc<E>) -> Self {
         Self {
             batch_queue: BatchQueue::<N>::new(),
             batch_occupancy: AtomicU64::new(0 as u64),
@@ -288,39 +294,7 @@ impl<const N: usize> WritePipeline<N> {
         }
     }
 
-    // TODO: Need try_acquire_token()
-    // #[inline] ?
-    fn try_reserve_space(&self) {
-        let mut token = self.batch_occupancy.load(Ordering::Acquire);
-
-        loop {
-            if (token as usize) < self.batch_queue.size() {
-                match self.batch_occupancy.compare_exchange(
-                    token,
-                    token + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(t) => {
-                        token = t;
-                        continue;
-                    }
-                }
-            } else {
-                self.wait();
-                token = self.batch_occupancy.load(Ordering::Acquire);
-            }
-        }
-    }
-
-    fn release_queue_space(&self) {}
-
-    // TODO: Need wait()
-    //
-    fn wait(&self) {
+    pub(super) fn reserve_space(&self) {
         //
         //
         // 1. loop 200 times using a "pause" for 1 micro sec
@@ -329,28 +303,77 @@ impl<const N: usize> WritePipeline<N> {
         //
         // This is inspired by Rocks code see: https://github.com/facebook/rocksdb/blob/763401b595c8c1647908356e42525aadd0b90eae/db/write_thread.cc#L64
         for _ in 0..200 {
-            if (self.batch_occupancy.load(Ordering::Acquire) as usize) < self.batch_queue.size() {
+            if self.try_reserve_space() {
                 return;
             }
             spin_loop();
         }
 
-        // Long wait
-        // NOTE: Match on Result to avoid unwrap()?
-        let mut guard = self.sem_mu.lock().unwrap();
+        loop {
+            if self.try_reserve_space() {
+                return;
+            }
 
-        while self.batch_occupancy.load(Ordering::Acquire) as usize >= self.batch_queue.size() {
-            //
-            // Test invariant
-            // TODO: To be replaced with SyncPoints
-            #[cfg(test)]
-            self.condvar_waiters.fetch_add(1, Ordering::Release);
-            //
-
+            // Long wait
             // NOTE: Match on Result to avoid unwrap()?
-            guard = self.sem_cv.wait(guard).unwrap();
+            let mut guard = self.sem_mu.lock().unwrap();
+
+            while self.batch_occupancy.load(Ordering::Acquire) as usize >= self.batch_queue.size() {
+                //
+                // Test invariant
+                // TODO: To be replaced with SyncPoints
+                #[cfg(test)]
+                self.condvar_waiters.fetch_add(1, Ordering::Release);
+                //
+
+                // NOTE: Match on Result to avoid unwrap()?
+                guard = self.sem_cv.wait(guard).unwrap();
+            }
+
+            // IMPORTANT: do not return here
+            // Waking only means space may exist. We need to loop again to try_reserve the space and only return if we succeed
         }
     }
+
+    fn try_reserve_space(&self) -> bool {
+        let mut cur = self.batch_occupancy.load(Ordering::Acquire);
+
+        loop {
+            if cur as usize >= self.batch_queue.size() {
+                return false;
+            }
+
+            match self.batch_occupancy.compare_exchange(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(t) => {
+                    cur = t;
+                }
+            }
+        }
+    }
+
+    pub(super) fn release_queue_space(&self) {
+        //
+
+        let _guard = self.sem_mu.lock().unwrap();
+
+        let prev = self.batch_occupancy.fetch_sub(1, Ordering::AcqRel);
+
+        assert!(
+            prev > 0,
+            "batch occupancy misaligned: released with zero occupancy"
+        );
+
+        //
+        self.sem_cv.notify_one();
+    }
+
+    //
 
     pub(crate) fn commit(
         &self,
@@ -383,12 +406,8 @@ impl<const N: usize> WritePipeline<N> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        ptr,
-        sync::{Barrier, atomic::AtomicBool},
-        thread,
-        time::Duration,
-    };
+    use crate::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::{ptr, sync::Barrier, thread, time::Duration};
 
     use crate::db::{batch::Batch, write_pipeline::tests::queue_harness::Harness};
 
@@ -397,9 +416,10 @@ mod tests {
     mod queue_harness {
         use std::{
             ptr::NonNull,
-            sync::{Condvar, Mutex},
             thread::{self, Scope, ScopedJoinHandle},
         };
+
+        use crate::sync::{Condvar, Mutex};
 
         use crate::db::{
             batch::{Batch, Sealed},
@@ -555,23 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn head_tail_masking() {
-        let head = 2;
-        let tail = 4;
-
-        let packed = HeadTail::pack(head, tail);
-
-        let (h, t) = packed.unpack();
-        assert!(h == 2);
-        assert!(t == 4);
-    }
-
-    #[test]
     #[should_panic]
     fn full_queue() {
         // [B1, B2, B3, B4]
         //  T            H
         //
+
         let ht = HeadTail::pack(5, 1);
 
         let batch_q = BatchQueue::<4>::new();
@@ -595,6 +604,12 @@ mod tests {
         assert!(h == 1);
     }
 
+    // TODO: Test -> dequeue_preserves_fifo_order()
+    //
+    // TODO: Test -> applied_later_batch_does_not_skip_unapplied_head()
+    //
+    // TODO: Test -> wraparound_reuses_cleared_slots()
+
     // -------- Pipeline Tests -------- //
 
     #[test]
@@ -612,7 +627,7 @@ mod tests {
 
         let env = EnvStub {};
 
-        let wp = WritePipeline::<1>::new_with_size(Arc::new(env));
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env));
 
         assert!(wp.batch_queue.size() == 1);
 
@@ -655,6 +670,119 @@ mod tests {
 
         assert!(reserved.load(Ordering::Acquire) == true);
         assert!(wp.batch_occupancy.load(Ordering::Acquire) == 1);
+
+        //
+    }
+
+    #[test]
+    #[should_panic]
+    fn release_queue_two_threads() {
+        struct EnvStub;
+        impl WriterEnv for EnvStub {
+            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+                Ok(())
+            }
+            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+                Ok(())
+            }
+        }
+
+        let env = EnvStub {};
+
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env));
+
+        // We want two threads to race on releasing queue which has occupancy of 1
+        // Should panic
+
+        let barrier = Barrier::new(2);
+
+        // Increase occupancy by one
+
+        wp.try_reserve_space();
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                barrier.wait();
+
+                wp.release_queue_space();
+                println!("returned");
+            });
+            //
+            barrier.wait();
+
+            wp.release_queue_space();
+            //
+        });
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use crate::sync::atomic::*;
+    use crate::sync::{Arc, Condvar, Mutex};
+
+    // ----------------- Loom Tests ----------------- //
+
+    #[test]
+    fn reserve_release_simple() {
+        //
+        struct EnvStub;
+        impl WriterEnv for EnvStub {
+            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+                Ok(())
+            }
+            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+                Ok(())
+            }
+        }
+
+        loom::model(|| {
+            let env = Arc::new(EnvStub);
+            let wp = Arc::new(WritePipeline::<1, EnvStub>::new_with_size(env));
+
+            let inside = Arc::new(AtomicUsize::new(0));
+
+            let wp1 = wp.clone();
+            let inside1 = inside.clone();
+
+            let t1 = loom::thread::spawn(move || {
+                wp1.reserve_space();
+
+                let prev = inside1.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(prev, 0);
+
+                loom::thread::yield_now();
+
+                let prev = inside1.fetch_sub(1, Ordering::SeqCst);
+                assert_eq!(prev, 1);
+
+                wp1.release_queue_space();
+            });
+
+            let wp2 = wp.clone();
+            let inside2 = inside.clone();
+
+            let t2 = loom::thread::spawn(move || {
+                wp2.reserve_space();
+
+                let prev = inside2.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(prev, 0);
+
+                loom::thread::yield_now();
+
+                let prev = inside2.fetch_sub(1, Ordering::SeqCst);
+                assert_eq!(prev, 1);
+
+                wp2.release_queue_space();
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            assert_eq!(wp.batch_occupancy.load(Ordering::SeqCst), 0);
+            assert_eq!(inside.load(Ordering::SeqCst), 0);
+        });
 
         //
     }
