@@ -7,6 +7,7 @@
 //
 mod column_family;
 mod db;
+pub mod error;
 mod iterator;
 mod key;
 mod memtable;
@@ -18,6 +19,9 @@ mod versioning;
 pub mod block;
 pub mod tests;
 pub mod utils;
+
+// Errors
+pub use error::{Error, Result};
 
 pub mod sync {
     #[cfg(feature = "loom")]

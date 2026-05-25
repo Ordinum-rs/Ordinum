@@ -7,12 +7,16 @@ use std::{
     ptr::{self, NonNull, null_mut},
 };
 
-use crate::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicPtr, AtomicU64, Ordering},
+use crate::{
+    db::db_impl::SequenceState,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicPtr, AtomicU64, Ordering},
+    },
 };
 
 use crate::{
+    Error, Result,
     db::{
         batch::{Batch, BatchInner, Sealed},
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
@@ -228,9 +232,9 @@ impl<const N: usize> BatchQueue<N> {
 // TODO: Finish the trait
 pub(crate) trait WriterEnv: Send + Sync {
     //
-    fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()>;
+    fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()>;
     //
-    fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()>;
+    fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()>;
 }
 
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
@@ -259,6 +263,9 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv + ?Sized = dyn Writ
     // Env trait
     env: Arc<E>,
 
+    // Seq State
+    seq_state: Arc<SequenceState>,
+
     //
     q_mu: Mutex<()>,
 
@@ -271,8 +278,8 @@ where
     E: WriterEnv + ?Sized,
 {
     // New with specific size
-    pub(crate) fn new(env: Arc<E>) -> Self {
-        Self::new_with_size(env)
+    pub(crate) fn new(env: Arc<E>, seq_state: Arc<SequenceState>) -> Self {
+        Self::new_with_size(env, seq_state)
     }
 }
 
@@ -280,13 +287,16 @@ impl<const N: usize, E> WritePipeline<N, E>
 where
     E: WriterEnv + ?Sized,
 {
-    pub(crate) fn new_with_size(env: Arc<E>) -> Self {
+    pub(crate) fn new_with_size(env: Arc<E>, seq_state: Arc<SequenceState>) -> Self {
         Self {
             batch_queue: BatchQueue::<N>::new(),
             batch_occupancy: AtomicU64::new(0 as u64),
             sem_mu: Mutex::new(()),
             sem_cv: Condvar::new(),
             env,
+
+            seq_state,
+
             q_mu: Mutex::new(()),
 
             #[cfg(test)]
@@ -358,17 +368,12 @@ where
     }
 
     pub(super) fn release_queue_space(&self) {
-        //
-
         let _guard = self.sem_mu.lock().unwrap();
-
         let prev = self.batch_occupancy.fetch_sub(1, Ordering::AcqRel);
-
         assert!(
             prev > 0,
             "batch occupancy misaligned: released with zero occupancy"
         );
-
         //
         self.sem_cv.notify_one();
     }
@@ -380,7 +385,7 @@ where
         // NOTE: Should we take Batch<Sealed>?
         batch: NonNull<Batch<Sealed>>,
         sync_wal: bool, /* NOTE: can possibly use options struct or config here */
-    ) -> Result<(), ()> {
+    ) -> Result<()> {
         // NOTE: Any assertions here?
 
         // Need to try_acquire a token - if not we wait()
@@ -393,8 +398,28 @@ where
         todo!()
     }
 
-    pub(crate) fn prepare_commit(&self, batch: NonNull<Batch<Sealed>>) -> Result<(), ()> {
-        todo!()
+    pub(crate) fn assign_seq_no(&self) {
+        //
+    }
+
+    pub(crate) fn prepare(&self, batch: NonNull<Batch<Sealed>>) -> Result<()> {
+        // XXX: In the future we may want to to have a SyncWal bool where we can decide if we want to fsync to WAL or not
+        // Further to that we can also decide if we want to asynchronously wait for fsync to complete
+        // But for now the commit will both wait for publish and fsync
+
+        let _guard = self.q_mu.lock().unwrap();
+
+        self.batch_queue.enqueue(batch);
+
+        // TODO: Need to figure out how assigning seq numbers to batches works while maintaining global invariants
+        // Assign the seq_no to the batch
+
+        let b = unsafe { &*batch.as_ptr() };
+
+        // Prepare
+        self.env.prepare_commit(b)?;
+
+        Ok(())
     }
 
     pub(crate) fn publish(&self, batch: &Batch<Sealed>) {
@@ -617,17 +642,19 @@ mod tests {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
                 Ok(())
             }
         }
 
         let env = EnvStub {};
 
-        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env));
+        let seq_state = Arc::new(SequenceState::default());
+
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env), seq_state.clone());
 
         assert!(wp.batch_queue.size() == 1);
 
@@ -679,17 +706,19 @@ mod tests {
     fn release_queue_two_threads() {
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
                 Ok(())
             }
         }
 
         let env = EnvStub {};
 
-        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env));
+        let seq_state = Arc::new(SequenceState::default());
+
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env), seq_state.clone());
 
         // We want two threads to race on releasing queue which has occupancy of 1
         // Should panic
@@ -729,6 +758,8 @@ mod loom_tests {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
+            type LogSeqNum = u64;
+            type VisibleSeqNum = u64;
             fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
                 Ok(())
             }
