@@ -7,20 +7,18 @@ use std::{
     ptr::{self, NonNull, null_mut},
 };
 
-use crate::{
-    db::db_impl::SequenceState,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-    },
-};
+use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::{
     Error, Result,
     db::{
         batch::{Batch, BatchInner, Sealed},
+        db_impl::SequenceState,
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     },
+    sync::Arc,
+    sync::Condvar,
+    sync::Mutex,
     sync::spin_loop,
     utils::{self, cache_padded::CachePadded},
 };
@@ -232,8 +230,10 @@ impl<const N: usize> BatchQueue<N> {
 // TODO: Finish the trait
 pub(crate) trait WriterEnv: Send + Sync {
     //
+    // NOTE: Happens under Mutex lock
     fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()>;
     //
+    // NOTE: No Lock - concurrent application to memtables
     fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()>;
 }
 
@@ -251,11 +251,11 @@ pub(crate) trait WriterEnv: Send + Sync {
 /// This preserves the logical ordering of data which is committed and applied to the database
 ///
 /// DOCS: Continue to work on the DOC
-pub(crate) struct WritePipeline<const N: usize, E: WriterEnv + ?Sized = dyn WriterEnv> {
+pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
+    // Queue
     batch_queue: BatchQueue<N>,
 
     // Queue reservation
-    // XXX: Future optimisation is to make a lock-free semaphore if profiling show bottleneck
     batch_occupancy: AtomicU64,
     sem_mu: Mutex<()>,
     sem_cv: Condvar,
@@ -275,7 +275,7 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv + ?Sized = dyn Writ
 
 impl<E> WritePipeline<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE, E>
 where
-    E: WriterEnv + ?Sized,
+    E: WriterEnv,
 {
     // New with specific size
     pub(crate) fn new(env: Arc<E>, seq_state: Arc<SequenceState>) -> Self {
@@ -285,7 +285,7 @@ where
 
 impl<const N: usize, E> WritePipeline<N, E>
 where
-    E: WriterEnv + ?Sized,
+    E: WriterEnv,
 {
     pub(crate) fn new_with_size(env: Arc<E>, seq_state: Arc<SequenceState>) -> Self {
         Self {
@@ -650,11 +650,11 @@ mod tests {
             }
         }
 
-        let env = EnvStub {};
+        let env = Arc::new(EnvStub {});
 
         let seq_state = Arc::new(SequenceState::default());
 
-        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env), seq_state.clone());
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone());
 
         assert!(wp.batch_queue.size() == 1);
 
@@ -714,11 +714,11 @@ mod tests {
             }
         }
 
-        let env = EnvStub {};
+        let env = Arc::new(EnvStub {});
 
         let seq_state = Arc::new(SequenceState::default());
 
-        let wp = WritePipeline::<1, EnvStub>::new_with_size(Arc::new(env), seq_state.clone());
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone());
 
         // We want two threads to race on releasing queue which has occupancy of 1
         // Should panic
@@ -758,19 +758,21 @@ mod loom_tests {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            type LogSeqNum = u64;
-            type VisibleSeqNum = u64;
-            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<(), ()> {
+            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
                 Ok(())
             }
         }
 
         loom::model(|| {
             let env = Arc::new(EnvStub);
-            let wp = Arc::new(WritePipeline::<1, EnvStub>::new_with_size(env));
+            let seq_state = Arc::new(SequenceState::default());
+            let wp = Arc::new(WritePipeline::<1, EnvStub>::new_with_size(
+                env,
+                seq_state.clone(),
+            ));
 
             let inside = Arc::new(AtomicUsize::new(0));
 

@@ -11,7 +11,7 @@ use crate::{
     sync::atomic::AtomicU64,
 };
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Weak};
 
 pub(crate) struct SequenceState {
     visible_seq_no: AtomicU64,
@@ -30,18 +30,16 @@ impl Default for SequenceState {
 pub(crate) struct DbImpl {
     _p: PhantomData<()>,
     seq_state: Arc<SequenceState>,
-    write_pipeline: WritePipeline<DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE>,
     cf_data: Arc<ColumnFamilyData>,
 }
 
 impl WriterEnv for DbImpl {
     //
-
     fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
         //
         Ok(())
     }
-
+    //
     fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
         //
         Ok(())
