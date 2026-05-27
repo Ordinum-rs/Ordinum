@@ -14,6 +14,7 @@
 //
 
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::utils;
 use std::ops::Deref;
 use std::ptr;
 use std::ptr::NonNull;
@@ -176,7 +177,7 @@ impl Batch<Sealed> {
     }
 
     pub(crate) fn non_null_ptr(&self) -> NonNull<Self> {
-        // SAFETY:
+        // # SAFETY
         //
         // `ptr::from_ref(self)` produces a non-null pointer to `self`.
         //
@@ -191,6 +192,31 @@ impl Batch<Sealed> {
         // - Any cross-thread mutation of `Batch<Sealed>` occurs only
         //   through atomics or other synchronization primitives.
         unsafe { NonNull::new_unchecked(ptr::from_ref(self).cast_mut()) }
+    }
+
+    /// assign_seq_num_once stamps the reserved sequence number into the
+    /// batch header.
+    ///
+    /// The sequence number occupies the first 8 bytes of the encoded batch
+    /// representation and is written exactly once by the commit pipeline
+    /// after global sequence reservation succeeds.
+    ///
+    /// # Safety
+    ///
+    /// This method performs interior mutation through a shared reference by
+    /// mutating the underlying encoded batch bytes directly.
+    ///
+    /// The caller must guarantee:
+    ///
+    /// - No concurrent mutation of the sequence number field occurs.
+    /// - The sequence number write must happen-before any concurrent
+    ///   observation of the batch by readers or writers.
+    ///
+    /// Violating these invariants may result in undefined behavior, torn
+    /// visibility of sequence metadata, or corruption of commit ordering
+    /// semantics.
+    pub(crate) unsafe fn assign_seq_num_once(&self, seq_num: u64) {
+        unsafe { self.inner.set_seq_num(seq_num) }
     }
 }
 
@@ -218,7 +244,6 @@ pub(super) struct BatchInner {
     /// memtable.
     max_batch_size: usize,
     count: u64,
-    flushable: bool, // NOTE: bool for now until we implement flushable batches
     runtime_commit_state: AtomicU8,
     // NOTE:
     // Need inline array for touched column families in this batch
@@ -236,21 +261,44 @@ impl BatchInner {
             data,
             max_batch_size: MAX_BATCH_SIZE,
             count: 0,
-            flushable: false,
             runtime_commit_state: AtomicU8::new(0),
         }
     }
 
     fn new_with_capacity(cap: usize) -> Self {
         assert!(cap <= MAX_BATCH_SIZE);
+        assert!(cap > Self::HEADER_SIZE);
         let mut data = Vec::with_capacity(cap);
         data.extend_from_slice(&[0u8; Self::HEADER_SIZE]);
         Self {
             data,
             max_batch_size: MAX_BATCH_SIZE,
             count: 0,
-            flushable: false,
             runtime_commit_state: AtomicU8::new(0),
+        }
+    }
+
+    fn seq_num(&self) -> u64 {
+        debug_assert!(self.data.len() > Self::BATCH_COUNT_OFFSET);
+        let ptr = self.data[..Self::BATCH_COUNT_OFFSET].as_ptr();
+        // SAFETY
+        //
+        // We know that the data slice is greater than 8 bytes
+        // Batches are created always with enough bytes for the header to exist. The Vec initialises the data so read_unaligned is safe for the first 8 bytes
+        unsafe { utils::read_u64_unsafe(ptr) }
+    }
+
+    // SAFETY:
+    // Caller upholds Batch<Sealed>::assign_seq_num_once invariants.
+    unsafe fn set_seq_num(&self, seq_num: u64) {
+        debug_assert!(self.data.len() > Self::BATCH_COUNT_OFFSET);
+        let b_ptr = self.data[..Self::BATCH_COUNT_OFFSET].as_ptr().cast_mut();
+        // # SAFETY
+        //
+        // We assert that data slice is greater than 8 bytes
+        // Batches are created always with enough bytes for the header to exist. The Vec initialises the data so copy_non_overlapping is safe for the first 8 bytes
+        unsafe {
+            utils::write_u64_unsafe(b_ptr, seq_num);
         }
     }
 }

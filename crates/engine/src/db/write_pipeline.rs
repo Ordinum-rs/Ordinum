@@ -398,7 +398,20 @@ where
         todo!()
     }
 
-    pub(crate) fn assign_seq_no(&self) {
+    pub(crate) fn assign_seq_no(&self, batch: &Batch<Sealed>) {
+        // What do we want to do
+
+        // Get the global log_seq_num
+        // TODO: Implement this properly
+        let lsn = 0;
+
+        // # SAFETY
+        //
+        // We are safe to assign the seq_num to the batch because we uphold the invariants that:
+        // - There is no other reader or writer which is mutating the seq_num bytes as assign_seq_no is called within a Mutex lock
+        // - The mutation takes place before releasing the lock and before any concurrent mutation observation of the batch
+        unsafe { batch.assign_seq_num_once(lsn) };
+
         //
     }
 
@@ -411,10 +424,12 @@ where
 
         self.batch_queue.enqueue(batch);
 
+        // Get reference (&Batch<Sealed>) to the batch to pass into methods
+        let b = unsafe { &*batch.as_ptr() };
+
         // TODO: Need to figure out how assigning seq numbers to batches works while maintaining global invariants
         // Assign the seq_no to the batch
-
-        let b = unsafe { &*batch.as_ptr() };
+        self.assign_seq_no(b);
 
         // Prepare
         self.env.prepare_commit(b)?;
