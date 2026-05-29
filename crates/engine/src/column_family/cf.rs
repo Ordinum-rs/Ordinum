@@ -7,7 +7,7 @@ use std::sync::{Arc, atomic::AtomicPtr};
 use crate::{
     column_family::cf_options::CFOptions,
     memtable::memtable::{Memtable, Mutable},
-    versioning::{memtable_list::MemTableList, superversion::Superversion},
+    version::{memtable_list::MemTableList, superversion::Superversion},
 };
 
 // Latest view of the LSM Tree

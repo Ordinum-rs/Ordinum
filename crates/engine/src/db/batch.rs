@@ -194,6 +194,10 @@ impl Batch<Sealed> {
         unsafe { NonNull::new_unchecked(ptr::from_ref(self).cast_mut()) }
     }
 
+    pub(crate) fn get_batch_count(&self) -> u64 {
+        self.inner.get_batch_count()
+    }
+
     /// assign_seq_num_once stamps the reserved sequence number into the
     /// batch header.
     ///
@@ -266,9 +270,10 @@ impl BatchInner {
     }
 
     fn new_with_capacity(cap: usize) -> Self {
-        assert!(cap <= MAX_BATCH_SIZE);
-        assert!(cap > Self::HEADER_SIZE);
-        let mut data = Vec::with_capacity(cap);
+        let capacity = cap + Self::HEADER_SIZE;
+
+        assert!(capacity <= MAX_BATCH_SIZE);
+        let mut data = Vec::with_capacity(capacity);
         data.extend_from_slice(&[0u8; Self::HEADER_SIZE]);
         Self {
             data,
@@ -301,6 +306,10 @@ impl BatchInner {
             utils::write_u64_unsafe(b_ptr, seq_num);
         }
     }
+
+    fn get_batch_count(&self) -> u64 {
+        self.count
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +320,16 @@ mod tests {
     fn batch_new() {
         let batch = Batch::new();
         assert!(batch.inner.count == 0);
+    }
+
+    #[test]
+    fn assign_seq_num() {
+        let batch = Batch::new_with_capacity(10);
+
+        assert_eq!(batch.inner.seq_num(), 0);
+
+        unsafe { batch.inner.set_seq_num(10) };
+
+        assert_eq!(batch.inner.seq_num(), 10);
     }
 }

@@ -14,7 +14,7 @@ mod memtable;
 mod options;
 mod range;
 mod thread_ctx;
-mod versioning;
+mod version;
 
 pub mod block;
 pub mod tests;

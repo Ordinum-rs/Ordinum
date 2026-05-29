@@ -7,13 +7,15 @@ use std::{
     ptr::{self, NonNull, null_mut},
 };
 
-use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use crate::{
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    version::SeqNumState,
+};
 
 use crate::{
     Error, Result,
     db::{
         batch::{Batch, BatchInner, Sealed},
-        db_impl::SequenceState,
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     },
     sync::Arc,
@@ -264,7 +266,7 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     env: Arc<E>,
 
     // Seq State
-    seq_state: Arc<SequenceState>,
+    seq_state: Arc<SeqNumState>,
 
     //
     q_mu: Mutex<()>,
@@ -278,7 +280,7 @@ where
     E: WriterEnv,
 {
     // New with specific size
-    pub(crate) fn new(env: Arc<E>, seq_state: Arc<SequenceState>) -> Self {
+    pub(crate) fn new(env: Arc<E>, seq_state: Arc<SeqNumState>) -> Self {
         Self::new_with_size(env, seq_state)
     }
 }
@@ -287,7 +289,7 @@ impl<const N: usize, E> WritePipeline<N, E>
 where
     E: WriterEnv,
 {
-    pub(crate) fn new_with_size(env: Arc<E>, seq_state: Arc<SequenceState>) -> Self {
+    pub(crate) fn new_with_size(env: Arc<E>, seq_state: Arc<SeqNumState>) -> Self {
         Self {
             batch_queue: BatchQueue::<N>::new(),
             batch_occupancy: AtomicU64::new(0 as u64),
@@ -398,23 +400,6 @@ where
         todo!()
     }
 
-    pub(crate) fn assign_seq_no(&self, batch: &Batch<Sealed>) {
-        // What do we want to do
-
-        // Get the global log_seq_num
-        // TODO: Implement this properly
-        let lsn = 0;
-
-        // # SAFETY
-        //
-        // We are safe to assign the seq_num to the batch because we uphold the invariants that:
-        // - There is no other reader or writer which is mutating the seq_num bytes as assign_seq_no is called within a Mutex lock
-        // - The mutation takes place before releasing the lock and before any concurrent mutation observation of the batch
-        unsafe { batch.assign_seq_num_once(lsn) };
-
-        //
-    }
-
     pub(crate) fn prepare(&self, batch: NonNull<Batch<Sealed>>) -> Result<()> {
         // XXX: In the future we may want to to have a SyncWal bool where we can decide if we want to fsync to WAL or not
         // Further to that we can also decide if we want to asynchronously wait for fsync to complete
@@ -427,9 +412,16 @@ where
         // Get reference (&Batch<Sealed>) to the batch to pass into methods
         let b = unsafe { &*batch.as_ptr() };
 
-        // TODO: Need to figure out how assigning seq numbers to batches works while maintaining global invariants
+        // TODO: Need to check this and test
         // Assign the seq_no to the batch
-        self.assign_seq_no(b);
+        unsafe {
+            b.assign_seq_num_once(
+                self.seq_state
+                    .log_seq_num
+                    .fetch_add(b.get_batch_count(), Ordering::AcqRel)
+                    - b.get_batch_count(),
+            )
+        };
 
         // Prepare
         self.env.prepare_commit(b)?;
@@ -667,7 +659,7 @@ mod tests {
 
         let env = Arc::new(EnvStub {});
 
-        let seq_state = Arc::new(SequenceState::default());
+        let seq_state = Arc::new(SeqNumState::default());
 
         let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone());
 
@@ -731,7 +723,7 @@ mod tests {
 
         let env = Arc::new(EnvStub {});
 
-        let seq_state = Arc::new(SequenceState::default());
+        let seq_state = Arc::new(SeqNumState::default());
 
         let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone());
 

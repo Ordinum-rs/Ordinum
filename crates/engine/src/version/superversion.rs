@@ -11,7 +11,7 @@ use mem::hazard::hazard_ptr::HzdPtr;
 
 use crate::column_family::cf::ColumnFamilyData;
 use crate::memtable::memtable::{Immutable, Memtable, Mutable, ReadableMemtable};
-use crate::versioning::memtable_list::MemListVersion;
+use crate::version::memtable_list::MemListVersion;
 
 pub(crate) struct Superversion {
     // NOTE: Backpointer which should be guranteed to outlive all super versions it must also be a stable heap-allocated object

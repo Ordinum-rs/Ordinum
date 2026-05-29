@@ -7,30 +7,16 @@ use crate::{
         write_batch::WBatch,
         write_pipeline::{WritePipeline, WriterEnv},
     },
-    sync::Arc,
-    sync::atomic::AtomicU64,
+    sync::{Arc, atomic::AtomicU64},
+    version::version_set::VersionSet,
 };
 
 use std::{marker::PhantomData, sync::Weak};
 
-pub(crate) struct SequenceState {
-    visible_seq_no: AtomicU64,
-    log_seq_no: AtomicU64,
-}
-
-impl Default for SequenceState {
-    fn default() -> Self {
-        Self {
-            visible_seq_no: AtomicU64::new(0),
-            log_seq_no: AtomicU64::new(0),
-        }
-    }
-}
-
 pub(crate) struct DbImpl {
     _p: PhantomData<()>,
-    seq_state: Arc<SequenceState>,
-    cf_data: Arc<ColumnFamilyData>,
+    //
+    version_set: VersionSet,
 }
 
 impl WriterEnv for DbImpl {
