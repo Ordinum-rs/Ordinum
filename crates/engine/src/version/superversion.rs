@@ -4,14 +4,17 @@
 //
 //
 use std::ptr::NonNull;
-use std::sync::Arc;
 
 use mem::hazard::domain::Global;
 use mem::hazard::hazard_ptr::HzdPtr;
 
 use crate::column_family::cf::ColumnFamilyData;
 use crate::memtable::memtable::{Immutable, Memtable, Mutable, ReadableMemtable};
+use crate::sync::Arc;
+use crate::sync::atomic::AtomicPtr;
 use crate::version::memtable_list::MemListVersion;
+
+pub(crate) const DEFAULT_SV_CACHE_SIZE: usize = 4;
 
 pub(crate) struct Superversion {
     // NOTE: Backpointer which should be guranteed to outlive all super versions it must also be a stable heap-allocated object
@@ -37,23 +40,37 @@ pub(crate) struct Superversion {
     //
 }
 
-// SuperVersion Cache to be stored in Thread Local Storage which is effectively static for the lifetime of the programme
-pub(crate) struct SVCache {
-    pub(crate) hzd: HzdPtr<'static, Global>,
-    pub(crate) generation: u64,
-    pub(crate) sv: *const Superversion,
+//
+// Readers CAS the SV Pointer and tries to install SV_IN_USE
+// If successful, we are free to use the SV and then return it once done
+// If we fail and instead get back SV_NULL then we must clear() then hazard slot and drop the pointer
+//
+// Only writers can invalidate a SVCache by walking the array
+
+// TODO: Think about the reclamation and reader/writer relationship and how to expose methods which keep hazard ptrs and raw ptrs in sync
+struct CacheEntry {
+    protected_ptr: AtomicPtr<Superversion>,
+    hazard: HzdPtr<'static, Global>,
 }
 
-impl SVCache {
+// SuperVersion Cache to be stored in Thread Local Storage which is effectively static for the lifetime of the programme
+pub(crate) struct SVCache<const N: usize> {
+    pub(crate) cache: Vec<CacheEntry>,
+}
+
+impl SVCache<DEFAULT_SV_CACHE_SIZE> {
     pub(crate) fn new() -> Self {
+        Self::new_with_size()
+    }
+}
+
+impl<const N: usize> SVCache<N> {
+    pub(crate) fn new_with_size() -> Self {
+        let vec: Vec<CacheEntry>;
+
         Self {
-            hzd: HzdPtr::new(),
-            generation: 0,
-            sv: std::ptr::null(),
+            cache: Vec::with_capacity(N),
         }
     }
-
-    // TODO: Implement safe methods to load and check generation number, return SV from
-
     // Methods operating or deferencing the ptr MUST use a pin()
 }

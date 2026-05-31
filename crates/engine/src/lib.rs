@@ -15,6 +15,7 @@ mod options;
 mod range;
 mod thread_ctx;
 mod version;
+mod wal;
 
 pub mod block;
 pub mod tests;

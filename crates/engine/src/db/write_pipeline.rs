@@ -10,6 +10,7 @@ use std::{
 use crate::{
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
     version::SeqNumState,
+    wal::writer::SyncPermit,
 };
 
 use crate::{
@@ -257,10 +258,14 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     // Queue
     batch_queue: BatchQueue<N>,
 
-    // Queue reservation
+    // Write Queue reservation
+    // TODO: Make into CommitPermit
     batch_occupancy: AtomicU64,
     sem_mu: Mutex<()>,
     sem_cv: Condvar,
+
+    // WAL fysnc reservation
+    sync_sem: SyncPermit,
 
     // Env trait
     env: Arc<E>,
@@ -298,6 +303,8 @@ where
             env,
 
             seq_state,
+
+            sync_sem: SyncPermit::default(),
 
             q_mu: Mutex::new(()),
 

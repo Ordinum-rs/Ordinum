@@ -34,10 +34,10 @@ pub(crate) struct UnCommitted {}
 
 impl BatchCommitState for UnCommitted {}
 
+// TODO: Move into BatchInner and expose only through type state methods
 pub(crate) struct Sealed {
     applied: AtomicBool,
     published: AtomicBool,
-    waiter: Thread,
 }
 
 impl BatchCommitState for Sealed {}
@@ -156,7 +156,6 @@ impl Batch<UnCommitted> {
             state: Sealed {
                 applied: AtomicBool::new(false),
                 published: AtomicBool::new(false),
-                waiter: thread::current(),
             },
             inner: self.inner,
         }
@@ -223,6 +222,8 @@ impl Batch<Sealed> {
         unsafe { self.inner.set_seq_num(seq_num) }
     }
 }
+
+//TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct BatchInner {

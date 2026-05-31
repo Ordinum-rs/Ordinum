@@ -24,10 +24,12 @@ pub(crate) struct ColumnFamilyData {
     //
     // Read Path
     // NOTE: Should always be loaded with HzdPtr
+    // We do not Arc<SV> on the superversion because we are using HazardPointers and we need to be able to CAS on the hot path
     superversion: AtomicPtr<Superversion>,
+    tls_id: u64,
     // --
     // NOTE: *Version
-    // NOTE: ThreadLocal<Superversion>,
+    // NOTE: ThreadLocalID
     //
     // Version_history?
 }
