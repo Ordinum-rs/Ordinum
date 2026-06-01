@@ -35,12 +35,14 @@ pub(crate) struct UnCommitted {}
 impl BatchCommitState for UnCommitted {}
 
 // TODO: Move into BatchInner and expose only through type state methods
-pub(crate) struct Sealed {
-    applied: AtomicBool,
-    published: AtomicBool,
-}
+pub(crate) struct Sealed {}
 
 impl BatchCommitState for Sealed {}
+
+// Pooled is the default state of a batch when pooled in the heap object pool
+pub(crate) struct Pooled {}
+
+impl BatchCommitState for Pooled {}
 
 #[repr(align(8))]
 #[derive(Debug)]
@@ -98,37 +100,47 @@ pub(crate) enum BatchOp {
 /// A batch should be 1:1 with a writer thread. A writer/caller should create a batch and push operations into the batch
 /// before calling Commit to have the batch processed by the [write_pipeline.rs]('WritePipeline').
 ///
-/// Batches are stack allocated. Ownership of the Batch is moved into Commit and passed to the WritePipeline once it is Sealed. Writers should
-/// call Seal on the Batch to Commit.
+/// Batches are heap allocated and may be retained by a batch pool for reuse.
+/// A sealed batch may be passed through the WritePipeline using non-owning pointers.
 ///
-/// Batches are safe to be accessed between threads because their lifetime is guranteed to outlive references and the stack allocation scope extends beyond
-/// the objects and references which may store or reference it.
-pub(crate) struct Batch<B: BatchCommitState> {
-    state: B,
-    inner: BatchInner,
+/// A batch allocation must remain alive and must not return to the pool while it
+/// is visible to the WritePipeline or while another thread may still access it.
+pub(crate) struct BatchObject<B: BatchCommitState> {
+    _state: PhantomData<B>,
+
+    // TODO: Once heap allocated this should be the heap object - either NonNull or Box
+    inner: NonNull<Batch>,
 }
 
-impl Batch<UnCommitted> {
+impl<B: BatchCommitState> BatchObject<B> {
+    pub(crate) fn into_inner(self) -> NonNull<Batch> {
+        self.inner
+    }
+}
+
+impl BatchObject<UnCommitted> {
     fn default_cf() -> VarInt {
         VarInt::new(DEFAULT_CF_ID)
     }
 
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        let batch = BatchInner::new();
+        let inner = Box::new(Batch::new());
+
         Self {
-            state: UnCommitted {},
-            inner: batch,
+            inner: NonNull::from(Box::leak(inner)),
+            _state: PhantomData,
         }
     }
 
     pub(crate) fn new_with_capacity(cap: usize) -> Self {
-        let batch = BatchInner::new_with_capacity(cap);
+        let batch = Box::new(Batch::new_with_capacity(cap));
 
         //
 
         Self {
-            state: UnCommitted {},
-            inner: batch,
+            _state: PhantomData,
+            inner: NonNull::from(Box::leak(batch)),
         }
     }
 
@@ -151,30 +163,15 @@ impl Batch<UnCommitted> {
         //
     }
 
-    pub(crate) fn seal(self) -> Batch<Sealed> {
-        Batch {
-            state: Sealed {
-                applied: AtomicBool::new(false),
-                published: AtomicBool::new(false),
-            },
+    pub(crate) fn seal(self) -> BatchObject<Sealed> {
+        BatchObject {
+            _state: PhantomData,
             inner: self.inner,
         }
     }
 }
 
-impl Batch<Sealed> {
-    pub(crate) fn is_applied(&self, ordering: Ordering) -> bool {
-        self.state.applied.load(ordering)
-    }
-
-    pub(crate) fn mark_applied(&self, ordering: Ordering) {
-        self.state.applied.store(true, ordering);
-    }
-
-    pub(crate) fn is_published(&self, ordering: Ordering) -> bool {
-        self.state.published.load(ordering)
-    }
-
+impl BatchObject<Sealed> {
     pub(crate) fn non_null_ptr(&self) -> NonNull<Self> {
         // # SAFETY
         //
@@ -187,46 +184,17 @@ impl Batch<Sealed> {
         // The caller must uphold:
         //
         // - `self` remains alive for the duration of queue publication.
-        // - `self` is not moved after its pointer is published.
+        // - `self` is not moved or returned to the pool after its pointer is published.
         // - Any cross-thread mutation of `Batch<Sealed>` occurs only
         //   through atomics or other synchronization primitives.
         unsafe { NonNull::new_unchecked(ptr::from_ref(self).cast_mut()) }
-    }
-
-    pub(crate) fn get_batch_count(&self) -> u64 {
-        self.inner.get_batch_count()
-    }
-
-    /// assign_seq_num_once stamps the reserved sequence number into the
-    /// batch header.
-    ///
-    /// The sequence number occupies the first 8 bytes of the encoded batch
-    /// representation and is written exactly once by the commit pipeline
-    /// after global sequence reservation succeeds.
-    ///
-    /// # Safety
-    ///
-    /// This method performs interior mutation through a shared reference by
-    /// mutating the underlying encoded batch bytes directly.
-    ///
-    /// The caller must guarantee:
-    ///
-    /// - No concurrent mutation of the sequence number field occurs.
-    /// - The sequence number write must happen-before any concurrent
-    ///   observation of the batch by readers or writers.
-    ///
-    /// Violating these invariants may result in undefined behavior, torn
-    /// visibility of sequence metadata, or corruption of commit ordering
-    /// semantics.
-    pub(crate) unsafe fn assign_seq_num_once(&self, seq_num: u64) {
-        unsafe { self.inner.set_seq_num(seq_num) }
     }
 }
 
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
-pub(super) struct BatchInner {
+pub(super) struct Batch {
     data: Vec<u8>,
     /// The maximum total serialized size allowed for a single atomic WriteBatch.
     ///
@@ -253,9 +221,15 @@ pub(super) struct BatchInner {
     // NOTE:
     // Need inline array for touched column families in this batch
     //
+    is_applied: AtomicBool,
+    is_published: AtomicBool,
+    //
+    //
+    // Pool logic
+    // TODO: Add field pool_next: ___,
 }
 
-impl BatchInner {
+impl Batch {
     const SEQ_NO_OFFSET: usize = 0; // seq starts at byte 0
     const BATCH_COUNT_OFFSET: usize = size_of::<u64>(); // count starts at byte 8
     const HEADER_SIZE: usize = size_of::<u64>() + size_of::<u32>(); // = 12
@@ -267,6 +241,8 @@ impl BatchInner {
             max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(0),
+            is_applied: AtomicBool::new(false),
+            is_published: AtomicBool::new(false),
         }
     }
 
@@ -281,6 +257,8 @@ impl BatchInner {
             max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(0),
+            is_applied: AtomicBool::new(false),
+            is_published: AtomicBool::new(false),
         }
     }
 
@@ -294,9 +272,28 @@ impl BatchInner {
         unsafe { utils::read_u64_unsafe(ptr) }
     }
 
-    // SAFETY:
-    // Caller upholds Batch<Sealed>::assign_seq_num_once invariants.
-    unsafe fn set_seq_num(&self, seq_num: u64) {
+    /// assign_seq_num_once stamps the reserved sequence number into the
+    /// batch header.
+    ///
+    /// The sequence number occupies the first 8 bytes of the encoded batch
+    /// representation and is written exactly once by the commit pipeline
+    /// after global sequence reservation succeeds.
+    ///
+    /// # Safety
+    ///
+    /// This method performs interior mutation through a shared reference by
+    /// mutating the underlying encoded batch bytes directly.
+    ///
+    /// The caller must guarantee:
+    ///
+    /// - No concurrent mutation of the sequence number field occurs.
+    /// - The sequence number write must happen-before any concurrent
+    ///   observation of the batch by readers or writers.
+    ///
+    /// Violating these invariants may result in undefined behavior, torn
+    /// visibility of sequence metadata, or corruption of commit ordering
+    /// semantics.
+    pub(super) unsafe fn assign_seq_num_once(&self, seq_num: u64) {
         debug_assert!(self.data.len() > Self::BATCH_COUNT_OFFSET);
         let b_ptr = self.data[..Self::BATCH_COUNT_OFFSET].as_ptr().cast_mut();
         // # SAFETY
@@ -308,7 +305,19 @@ impl BatchInner {
         }
     }
 
-    fn get_batch_count(&self) -> u64 {
+    pub(super) fn is_applied(&self, ordering: Ordering) -> bool {
+        self.is_applied.load(ordering)
+    }
+
+    pub(super) fn mark_applied(&self, ordering: Ordering) {
+        self.is_applied.store(true, ordering);
+    }
+
+    pub(super) fn is_published(&self, ordering: Ordering) -> bool {
+        self.is_published.load(ordering)
+    }
+
+    pub(super) fn get_batch_count(&self) -> u64 {
         self.count
     }
 }
@@ -319,18 +328,21 @@ mod tests {
 
     #[test]
     fn batch_new() {
-        let batch = Batch::new();
-        assert!(batch.inner.count == 0);
+        let batch = BatchObject::new().into_inner();
+        let b_ref = unsafe { &*batch.as_ptr() };
+        assert!(b_ref.count == 0);
     }
 
     #[test]
     fn assign_seq_num() {
-        let batch = Batch::new_with_capacity(10);
+        let batch = BatchObject::new_with_capacity(10).into_inner();
 
-        assert_eq!(batch.inner.seq_num(), 0);
+        let b_ref = unsafe { &*batch.as_ptr() };
 
-        unsafe { batch.inner.set_seq_num(10) };
+        assert_eq!(b_ref.seq_num(), 0);
 
-        assert_eq!(batch.inner.seq_num(), 10);
+        unsafe { b_ref.assign_seq_num_once(10) };
+
+        assert_eq!(b_ref.seq_num(), 10);
     }
 }

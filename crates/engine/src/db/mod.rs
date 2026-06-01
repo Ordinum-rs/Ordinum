@@ -1,5 +1,6 @@
 use crate::utils::var_int::VarInt;
 
+pub(crate) mod batch_pool;
 pub(crate) mod db;
 pub(crate) mod db_impl;
 pub(crate) mod options;

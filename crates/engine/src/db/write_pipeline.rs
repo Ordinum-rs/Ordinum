@@ -16,7 +16,7 @@ use crate::{
 use crate::{
     Error, Result,
     db::{
-        batch::{Batch, BatchInner, Sealed},
+        batch::{Batch, BatchObject, Sealed},
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     },
     sync::Arc,
@@ -122,7 +122,7 @@ impl HeadTail {
 #[derive(Debug)]
 struct BatchQueue<const N: usize> {
     head_tail: CachePadded<AtomicU64>,
-    slots: [AtomicPtr<Batch<Sealed>>; N],
+    slots: [AtomicPtr<Batch>; N],
 }
 
 impl<const N: usize> BatchQueue<N> {
@@ -143,7 +143,7 @@ impl<const N: usize> BatchQueue<N> {
     }
 
     // Enqueueing into the BatchQueue should be done under a Mutex lock
-    pub(crate) fn enqueue(&self, batch: NonNull<Batch<Sealed>>) {
+    pub(crate) fn enqueue(&self, batch: NonNull<Batch>) {
         let (head, tail) = HeadTail::unpack_unchecked(self.head_tail.load(Ordering::Relaxed));
 
         // Queue should not be full as we should have reserved space already - if it is we need to panic
@@ -171,7 +171,7 @@ impl<const N: usize> BatchQueue<N> {
     // try_dequeue attempts to remove the oldest batch in the queue and advance the tail if the batch is applied
     //
     // If an earlier batch is not yet applied or the queue is empty then we return nil
-    pub(crate) fn try_dequeue(&self) -> Option<NonNull<Batch<Sealed>>> {
+    pub(crate) fn try_dequeue(&self) -> Option<NonNull<Batch>> {
         //
         let mut ht = HeadTail::from_raw(self.head_tail.load(Ordering::Acquire)).raw();
 
@@ -234,10 +234,10 @@ impl<const N: usize> BatchQueue<N> {
 pub(crate) trait WriterEnv: Send + Sync {
     //
     // NOTE: Happens under Mutex lock
-    fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()>;
+    fn prepare_commit(&self, batch: &Batch) -> Result<()>;
     //
     // NOTE: No Lock - concurrent application to memtables
-    fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()>;
+    fn apply_commit(&self, batch: &Batch) -> Result<()>;
 }
 
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
@@ -395,10 +395,12 @@ where
     pub(crate) fn commit(
         &self,
         // NOTE: Should we take Batch<Sealed>?
-        batch: NonNull<Batch<Sealed>>,
+        batch: NonNull<BatchObject<Sealed>>,
         sync_wal: bool, /* NOTE: can possibly use options struct or config here */
     ) -> Result<()> {
         // NOTE: Any assertions here?
+        //
+        // NOTE: When we commit we do not need the type state anymore and can convert into inner heap allocated batch object
 
         // Need to try_acquire a token - if not we wait()
 
@@ -410,7 +412,7 @@ where
         todo!()
     }
 
-    pub(crate) fn prepare(&self, batch: NonNull<Batch<Sealed>>) -> Result<()> {
+    pub(crate) fn prepare(&self, batch: NonNull<Batch>) -> Result<()> {
         // XXX: In the future we may want to to have a SyncWal bool where we can decide if we want to fsync to WAL or not
         // Further to that we can also decide if we want to asynchronously wait for fsync to complete
         // But for now the commit will both wait for publish and fsync
@@ -439,7 +441,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn publish(&self, batch: &Batch<Sealed>) {
+    pub(crate) fn publish(&self, batch: &BatchObject<Sealed>) {
         todo!()
     }
 
@@ -461,10 +463,13 @@ mod tests {
             thread::{self, Scope, ScopedJoinHandle},
         };
 
-        use crate::sync::{Condvar, Mutex};
+        use crate::{
+            db::batch::Batch,
+            sync::{Condvar, Mutex},
+        };
 
         use crate::db::{
-            batch::{Batch, Sealed},
+            batch::{BatchObject, Sealed},
             write_pipeline::BatchQueue,
         };
 
@@ -544,20 +549,20 @@ mod tests {
                 f: F,
             ) -> ScopedJoinHandle<'scope, ConsumerCtx>
             where
-                F: FnOnce(NonNull<Batch<Sealed>>, &BatchQueue<N>) -> Option<NonNull<Batch<Sealed>>>
-                    + Send
-                    + 'scope,
-                C: FnOnce(&Batch<Sealed>) + Send + 'scope,
+                F: FnOnce(NonNull<Batch>, &BatchQueue<N>) -> Option<NonNull<Batch>> + Send + 'scope,
+                C: FnOnce(&Batch) + Send + 'scope,
             {
                 scope.spawn(move || {
-                    let batch = Batch::new().seal();
-                    let b_ptr = batch.non_null_ptr();
+                    let batch = BatchObject::new().seal().into_inner();
+                    let b_ptr = batch;
+
+                    let b_ref = unsafe { &*batch.as_ptr() };
 
                     self.wait_released(id, 1);
                     self.queue.enqueue(b_ptr);
                     self.set_stage(id, Stage::Enqueued);
 
-                    config(&batch);
+                    config(b_ref);
 
                     self.wait_released(id, 2);
                     self.set_stage(id, Stage::Ready);
@@ -569,8 +574,8 @@ mod tests {
                     self.set_stage(id, Stage::Done);
 
                     ConsumerCtx {
-                        published: batch.is_published(std::sync::atomic::Ordering::Relaxed),
-                        applied: batch.is_applied(std::sync::atomic::Ordering::Relaxed),
+                        published: b_ref.is_published(std::sync::atomic::Ordering::Relaxed),
+                        applied: b_ref.is_applied(std::sync::atomic::Ordering::Relaxed),
                         self_dequeued: self_dq,
                         did_dequeue: r.is_some(),
                     }
@@ -628,20 +633,20 @@ mod tests {
         let batch_q = BatchQueue::<4>::new();
         batch_q.head_tail.store(ht.raw(), Ordering::Release);
 
-        let batch = Batch::new().seal();
+        let batch = BatchObject::new().seal().into_inner();
 
-        batch_q.enqueue(unsafe { NonNull::new_unchecked(ptr::from_ref(&batch).cast_mut()) });
+        batch_q.enqueue(unsafe { batch });
     }
 
     #[test]
     fn enqueue_batch() {
-        let batch = Batch::new().seal();
+        let batch = BatchObject::new().seal().into_inner();
 
         let batch_q = BatchQueue::<4>::new();
 
-        batch_q.enqueue(batch.non_null_ptr());
+        batch_q.enqueue(batch);
 
-        assert!(batch_q.slots[0].load(Ordering::Relaxed) == ptr::from_ref(&batch).cast_mut());
+        assert!(batch_q.slots[0].load(Ordering::Relaxed) == batch.as_ptr());
         let (h, _) = HeadTail::unpack_unchecked(batch_q.head_tail.load(Ordering::Relaxed));
         assert!(h == 1);
     }
@@ -654,15 +659,16 @@ mod tests {
 
     // -------- Pipeline Tests -------- //
 
+    // TODO: Need to fix this test
     #[test]
     fn try_reserve() {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
+            fn apply_commit(&self, batch: &Batch) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
+            fn prepare_commit(&self, batch: &Batch) -> Result<()> {
                 Ok(())
             }
         }
@@ -724,10 +730,10 @@ mod tests {
     fn release_queue_two_threads() {
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
+            fn apply_commit(&self, batch: &Batch) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
+            fn prepare_commit(&self, batch: &Batch) -> Result<()> {
                 Ok(())
             }
         }
@@ -772,15 +778,16 @@ mod loom_tests {
 
     // ----------------- Loom Tests ----------------- //
 
+    // TODO: Need to fix test
     #[test]
     fn reserve_release_simple() {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
+            fn apply_commit(&self, batch: &Batch) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch<Sealed>) -> Result<()> {
+            fn prepare_commit(&self, batch: &Batch) -> Result<()> {
                 Ok(())
             }
         }
