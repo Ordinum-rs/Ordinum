@@ -10,7 +10,7 @@ use std::{
 use crate::{
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
     version::SeqNumState,
-    wal::writer::SyncPermit,
+    wal::SyncQueueSem,
 };
 
 use crate::{
@@ -265,7 +265,7 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     sem_cv: Condvar,
 
     // WAL fysnc reservation
-    sync_sem: SyncPermit,
+    sync_sem: SyncQueueSem,
 
     // Env trait
     env: Arc<E>,
@@ -285,8 +285,8 @@ where
     E: WriterEnv,
 {
     // New with specific size
-    pub(crate) fn new(env: Arc<E>, seq_state: Arc<SeqNumState>) -> Self {
-        Self::new_with_size(env, seq_state)
+    pub(crate) fn new(env: Arc<E>, seq_state: Arc<SeqNumState>, sync_sem: SyncQueueSem) -> Self {
+        Self::new_with_size(env, seq_state, sync_sem)
     }
 }
 
@@ -294,7 +294,11 @@ impl<const N: usize, E> WritePipeline<N, E>
 where
     E: WriterEnv,
 {
-    pub(crate) fn new_with_size(env: Arc<E>, seq_state: Arc<SeqNumState>) -> Self {
+    pub(crate) fn new_with_size(
+        env: Arc<E>,
+        seq_state: Arc<SeqNumState>,
+        sync_sem: SyncQueueSem,
+    ) -> Self {
         Self {
             batch_queue: BatchQueue::<N>::new(),
             batch_occupancy: AtomicU64::new(0 as u64),
@@ -303,8 +307,7 @@ where
             env,
 
             seq_state,
-
-            sync_sem: SyncPermit::default(),
+            sync_sem,
 
             q_mu: Mutex::new(()),
 
@@ -667,8 +670,9 @@ mod tests {
         let env = Arc::new(EnvStub {});
 
         let seq_state = Arc::new(SeqNumState::default());
+        let sync_sem = SyncQueueSem::default();
 
-        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone());
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
 
         assert!(wp.batch_queue.size() == 1);
 
@@ -731,8 +735,9 @@ mod tests {
         let env = Arc::new(EnvStub {});
 
         let seq_state = Arc::new(SeqNumState::default());
+        let sync_sem = SyncQueueSem::default();
 
-        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone());
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
 
         // We want two threads to race on releasing queue which has occupancy of 1
         // Should panic
