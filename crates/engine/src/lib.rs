@@ -13,7 +13,7 @@ mod key;
 mod memtable;
 mod options;
 mod range;
-mod thread_ctx;
+mod thread_local_storage;
 mod version;
 mod wal;
 
@@ -33,12 +33,22 @@ pub mod sync {
         pub use loom::sync::atomic::*;
     }
 
+    #[cfg(feature = "loom")]
+    pub mod cell {
+        pub use loom::cell::*;
+    }
+
     #[cfg(not(feature = "loom"))]
     pub use std::sync::{Arc, Condvar, Mutex};
 
     #[cfg(not(feature = "loom"))]
     pub mod atomic {
         pub use std::sync::atomic::*;
+    }
+
+    #[cfg(not(feature = "loom"))]
+    pub mod cell {
+        pub use std::cell::*;
     }
 
     pub fn spin_loop() {

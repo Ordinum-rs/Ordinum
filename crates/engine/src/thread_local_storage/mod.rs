@@ -1,7 +1,7 @@
 pub(crate) mod registry;
 pub(crate) mod scratch;
 
-use crate::thread_ctx::registry::ThreadCtx;
+use crate::thread_local_storage::registry::ThreadCtx;
 
 /*
 

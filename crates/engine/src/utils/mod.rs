@@ -1,6 +1,5 @@
 pub(crate) mod cache_padded;
 pub(crate) mod sync_points;
-pub(crate) mod tagged_pointer;
 pub(crate) mod var_int;
 
 #[inline]
