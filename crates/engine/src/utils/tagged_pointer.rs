@@ -27,8 +27,8 @@ use std::marker::PhantomData;
 // 4. TaggedPtr does not protect lifetime.
 // 5. It is not complete ABA prevention if the tag wraps.
 pub(crate) struct TaggedPtr<T> {
-    raw: usize,
-    _state: PhantomData<*mut T>,
+    ptr: *mut (),
+    _marker: PhantomData<*mut T>,
 }
 
 // TODO: Finish implementation

@@ -171,26 +171,6 @@ impl BatchObject<UnCommitted> {
     }
 }
 
-impl BatchObject<Sealed> {
-    pub(crate) fn non_null_ptr(&self) -> NonNull<Self> {
-        // # SAFETY
-        //
-        // `ptr::from_ref(self)` produces a non-null pointer to `self`.
-        //
-        // Casting to `*mut` is sound because this does not create an
-        // exclusive `&mut Self`; it only produces a raw pointer for
-        // publication into the commit queue.
-        //
-        // The caller must uphold:
-        //
-        // - `self` remains alive for the duration of queue publication.
-        // - `self` is not moved or returned to the pool after its pointer is published.
-        // - Any cross-thread mutation of `Batch<Sealed>` occurs only
-        //   through atomics or other synchronization primitives.
-        unsafe { NonNull::new_unchecked(ptr::from_ref(self).cast_mut()) }
-    }
-}
-
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
