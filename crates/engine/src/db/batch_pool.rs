@@ -12,7 +12,7 @@
 use std::{array, ptr::NonNull};
 
 use crate::{
-    db::batch::{Batch, BatchObject, Pooled},
+    db::batch::{Batch, BatchObject, NonNullBatchPtr, Pooled, UnCommitted},
     sync::{
         Mutex,
         atomic::{AtomicPtr, AtomicUsize},
@@ -75,7 +75,7 @@ pub(crate) struct ThreadBatchCache {
 impl ThreadBatchCache {}
 
 struct BatchPoolShard {
-    batches: Mutex<Vec<NonNull<Batch>>>,
+    batches: Mutex<Vec<NonNullBatchPtr>>,
 }
 
 impl Default for BatchPoolShard {
@@ -111,7 +111,19 @@ impl BatchPool {
         }
     }
 
-    pub(crate) fn acquire(&self) -> NonNull<Batch> {
+    pub(crate) fn acquire(&mut self) -> BatchObject<UnCommitted> {
+        // Easy path for test
+
+        if self.pool[0].batches.lock().unwrap().len() == 0 {
+            println!("Allocating");
+            BatchObject::new()
+        } else {
+            println!("Fetching from pool..");
+            BatchObject::from_batch_ptr(self.pool[0].batches.lock().unwrap().pop().unwrap())
+        }
+
+        // ==============
+
         // assertions
 
         // 1. Get thread-local batch cache
@@ -128,8 +140,6 @@ impl BatchPool {
         // 5. Allocate a small batch refill
         //    - Return one batch
         //    - Place remaining batches into TLS cache
-
-        todo!()
     }
 
     fn try_acquire(&self, thread_cache: &mut ThreadBatchCache) /* Enum return? */ {}
@@ -145,6 +155,30 @@ mod tests {
     use std::{sync::Barrier, thread};
 
     use super::*;
+
+    #[test]
+    fn basic_acquire() {
+        //
+
+        let mut pool = BatchPool::new();
+
+        pool.pool[0]
+            .batches
+            .lock()
+            .unwrap()
+            .push(BatchObject::<UnCommitted>::new().batch_ptr());
+
+        thread::scope(|s| {
+            let batch = pool.acquire();
+
+            s.spawn(|| {
+                let batch = pool.acquire();
+            });
+        });
+
+        //
+        //
+    }
 
     #[test]
     fn shard_index() {

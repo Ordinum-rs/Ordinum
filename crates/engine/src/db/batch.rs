@@ -53,6 +53,59 @@ pub(crate) enum BatchOp {
     // XXX: More operations in later updates
 }
 
+/// Owning pointer to a heap-allocated batch object.
+///
+/// `NonNullBatchPtr` is the stable allocation identity used by the batch pool and
+/// write pipeline. The pointed-to `Batch` is allocated with `Box::into_raw` and
+/// must be destroyed exactly once with `Box::from_raw` when it is no longer
+/// retained by the pool.
+///
+/// # Invariants
+///
+/// - The pointer is non-null, aligned, and was produced from `Box<Batch>`.
+/// - At any time, ownership is in exactly one phase:
+///   - retained by TLS cache,
+///   - retained by a global pool shard,
+///   - owned by an active `BatchObject<S>` handle,
+///   - or visible to the write pipeline until commit publication completes.
+/// - A batch must not be returned to TLS/global pool while any queue slot,
+///   write pipeline stage, caller, or worker thread may still access it.
+/// - Non-atomic batch fields may be mutated only by the current owner before
+///   publication, or by the write pipeline at protocol points that have
+///   exclusive access.
+/// - Cross-thread state changes after publication must use atomics or other
+///   synchronization.
+pub(super) struct NonNullBatchPtr(NonNull<Batch>);
+
+impl NonNullBatchPtr {
+    pub(super) fn as_ptr(&self) -> *mut Batch {
+        self.0.as_ptr()
+    }
+
+    pub(super) fn into_inner(&self) -> NonNull<Batch> {
+        self.0
+    }
+}
+
+// SAFETY:
+//
+// `BatchPtr` transfers ownership of a stable heap allocation between threads.
+// The pointer itself does not permit shared mutation. Safe APIs must preserve
+// the phase invariant: only one owner may mutate non-atomic batch state, and a
+// batch visible to the write pipeline may not be reused or destroyed.
+unsafe impl Send for NonNullBatchPtr {}
+
+impl Drop for NonNullBatchPtr {
+    fn drop(&mut self) {
+        // Println for testing
+
+        #[cfg(test)]
+        println!("Dropping batch ptr");
+
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) })
+    }
+}
+
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 //
 // Batch:
@@ -109,12 +162,19 @@ pub(crate) struct BatchObject<B: BatchCommitState> {
     _state: PhantomData<B>,
 
     // TODO: Once heap allocated this should be the heap object - either NonNull or Box
-    inner: NonNull<Batch>,
+    inner: NonNullBatchPtr,
 }
 
 impl<B: BatchCommitState> BatchObject<B> {
-    pub(crate) fn into_inner(self) -> NonNull<Batch> {
+    pub(crate) fn batch_ptr(self) -> NonNullBatchPtr {
         self.inner
+    }
+
+    pub(crate) fn from_batch_ptr(ptr: NonNullBatchPtr) -> Self {
+        Self {
+            inner: ptr,
+            _state: PhantomData,
+        }
     }
 }
 
@@ -123,24 +183,27 @@ impl BatchObject<UnCommitted> {
         VarInt::new(DEFAULT_CF_ID)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new() -> Self {
+    // We need to document and maybe think of a safe way to avoid leaking the memory from box leak
+    // Maybe through a custom NewType which wraps NonNull<Batch> and ensure through drop that we Box::from_raw(_) and destroy properly
+    pub(super) fn new() -> Self {
         let inner = Box::new(Batch::new());
 
         Self {
-            inner: NonNull::from(Box::leak(inner)),
+            // XXX: Is there a safer way to do this - unwrap() is scary
+            inner: NonNullBatchPtr(NonNull::new(Box::into_raw(inner)).unwrap()),
             _state: PhantomData,
         }
     }
 
-    pub(crate) fn new_with_capacity(cap: usize) -> Self {
+    pub(super) fn new_with_capacity(cap: usize) -> Self {
         let batch = Box::new(Batch::new_with_capacity(cap));
 
         //
 
         Self {
             _state: PhantomData,
-            inner: NonNull::from(Box::leak(batch)),
+            // XXX: Is there a safer way to do this - unwrap() is scary
+            inner: NonNullBatchPtr(NonNull::new(Box::into_raw(batch)).unwrap()),
         }
     }
 
@@ -205,8 +268,8 @@ pub(super) struct Batch {
     is_published: AtomicBool,
     //
     //
-    // Pool logic
-    // TODO: Add field pool_next: ___,
+
+    // Signalling mechanisms which will be Arc<> - The batch is heap alloacated so the signalling mechanisms will be stable
 }
 
 impl Batch {
@@ -308,14 +371,14 @@ mod tests {
 
     #[test]
     fn batch_new() {
-        let batch = BatchObject::new().into_inner();
+        let batch = BatchObject::new().batch_ptr();
         let b_ref = unsafe { &*batch.as_ptr() };
         assert!(b_ref.count == 0);
     }
 
     #[test]
     fn assign_seq_num() {
-        let batch = BatchObject::new_with_capacity(10).into_inner();
+        let batch = BatchObject::new_with_capacity(10).batch_ptr();
 
         let b_ref = unsafe { &*batch.as_ptr() };
 

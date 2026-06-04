@@ -392,10 +392,15 @@ where
 
     //
 
+    // XXX: We may want a commit_sync(self) where we do move ownership and do not allow NoSyncWait or commit to return whilst the batch is queued
+    // this provides greater safety and also can be more efficient with returning the batch back to cache/pool as soon as possible rather than leaving
+    // it up to the caller
+
     pub(crate) fn commit(
-        &self,
-        // NOTE: Should we take Batch<Sealed>?
-        batch: NonNull<BatchObject<Sealed>>,
+        // TODO: Commit should take a (mutable?) reference to the BatchObject so the Caller retains ownership of the underlying NonNullBatchPtr
+        // and can call Close() / Return() after commit()
+        &mut self,
+        batch: BatchObject<Sealed>,
         sync_wal: bool, /* NOTE: can possibly use options struct or config here */
     ) -> Result<()> {
         // NOTE: Any assertions here?
@@ -553,8 +558,8 @@ mod tests {
                 C: FnOnce(&Batch) + Send + 'scope,
             {
                 scope.spawn(move || {
-                    let batch = BatchObject::new().seal().into_inner();
-                    let b_ptr = batch;
+                    let batch = BatchObject::new().seal().batch_ptr();
+                    let b_ptr = batch.into_inner();
 
                     let b_ref = unsafe { &*batch.as_ptr() };
 
@@ -633,18 +638,20 @@ mod tests {
         let batch_q = BatchQueue::<4>::new();
         batch_q.head_tail.store(ht.raw(), Ordering::Release);
 
-        let batch = BatchObject::new().seal().into_inner();
+        let batch = BatchObject::new().seal().batch_ptr();
+        let b_ptr = batch.into_inner();
 
-        batch_q.enqueue(unsafe { batch });
+        batch_q.enqueue(b_ptr);
     }
 
     #[test]
     fn enqueue_batch() {
-        let batch = BatchObject::new().seal().into_inner();
+        let batch = BatchObject::new().seal().batch_ptr();
+        let b_ptr = batch.into_inner();
 
         let batch_q = BatchQueue::<4>::new();
 
-        batch_q.enqueue(batch);
+        batch_q.enqueue(b_ptr);
 
         assert!(batch_q.slots[0].load(Ordering::Relaxed) == batch.as_ptr());
         let (h, _) = HeadTail::unpack_unchecked(batch_q.head_tail.load(Ordering::Relaxed));
@@ -698,7 +705,7 @@ mod tests {
                 //
                 barrier.wait();
 
-                wp.try_reserve_space();
+                wp.reserve_space();
                 reserved.store(true, Ordering::Release);
             });
 
@@ -794,10 +801,12 @@ mod loom_tests {
 
         loom::model(|| {
             let env = Arc::new(EnvStub);
-            let seq_state = Arc::new(SequenceState::default());
+            let seq_state = Arc::new(SeqNumState::default());
+            let sync_sem = SyncQueueSem::default();
             let wp = Arc::new(WritePipeline::<1, EnvStub>::new_with_size(
                 env,
                 seq_state.clone(),
+                sync_sem,
             ));
 
             let inside = Arc::new(AtomicUsize::new(0));
