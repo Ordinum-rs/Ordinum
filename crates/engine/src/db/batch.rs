@@ -24,6 +24,7 @@ use std::{marker::PhantomData, sync::atomic::AtomicU8};
 use crate::db::DEFAULT_CF_ID;
 use crate::db::{self, db_impl::DbImpl};
 use crate::utils::var_int::VarInt;
+use crate::{Error, Result};
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
@@ -75,15 +76,23 @@ pub(crate) enum BatchOp {
 ///   exclusive access.
 /// - Cross-thread state changes after publication must use atomics or other
 ///   synchronization.
-pub(super) struct NonNullBatchPtr(NonNull<Batch>);
+pub(super) struct NonNullBatchPtr {
+    ptr: NonNull<Batch>,
+}
 
 impl NonNullBatchPtr {
     pub(super) fn as_ptr(&self) -> *mut Batch {
-        self.0.as_ptr()
+        self.ptr.as_ptr()
     }
 
-    pub(super) fn into_inner(&self) -> NonNull<Batch> {
-        self.0
+    pub(super) fn as_non_null(&self) -> NonNull<Batch> {
+        self.ptr
+    }
+}
+
+impl From<NonNull<Batch>> for NonNullBatchPtr {
+    fn from(ptr: NonNull<Batch>) -> Self {
+        NonNullBatchPtr { ptr }
     }
 }
 
@@ -97,12 +106,7 @@ unsafe impl Send for NonNullBatchPtr {}
 
 impl Drop for NonNullBatchPtr {
     fn drop(&mut self) {
-        // Println for testing
-
-        #[cfg(test)]
-        println!("Dropping batch ptr");
-
-        drop(unsafe { Box::from_raw(self.0.as_ptr()) })
+        drop(unsafe { Box::from_raw(self.ptr.as_ptr()) })
     }
 }
 
@@ -166,14 +170,18 @@ pub(crate) struct BatchObject<B: BatchCommitState> {
 }
 
 impl<B: BatchCommitState> BatchObject<B> {
-    pub(crate) fn batch_ptr(self) -> NonNullBatchPtr {
-        self.inner
+    pub(crate) fn as_ptr(&self) -> *mut Batch {
+        self.inner.as_ptr()
+    }
+
+    pub(crate) fn as_non_null(&self) -> NonNull<Batch> {
+        self.inner.as_non_null()
     }
 
     pub(crate) fn from_batch_ptr(ptr: NonNullBatchPtr) -> Self {
         Self {
-            inner: ptr,
             _state: PhantomData,
+            inner: ptr,
         }
     }
 }
@@ -190,7 +198,7 @@ impl BatchObject<UnCommitted> {
 
         Self {
             // XXX: Is there a safer way to do this - unwrap() is scary
-            inner: NonNullBatchPtr(NonNull::new(Box::into_raw(inner)).unwrap()),
+            inner: NonNullBatchPtr::from(NonNull::new(Box::into_raw(inner)).unwrap()),
             _state: PhantomData,
         }
     }
@@ -203,8 +211,12 @@ impl BatchObject<UnCommitted> {
         Self {
             _state: PhantomData,
             // XXX: Is there a safer way to do this - unwrap() is scary
-            inner: NonNullBatchPtr(NonNull::new(Box::into_raw(batch)).unwrap()),
+            inner: NonNullBatchPtr::from(NonNull::new(Box::into_raw(batch)).unwrap()),
         }
+    }
+
+    pub(super) fn into_inner(self) -> NonNullBatchPtr {
+        self.inner
     }
 
     pub(crate) fn put<K, V>(&self, key: K, value: V)
@@ -231,6 +243,24 @@ impl BatchObject<UnCommitted> {
             _state: PhantomData,
             inner: self.inner,
         }
+    }
+}
+
+impl BatchObject<Sealed> {
+    pub(crate) fn Close(&self) -> Result<()> {
+        //
+        // This needs to make sure we check runtime state and wait for completion before doing anything
+        //
+        //
+        todo!()
+    }
+
+    pub(crate) fn Reset(&self) -> Result<()> {
+        //
+        // This needs to make sure we check runtime state and wait for completion before doing anything
+        //
+        //
+        todo!()
     }
 }
 
@@ -365,20 +395,40 @@ impl Batch {
     }
 }
 
+pub(crate) struct BatchRef<'env> {
+    batch: &'env Batch,
+}
+
+impl<'env> BatchRef<'env> {
+    pub(crate) fn from_batch(batch: &'env Batch) -> Self {
+        Self { batch }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn batch_ptr_drop() {
+        let b = BatchObject::new();
+
+        let b_ptr = b.as_non_null();
+        let b_ptr2 = b.as_non_null();
+
+        assert_eq!(b_ptr, b_ptr2);
+    }
+
+    #[test]
     fn batch_new() {
-        let batch = BatchObject::new().batch_ptr();
+        let mut batch = BatchObject::new();
         let b_ref = unsafe { &*batch.as_ptr() };
         assert!(b_ref.count == 0);
     }
 
     #[test]
     fn assign_seq_num() {
-        let batch = BatchObject::new_with_capacity(10).batch_ptr();
+        let mut batch = BatchObject::new_with_capacity(10);
 
         let b_ref = unsafe { &*batch.as_ptr() };
 

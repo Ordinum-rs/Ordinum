@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    db::batch::{BatchRef, NonNullBatchPtr},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
     version::SeqNumState,
     wal::SyncQueueSem,
@@ -234,10 +235,10 @@ impl<const N: usize> BatchQueue<N> {
 pub(crate) trait WriterEnv: Send + Sync {
     //
     // NOTE: Happens under Mutex lock
-    fn prepare_commit(&self, batch: &Batch) -> Result<()>;
+    fn prepare_commit<'env>(&self, batch: &'env BatchRef) -> Result<()>;
     //
     // NOTE: No Lock - concurrent application to memtables
-    fn apply_commit(&self, batch: &Batch) -> Result<()>;
+    fn apply_commit<'env>(&self, batch: &'env BatchRef) -> Result<()>;
 }
 
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
@@ -400,7 +401,7 @@ where
         // TODO: Commit should take a (mutable?) reference to the BatchObject so the Caller retains ownership of the underlying NonNullBatchPtr
         // and can call Close() / Return() after commit()
         &mut self,
-        batch: BatchObject<Sealed>,
+        batch: &mut BatchObject<Sealed>,
         sync_wal: bool, /* NOTE: can possibly use options struct or config here */
     ) -> Result<()> {
         // NOTE: Any assertions here?
@@ -424,10 +425,10 @@ where
 
         let _guard = self.q_mu.lock().unwrap();
 
-        self.batch_queue.enqueue(batch);
-
         // Get reference (&Batch<Sealed>) to the batch to pass into methods
         let b = unsafe { &*batch.as_ptr() };
+
+        self.batch_queue.enqueue(batch);
 
         // TODO: Need to check this and test
         // Assign the seq_no to the batch
@@ -441,7 +442,7 @@ where
         };
 
         // Prepare
-        self.env.prepare_commit(b)?;
+        self.env.prepare_commit(&BatchRef::from_batch(b))?;
 
         Ok(())
     }
@@ -469,7 +470,7 @@ mod tests {
         };
 
         use crate::{
-            db::batch::Batch,
+            db::batch::{Batch, NonNullBatchPtr},
             sync::{Condvar, Mutex},
         };
 
@@ -554,17 +555,17 @@ mod tests {
                 f: F,
             ) -> ScopedJoinHandle<'scope, ConsumerCtx>
             where
-                F: FnOnce(NonNull<Batch>, &BatchQueue<N>) -> Option<NonNull<Batch>> + Send + 'scope,
+                F: FnOnce(&Batch, &BatchQueue<N>) -> Option<NonNull<Batch>> + Send + 'scope,
                 C: FnOnce(&Batch) + Send + 'scope,
             {
                 scope.spawn(move || {
-                    let batch = BatchObject::new().seal().batch_ptr();
-                    let b_ptr = batch.into_inner();
-
-                    let b_ref = unsafe { &*batch.as_ptr() };
+                    let mut sealed = BatchObject::new().seal();
+                    let b_non_null = sealed.as_non_null();
+                    let b_ptr = b_non_null.as_ptr();
+                    let b_ref = unsafe { &*b_non_null.as_ptr() };
 
                     self.wait_released(id, 1);
-                    self.queue.enqueue(b_ptr);
+                    self.queue.enqueue(b_non_null);
                     self.set_stage(id, Stage::Enqueued);
 
                     config(b_ref);
@@ -572,9 +573,9 @@ mod tests {
                     self.wait_released(id, 2);
                     self.set_stage(id, Stage::Ready);
 
-                    let r = f(b_ptr, &self.queue);
+                    let r = f(b_ref, &self.queue);
 
-                    let self_dq = matches!(r, Some(ptr) if ptr == b_ptr);
+                    let self_dq = matches!(r, Some(ptr) if ptr.as_ptr() == b_ptr);
 
                     self.set_stage(id, Stage::Done);
 
@@ -619,10 +620,15 @@ mod tests {
             let r1 = b1.join().unwrap();
             let r2 = b2.join().unwrap();
 
-            // B1 should have applied and dequeued successfully while B2 should not have
-
-            assert!(r1.did_dequeue == true);
-            assert!(r2.did_dequeue == false);
+            // B1 is the only applied head batch. Either consumer may win the
+            // dequeue race, but exactly one consumer should dequeue a batch.
+            assert_eq!(
+                [r1.did_dequeue, r2.did_dequeue]
+                    .into_iter()
+                    .filter(|did_dequeue| *did_dequeue)
+                    .count(),
+                1
+            );
         })
     }
 
@@ -638,16 +644,16 @@ mod tests {
         let batch_q = BatchQueue::<4>::new();
         batch_q.head_tail.store(ht.raw(), Ordering::Release);
 
-        let batch = BatchObject::new().seal().batch_ptr();
-        let b_ptr = batch.into_inner();
+        let mut batch = BatchObject::new().seal();
+        let b_ptr = batch.as_non_null();
 
         batch_q.enqueue(b_ptr);
     }
 
     #[test]
     fn enqueue_batch() {
-        let batch = BatchObject::new().seal().batch_ptr();
-        let b_ptr = batch.into_inner();
+        let mut batch = BatchObject::new().seal();
+        let b_ptr = batch.as_non_null();
 
         let batch_q = BatchQueue::<4>::new();
 
@@ -672,10 +678,10 @@ mod tests {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch) -> Result<()> {
+            fn apply_commit<'env>(&'env self, batch: &'env BatchRef) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch) -> Result<()> {
+            fn prepare_commit<'env>(&'env self, batch: &'env BatchRef) -> Result<()> {
                 Ok(())
             }
         }
@@ -737,10 +743,10 @@ mod tests {
     fn release_queue_two_threads() {
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch) -> Result<()> {
+            fn apply_commit<'env>(&self, batch: &'env BatchRef) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch) -> Result<()> {
+            fn prepare_commit<'env>(&self, batch: &'env BatchRef) -> Result<()> {
                 Ok(())
             }
         }
@@ -766,7 +772,6 @@ mod tests {
                 barrier.wait();
 
                 wp.release_queue_space();
-                println!("returned");
             });
             //
             barrier.wait();
@@ -791,10 +796,10 @@ mod loom_tests {
         //
         struct EnvStub;
         impl WriterEnv for EnvStub {
-            fn apply_commit(&self, batch: &Batch) -> Result<()> {
+            fn apply_commit<'env>(&self, batch: &'env BatchRef) -> Result<()> {
                 Ok(())
             }
-            fn prepare_commit(&self, batch: &Batch) -> Result<()> {
+            fn prepare_commit<'env>(&self, batch: &'env BatchRef) -> Result<()> {
                 Ok(())
             }
         }

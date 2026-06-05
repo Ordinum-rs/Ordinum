@@ -101,6 +101,9 @@ pub(crate) struct BatchPool {
     // XXX: Later we may want to hold ownership of the batches such as Vec<Box<Batch>> or custom Slab Allocator??
     // This would help with cache locality in memory and upfront allocation for predicted workloads
     next_shard: AtomicUsize,
+    //
+    // TODO: Add metrics
+    // __
 }
 
 impl BatchPool {
@@ -166,7 +169,7 @@ mod tests {
             .batches
             .lock()
             .unwrap()
-            .push(BatchObject::<UnCommitted>::new().batch_ptr());
+            .push(BatchObject::<UnCommitted>::new().into_inner());
 
         thread::scope(|s| {
             let batch = pool.acquire();

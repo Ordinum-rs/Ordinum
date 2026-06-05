@@ -2,7 +2,7 @@ use crate::{
     Error, Result,
     column_family::cf::ColumnFamilyData,
     db::{
-        batch::{Batch, BatchObject, Sealed},
+        batch::{Batch, BatchObject, BatchRef, Sealed},
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
         write_batch::WBatch,
         write_pipeline::{WritePipeline, WriterEnv},
@@ -21,12 +21,12 @@ pub(crate) struct DbImpl {
 
 impl WriterEnv for DbImpl {
     //
-    fn apply_commit(&self, batch: &Batch) -> Result<()> {
+    fn apply_commit<'env>(&self, batch: &'env BatchRef) -> Result<()> {
         //
         Ok(())
     }
     //
-    fn prepare_commit(&self, batch: &Batch) -> Result<()> {
+    fn prepare_commit<'env>(&self, batch: &'env BatchRef) -> Result<()> {
         //
         Ok(())
     }
