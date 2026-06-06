@@ -48,9 +48,9 @@ mod tests {
 
         batch.put(b"Hello", b"There");
 
-        let mut sealed_batch = batch.seal();
+        let sealed_batch = batch.seal();
 
-        wp.commit(&mut sealed_batch, false).expect("Ahhhhhh")
+        wp.commit(&sealed_batch).expect("Ahhhhhh")
 
         // The caller retains ownership of `sealed_batch` throughout the commit.
         // The pipeline only borrows the underlying Batch via its stable heap address.

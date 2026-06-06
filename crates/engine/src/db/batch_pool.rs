@@ -17,6 +17,7 @@ use crate::{
         Mutex,
         atomic::{AtomicPtr, AtomicUsize},
     },
+    thread_local_storage::TCTX,
     utils::cache_padded::CachePadded,
 };
 
@@ -69,7 +70,7 @@ const MAX_BATCHES_PER_THREAD_CACHE: usize = 4;
 
 pub(crate) struct ThreadBatchCache {
     pub(crate) shard_idx: Option<usize>,
-    pub(crate) batches: Vec<NonNull<Batch>>,
+    pub(crate) batches: Vec<NonNullBatchPtr>,
 }
 
 impl ThreadBatchCache {}
@@ -107,6 +108,7 @@ pub(crate) struct BatchPool {
 }
 
 impl BatchPool {
+    // XXX: Once we have a stable DB we can make this pub(super) so that only objects that hold a pool can create one
     pub(crate) fn new() -> Self {
         Self {
             pool: array::from_fn(|_| CachePadded::new(BatchPoolShard::default())),
@@ -114,41 +116,61 @@ impl BatchPool {
         }
     }
 
-    pub(crate) fn acquire(&mut self) -> BatchObject<UnCommitted> {
+    //
+    //
+    //
+    //
+    fn try_acquire_from_tls(
+        &self,
+        cache: &mut ThreadBatchCache,
+    ) -> Option<BatchObject<UnCommitted>> {
+        cache.batches.pop().map_or(None, |batch| {
+            Some(BatchObject::<UnCommitted>::from_batch_ptr(batch))
+        })
+    }
+
+    pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
         // Easy path for test
 
-        if self.pool[0].batches.lock().unwrap().len() == 0 {
-            println!("Allocating");
-            BatchObject::new()
-        } else {
-            println!("Fetching from pool..");
-            BatchObject::from_batch_ptr(self.pool[0].batches.lock().unwrap().pop().unwrap())
-        }
+        // if self.pool[0].batches.lock().unwrap().len() == 0 {
+        //     println!("Allocating");
+        //     BatchObject::new()
+        // } else {
+        //     println!("Fetching from pool..");
+        //     BatchObject::from_batch_ptr(self.pool[0].batches.lock().unwrap().pop().unwrap())
+        // }
 
         // ==============
 
-        // assertions
+        // 0. Assertions
 
-        // 1. Get thread-local batch cache
+        TCTX.with(|ctx| {
+            //
+            // Lazy shard assign check
 
-        // 2. Lazily assign shard if cache has not yet been assigned one
+            let tls_cache =
+                ctx.thread_batch_cache_mut(/* We would pull this from the DB or TLS ID? */ 0);
 
-        // 3. Try acquire from TLS cache
-        //    - Return immediately on hit
+            // 1. Try acquire from TLS cache
+            //    - Return immediately on hit
+            match self.try_acquire_from_tls(tls_cache).or_else(|| {
+                //
+                // 2. Try to refill from pool (which will allocate if global is empty)
+                // 3. Try acquire from TLS again
 
-        // 4. Try acquire from assigned shard
-        //    - Refill TLS cache on hit
-        //    - Return one batch
+                Some(BatchObject::new())
+            }) {
+                Some(batch) => return batch,
+                None => {
+                    panic!("Could not acquire from TLS or Pool and could not Allocate")
+                }
+            }
+        })
 
-        // 5. Allocate a small batch refill
-        //    - Return one batch
-        //    - Place remaining batches into TLS cache
-    }
-
-    fn try_acquire(&self, thread_cache: &mut ThreadBatchCache) /* Enum return? */ {}
-
-    pub(crate) fn thread_cache(&self, ctx: &mut ThreadBatchCache) -> NonNull<Batch> {
-        todo!()
+        //
+        //
+        //
+        //
     }
 }
 

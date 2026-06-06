@@ -1,7 +1,3 @@
-//
-// Protyping a commit pipeline similar to pebble - rather than a leader/follower rocks style write_thread
-//
-
 use std::{
     array,
     ptr::{self, NonNull, null_mut},
@@ -91,7 +87,7 @@ impl HeadTail {
 // tail = 1
 // Range = [tail, head) i.e. [1,3)
 //
-// Each slot = AtomicPtr<Batch<Sealed>>
+// Each slot = AtomicPtr<Batch>
 // Null slot = Producer Owns Slot
 // Non Null  = Consumer Owns Slot
 //
@@ -230,8 +226,6 @@ impl<const N: usize> BatchQueue<N> {
 // This separation keeps the WritePipeline focused on ordering semantics
 // while allowing the DB layer to retain ownership of storage policy and
 // lifecycle management.
-
-// TODO: Finish the trait
 pub(crate) trait WriterEnv: Send + Sync {
     //
     // NOTE: Happens under Mutex lock
@@ -322,7 +316,7 @@ where
         //
         // 1. loop 200 times using a "pause" for 1 micro sec
         // 2. Thread::yield()
-        // 3. Thread parking (rocks uses Mutex and CondVar)
+        // 3. Mutex and CondVar
         //
         // This is inspired by Rocks code see: https://github.com/facebook/rocksdb/blob/763401b595c8c1647908356e42525aadd0b90eae/db/write_thread.cc#L64
         for _ in 0..200 {
@@ -396,13 +390,31 @@ where
     // XXX: We may want a commit_sync(self) where we do move ownership and do not allow NoSyncWait or commit to return whilst the batch is queued
     // this provides greater safety and also can be more efficient with returning the batch back to cache/pool as soon as possible rather than leaving
     // it up to the caller
+    //
+
+    pub(crate) fn commit_sync(&self, batch: &BatchObject<Sealed>) -> Result<()> {
+        // NOTE: Any assertions here?
+        //
+        // NOTE: When we commit we do not need the type state anymore and can convert into inner heap allocated batch object
+
+        // Need to try_acquire a token - if not we wait()
+
+        // Hand off to DB which will carry out the write
+        //
+
+        // Commit Sync will not return until the batch has been applied, and fsynced
+
+        //
+        //
+        //
+        todo!()
+    }
 
     pub(crate) fn commit(
         // TODO: Commit should take a (mutable?) reference to the BatchObject so the Caller retains ownership of the underlying NonNullBatchPtr
         // and can call Close() / Return() after commit()
-        &mut self,
-        batch: &mut BatchObject<Sealed>,
-        sync_wal: bool, /* NOTE: can possibly use options struct or config here */
+        &self,
+        batch: &BatchObject<Sealed>,
     ) -> Result<()> {
         // NOTE: Any assertions here?
         //

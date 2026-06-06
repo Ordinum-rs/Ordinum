@@ -38,6 +38,27 @@ impl ThreadCtx {
     // pub(crate) fn sv_cache_mut(&self) -> &mut SVCache {
     // unsafe { &mut *self.sv_cache.get() }
     // }
+    //
+
+    // TODO: Need SAFETY Comments
+    fn db_instance(&self, db_id: usize) -> &DBInstanceCtx {
+        //
+        let db_vec = unsafe { &*self.db_instance.get() };
+
+        assert!(db_id < db_vec.len());
+
+        &db_vec[db_id]
+    }
+
+    // TODO: Need SAFETY Comments
+    pub(crate) fn thread_batch_cache(&self, db_id: usize) -> &ThreadBatchCache {
+        unsafe { &*self.db_instance(db_id).batch_cache.get() }
+    }
+
+    // TODO: Need SAFETY Comments
+    pub(crate) fn thread_batch_cache_mut(&self, db_id: usize) -> &mut ThreadBatchCache {
+        unsafe { &mut *self.db_instance(db_id).batch_cache.get() }
+    }
 }
 
 #[test]

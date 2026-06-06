@@ -170,15 +170,15 @@ pub(crate) struct BatchObject<B: BatchCommitState> {
 }
 
 impl<B: BatchCommitState> BatchObject<B> {
-    pub(crate) fn as_ptr(&self) -> *mut Batch {
+    pub(super) fn as_ptr(&self) -> *mut Batch {
         self.inner.as_ptr()
     }
 
-    pub(crate) fn as_non_null(&self) -> NonNull<Batch> {
+    pub(super) fn as_non_null(&self) -> NonNull<Batch> {
         self.inner.as_non_null()
     }
 
-    pub(crate) fn from_batch_ptr(ptr: NonNullBatchPtr) -> Self {
+    pub(super) fn from_batch_ptr(ptr: NonNullBatchPtr) -> Self {
         Self {
             _state: PhantomData,
             inner: ptr,
