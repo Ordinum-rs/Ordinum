@@ -3,6 +3,7 @@ use crate::{
     column_family::cf::ColumnFamilyData,
     db::{
         batch::{Batch, BatchObject, BatchRef, Sealed},
+        batch_pool::BatchPool,
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
         write_batch::WBatch,
         write_pipeline::{WritePipeline, WriterEnv},
@@ -17,6 +18,7 @@ pub(crate) struct DbImpl {
     _p: PhantomData<()>,
     //
     version_set: VersionSet,
+    batch_pool: Arc<BatchPool>,
 }
 
 impl WriterEnv for DbImpl {

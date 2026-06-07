@@ -1,9 +1,16 @@
 pub(crate) mod registry;
 pub(crate) mod scratch;
 
-use crate::thread_local_storage::registry::ThreadCtx;
+use crate::sync::atomic::AtomicUsize;
+use crate::thread_local_storage::registry::{DBInstanceCtx, ThreadCtx};
+
+// DOCS: Add information about this and maybe think about where this is best placed
+static NEXT_DB_TLD_ID: AtomicUsize = AtomicUsize::new(0);
 
 /*
+
+
+
 
 Thread Context gives us a thread local storage container for different structures
 
@@ -28,11 +35,11 @@ struct ThreadContext {
 //
 // 3. References must not escape the scope of mutation or the scope of the thread unless designed for.
 
-use std::cell::RefCell;
+use crate::sync::cell::RefCell;
 
 // TODO: Should i remove ref cell and wrap the hazard_pointer in UnsafeCell or RefCell so we don't borrow_mut() on whole TLS?
 thread_local! {
-    pub(crate) static TCTX: ThreadCtx = ThreadCtx::new()
+    static TCTX: ThreadCtx = ThreadCtx::new()
 }
 
 pub(crate) fn thread_ctx<F, R>(f: F) -> R
@@ -40,6 +47,13 @@ where
     F: FnOnce(&ThreadCtx) -> R,
 {
     TCTX.with(|ctx| f(ctx))
+}
+
+pub(crate) fn thread_db_instance_ctx<F, R>(db_id: usize, f: F) -> R
+where
+    F: FnOnce(&DBInstanceCtx) -> R,
+{
+    TCTX.with(|ctx| f(ctx.db_instance(db_id)))
 }
 
 #[cfg(test)]

@@ -5,26 +5,57 @@
 //
 
 use crate::db::batch_pool::ThreadBatchCache;
+use crate::sync::cell;
+use crate::sync::cell::RefCell;
+use crate::sync::cell::RefMut;
 use crate::thread_local_storage::TCTX;
 use crate::version::superversion::SVCache;
 
 //
-use crate::sync::cell;
 use std::cell::UnsafeCell;
 use std::ops::Bound::Unbounded;
+use std::pin::{self, Pin};
 use std::ptr::NonNull;
 
 pub(crate) struct DBInstanceCtx {
+    // TODO: Writers will be able to walk the linked list of DBInstanceCtx for the DB when changing a superversion to invalidate
+    // a Cached SV so we must maintain strict Safety invariants for this
+    //
+    // Should we Box this?
     // sv_cache: UnsafeCell<SVCache>,
-    batch_cache: UnsafeCell<ThreadBatchCache>,
+    //
+    // TODO: Document the strict invariants for accessing this field
+    batch_cache: RefCell<ThreadBatchCache>,
     // NOTE: Add PerfContext/Metrics
     // NOTE: Add IOContext/Metrics
+}
+
+impl DBInstanceCtx {
+    pub(crate) fn new() -> Self {
+        Self {
+            batch_cache: RefCell::new(ThreadBatchCache::new()),
+        }
+    }
+
+    // TODO: Need SAFETY Comments
+    pub(crate) fn thread_batch_cache_mut<F, R>(&self, db_id: usize, f: F) -> R
+    where
+        F: FnOnce(&mut ThreadBatchCache) -> R,
+    {
+        // unsafe { &mut *self.db_instance(db_id).batch_cache.borrow_mut() }
+        let mut cache = self.batch_cache.borrow_mut();
+        f(&mut cache)
+    }
 }
 
 pub(crate) struct ThreadCtx {
     // XXX: Future optimisation baked in now
     // Indexed by tls_id/db_id
-    db_instance: UnsafeCell<Vec<DBInstanceCtx>>,
+    //
+    // Vec will change or move contents on re-allocation, we need to ensure that the objects stored are at stable addresses
+    //
+    // XXX: Make this into a cleaner type
+    db_instance: UnsafeCell<Vec<Option<Pin<Box<DBInstanceCtx>>>>>,
 }
 
 // TODO: Need to implement thread ctx drop
@@ -32,7 +63,9 @@ pub(crate) struct ThreadCtx {
 
 impl ThreadCtx {
     pub(crate) fn new() -> Self {
-        todo!()
+        Self {
+            db_instance: UnsafeCell::new(Vec::new()),
+        }
     }
 
     // pub(crate) fn sv_cache_mut(&self) -> &mut SVCache {
@@ -41,23 +74,15 @@ impl ThreadCtx {
     //
 
     // TODO: Need SAFETY Comments
-    fn db_instance(&self, db_id: usize) -> &DBInstanceCtx {
+    pub(super) fn db_instance(&self, db_id: usize) -> &DBInstanceCtx {
         //
-        let db_vec = unsafe { &*self.db_instance.get() };
+        let db_vec = unsafe { &mut *self.db_instance.get() };
 
-        assert!(db_id < db_vec.len());
+        if db_vec.len() <= db_id {
+            db_vec.resize_with(db_id + 1, || None);
+        }
 
-        &db_vec[db_id]
-    }
-
-    // TODO: Need SAFETY Comments
-    pub(crate) fn thread_batch_cache(&self, db_id: usize) -> &ThreadBatchCache {
-        unsafe { &*self.db_instance(db_id).batch_cache.get() }
-    }
-
-    // TODO: Need SAFETY Comments
-    pub(crate) fn thread_batch_cache_mut(&self, db_id: usize) -> &mut ThreadBatchCache {
-        unsafe { &mut *self.db_instance(db_id).batch_cache.get() }
+        db_vec[db_id].get_or_insert_with(|| Pin::new(Box::new(DBInstanceCtx::new())))
     }
 }
 

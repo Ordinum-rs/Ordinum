@@ -17,7 +17,7 @@ use crate::{
         Mutex,
         atomic::{AtomicPtr, AtomicUsize},
     },
-    thread_local_storage::TCTX,
+    thread_local_storage::{thread_ctx, thread_db_instance_ctx},
     utils::cache_padded::CachePadded,
 };
 
@@ -73,7 +73,14 @@ pub(crate) struct ThreadBatchCache {
     pub(crate) batches: Vec<NonNullBatchPtr>,
 }
 
-impl ThreadBatchCache {}
+impl ThreadBatchCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            shard_idx: None,
+            batches: Vec::new(),
+        }
+    }
+}
 
 struct BatchPoolShard {
     batches: Mutex<Vec<NonNullBatchPtr>>,
@@ -129,6 +136,8 @@ impl BatchPool {
         })
     }
 
+    fn refill_tls_cache(&self, cache: &mut ThreadBatchCache) {}
+
     pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
         // Easy path for test
 
@@ -144,27 +153,29 @@ impl BatchPool {
 
         // 0. Assertions
 
-        TCTX.with(|ctx| {
+        thread_db_instance_ctx(0, |ctx| {
             //
             // Lazy shard assign check
 
-            let tls_cache =
-                ctx.thread_batch_cache_mut(/* We would pull this from the DB or TLS ID? */ 0);
+            return ctx.thread_batch_cache_mut(
+                /* We would pull this from the DB */ 0,
+                |cache| {
+                    // 1. Try acquire from TLS cache
+                    //    - Return immediately on hit
+                    match self.try_acquire_from_tls(cache).or_else(|| {
+                        //
+                        // 2. Try to refill from pool (which will allocate if global is empty)
+                        // 3. Try acquire from TLS again
 
-            // 1. Try acquire from TLS cache
-            //    - Return immediately on hit
-            match self.try_acquire_from_tls(tls_cache).or_else(|| {
-                //
-                // 2. Try to refill from pool (which will allocate if global is empty)
-                // 3. Try acquire from TLS again
-
-                Some(BatchObject::new())
-            }) {
-                Some(batch) => return batch,
-                None => {
-                    panic!("Could not acquire from TLS or Pool and could not Allocate")
-                }
-            }
+                        Some(BatchObject::new())
+                    }) {
+                        Some(batch) => return batch,
+                        None => {
+                            panic!("Could not acquire from TLS or Pool and could not Allocate")
+                        }
+                    }
+                },
+            );
         })
 
         //
@@ -180,6 +191,33 @@ mod tests {
     use std::{sync::Barrier, thread};
 
     use super::*;
+
+    #[test]
+    fn empty_try_acquire() {
+        //
+        let mut pool = BatchPool::new();
+
+        thread_db_instance_ctx(0, |ctx| {
+            // We don't have any db instances yet so just use 0 and let tls make a slot for us
+            ctx.thread_batch_cache_mut(0, |cache| {
+                let result = pool.try_acquire_from_tls(cache);
+
+                assert!(result.is_none());
+
+                // If we manually insert a Batch into the tls cache then we should get a Wrapped BatchObject<Uncommitted>
+                cache.batches.push(BatchObject::new().into_inner());
+            })
+        });
+
+        thread_db_instance_ctx(0, |ctx| {
+            // We don't have any db instances yet so just use 0 and let tls make a slot for us
+            ctx.thread_batch_cache_mut(0, |cache| {
+                let result = pool.try_acquire_from_tls(cache);
+
+                assert!(result.is_some());
+            })
+        });
+    }
 
     #[test]
     fn basic_acquire() {
@@ -201,6 +239,7 @@ mod tests {
             });
         });
 
+        // Assertions?
         //
         //
     }
@@ -216,12 +255,12 @@ mod tests {
         thread::scope(|s| {
             let t1 = s.spawn(|| {
                 barrier.wait();
-                pool.next_shard.fetch_add(1, Ordering::Release)
+                pool.next_shard.fetch_add(1, Ordering::Relaxed)
             });
 
             let t2 = s.spawn(|| {
                 barrier.wait();
-                pool.next_shard.fetch_add(1, Ordering::Release)
+                pool.next_shard.fetch_add(1, Ordering::Relaxed)
             });
 
             let r1 = t1.join().unwrap();
