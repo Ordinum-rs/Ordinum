@@ -157,25 +157,24 @@ impl BatchPool {
             //
             // Lazy shard assign check
 
-            return ctx.thread_batch_cache_mut(
-                /* We would pull this from the DB */ 0,
-                |cache| {
-                    // 1. Try acquire from TLS cache
-                    //    - Return immediately on hit
-                    match self.try_acquire_from_tls(cache).or_else(|| {
-                        //
-                        // 2. Try to refill from pool (which will allocate if global is empty)
-                        // 3. Try acquire from TLS again
+            return ctx.thread_batch_cache_mut(|cache| {
+                // 1. Try acquire from TLS cache
+                //    - Return immediately on hit
+                match self.try_acquire_from_tls(cache).or_else(|| {
+                    //
+                    // 2. Try to refill from pool (which will allocate if global is empty)
+                    // TODO: Add the refill from global pool
+                    // 3. Return a batch from the pool and avoid a second tls cache call
 
-                        Some(BatchObject::new())
-                    }) {
-                        Some(batch) => return batch,
-                        None => {
-                            panic!("Could not acquire from TLS or Pool and could not Allocate")
-                        }
+                    println!("Allocating..");
+                    Some(BatchObject::new())
+                }) {
+                    Some(batch) => return batch,
+                    None => {
+                        panic!("Could not acquire from TLS or Pool and could not Allocate")
                     }
-                },
-            );
+                }
+            });
         })
 
         //
@@ -199,7 +198,7 @@ mod tests {
 
         thread_db_instance_ctx(0, |ctx| {
             // We don't have any db instances yet so just use 0 and let tls make a slot for us
-            ctx.thread_batch_cache_mut(0, |cache| {
+            ctx.thread_batch_cache_mut(|cache| {
                 let result = pool.try_acquire_from_tls(cache);
 
                 assert!(result.is_none());
@@ -211,7 +210,7 @@ mod tests {
 
         thread_db_instance_ctx(0, |ctx| {
             // We don't have any db instances yet so just use 0 and let tls make a slot for us
-            ctx.thread_batch_cache_mut(0, |cache| {
+            ctx.thread_batch_cache_mut(|cache| {
                 let result = pool.try_acquire_from_tls(cache);
 
                 assert!(result.is_some());

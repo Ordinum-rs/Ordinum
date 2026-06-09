@@ -9,17 +9,36 @@ use crate::{
         write_pipeline::{WritePipeline, WriterEnv},
     },
     sync::{Arc, atomic::AtomicU64},
-    version::version_set::VersionSet,
+    version::{SeqNumState, version_set::VersionSet},
 };
 
 use std::{marker::PhantomData, sync::Weak};
+
+// -------------------------------------------------------------
 
 pub(crate) struct DbImpl {
     _p: PhantomData<()>,
     //
     version_set: VersionSet,
-    batch_pool: Arc<BatchPool>,
+    //
+    // Batch pool
+    // batch_pool: BatchPool,
 }
+
+impl DbImpl {
+    pub(crate) fn new() -> Self {
+        Self {
+            _p: PhantomData,
+            version_set: VersionSet::new(),
+        }
+    }
+
+    pub(crate) fn seq_state(&self) -> Arc<SeqNumState> {
+        Arc::clone(&self.seq_state())
+    }
+}
+
+//
 
 impl WriterEnv for DbImpl {
     //

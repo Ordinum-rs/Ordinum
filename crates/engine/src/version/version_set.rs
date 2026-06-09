@@ -8,6 +8,7 @@
 //
 
 use crate::sync::Arc;
+use crate::sync::atomic::AtomicU64;
 use crate::{column_family::cf::ColumnFamilySet, version::SeqNumState};
 
 pub(crate) struct VersionSet {
@@ -27,4 +28,16 @@ pub(crate) struct VersionSet {
     // Congig/Options?
     //
     //
+}
+
+impl VersionSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            cf_set: ColumnFamilySet {},
+            global_sn: Arc::new(SeqNumState {
+                visible_seq_num: AtomicU64::new(0),
+                log_seq_num: AtomicU64::new(0),
+            }),
+        }
+    }
 }

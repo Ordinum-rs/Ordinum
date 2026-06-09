@@ -38,7 +38,7 @@ impl DBInstanceCtx {
     }
 
     // TODO: Need SAFETY Comments
-    pub(crate) fn thread_batch_cache_mut<F, R>(&self, db_id: usize, f: F) -> R
+    pub(crate) fn thread_batch_cache_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut ThreadBatchCache) -> R,
     {

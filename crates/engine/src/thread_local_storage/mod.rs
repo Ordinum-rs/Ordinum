@@ -5,7 +5,7 @@ use crate::sync::atomic::AtomicUsize;
 use crate::thread_local_storage::registry::{DBInstanceCtx, ThreadCtx};
 
 // DOCS: Add information about this and maybe think about where this is best placed
-static NEXT_DB_TLD_ID: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static NEXT_TLS_ID: AtomicUsize = AtomicUsize::new(0);
 
 /*
 
