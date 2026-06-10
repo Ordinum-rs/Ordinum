@@ -15,7 +15,7 @@ use crate::{
     db::batch::{Batch, BatchObject, NonNullBatchPtr, Pooled, UnCommitted},
     sync::{
         Mutex,
-        atomic::{AtomicPtr, AtomicUsize},
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
     thread_local_storage::{thread_ctx, thread_db_instance_ctx},
     utils::cache_padded::CachePadded,
@@ -34,9 +34,9 @@ const NUMBER_POOL_SHARDS: usize = 4;
 // We can't estimate the number of retained batches in tls because writer threads are unbounded but we can cap the tls cache size
 
 const MAX_BATCHES_PER_SHARD: usize = 16;
-const SHARD_CAP: usize = 4;
+const NUMBER_OF_SHARDS_FOR_POOL: usize = 4;
 const MAX_RETAINED_POOL_BYTES: usize =
-    (MAX_BATCHES_PER_SHARD * SHARD_CAP) * crate::db::batch::DEFAULT_BATCH_INIT_SIZE;
+    (MAX_BATCHES_PER_SHARD * NUMBER_OF_SHARDS_FOR_POOL) * crate::db::batch::DEFAULT_BATCH_INIT_SIZE;
 
 const MAX_BATCHES_PER_THREAD_CACHE: usize = 4;
 
@@ -100,18 +100,40 @@ impl BatchPoolShard {
     }
 }
 
+// XXX: Need to think about how we might wire this into a standardised stats module which then plugs in to a wider engine level stats collection
+struct BatchPoolStats {
+    tls_misses: AtomicUsize,
+    shard_hits: AtomicUsize,
+    allocations: AtomicUsize,
+}
+
+impl Default for BatchPoolStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchPoolStats {
+    fn new() -> Self {
+        Self {
+            tls_misses: AtomicUsize::new(0),
+            shard_hits: AtomicUsize::new(0),
+            allocations: AtomicUsize::new(0),
+        }
+    }
+}
+
 // Pool stores reusable Batch pointers.
 
 // Batches are allocated lazily on demand and may be
 // destroyed when the pool exceeds its retention limits.
 pub(crate) struct BatchPool {
-    pool: [CachePadded<BatchPoolShard>; SHARD_CAP],
+    pool: [CachePadded<BatchPoolShard>; NUMBER_OF_SHARDS_FOR_POOL],
     // XXX: Later we may want to hold ownership of the batches such as Vec<Box<Batch>> or custom Slab Allocator??
     // This would help with cache locality in memory and upfront allocation for predicted workloads
     next_shard: AtomicUsize,
     //
-    // TODO: Add metrics
-    // __
+    stats: BatchPoolStats,
 }
 
 impl BatchPool {
@@ -120,6 +142,7 @@ impl BatchPool {
         Self {
             pool: array::from_fn(|_| CachePadded::new(BatchPoolShard::default())),
             next_shard: AtomicUsize::new(0),
+            stats: BatchPoolStats::default(),
         }
     }
 
@@ -127,6 +150,19 @@ impl BatchPool {
     //
     //
     //
+
+    fn assign_shard_idx(&self, cache: &mut ThreadBatchCache) -> usize {
+        let id = self.next_shard.fetch_add(1, Ordering::Relaxed) % NUMBER_OF_SHARDS_FOR_POOL;
+        cache.shard_idx = Some(id);
+        id
+    }
+
+    fn shard_idx_for_cache(&self, cache: &mut ThreadBatchCache) -> usize {
+        cache
+            .shard_idx
+            .unwrap_or_else(|| self.assign_shard_idx(cache))
+    }
+
     fn try_acquire_from_tls(
         &self,
         cache: &mut ThreadBatchCache,
@@ -136,38 +172,57 @@ impl BatchPool {
         })
     }
 
-    fn refill_tls_cache(&self, cache: &mut ThreadBatchCache) {}
+    fn refill_tls_cache(&self, cache: &mut ThreadBatchCache) -> BatchObject<UnCommitted> {
+        // First get the batches from the shard
+        let mut shard = self.pool[self.shard_idx_for_cache(cache)]
+            .batches
+            .lock()
+            .unwrap_or_else(|e| {
+                // XXX: Maybe we want to think about if we handle another thread panicking? Do we want to recover?
+                panic!()
+            });
+
+        self.stats.shard_hits.fetch_add(1, Ordering::Relaxed);
+
+        let returnable_batch = shard.pop().unwrap_or_else(|| {
+            self.stats.allocations.fetch_add(1, Ordering::Relaxed);
+            BatchObject::new().into_inner()
+        });
+
+        //
+        while cache.batches.len() < MAX_BATCHES_PER_THREAD_CACHE / 2 {
+            // We want to pop from global pool - if pool is empty then we allocate a new batch
+            match shard.pop() {
+                Some(batch) => cache.batches.push(batch),
+                None => {
+                    // XXX: What i'd like to do here is get warmed up as possible by allocating on empty pop and refilling tls_cache eagerly
+                    // BUT We need to understand the stats first because a cold thread could feasably over allocate and not use the cached batches
+                    // So we will go with the natural approach first. When global pool is empty we just break and return the single batch and let the
+                    // drop implementatino slowly build the cache
+                    break;
+                }
+            }
+        }
+
+        BatchObject::from_batch_ptr(returnable_batch)
+    }
 
     pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
-        // Easy path for test
-
-        // if self.pool[0].batches.lock().unwrap().len() == 0 {
-        //     println!("Allocating");
-        //     BatchObject::new()
-        // } else {
-        //     println!("Fetching from pool..");
-        //     BatchObject::from_batch_ptr(self.pool[0].batches.lock().unwrap().pop().unwrap())
-        // }
-
-        // ==============
-
         // 0. Assertions
 
         thread_db_instance_ctx(0, |ctx| {
             //
-            // Lazy shard assign check
 
             return ctx.thread_batch_cache_mut(|cache| {
+                // Lazy shard check
+
                 // 1. Try acquire from TLS cache
                 //    - Return immediately on hit
                 match self.try_acquire_from_tls(cache).or_else(|| {
-                    //
-                    // 2. Try to refill from pool (which will allocate if global is empty)
-                    // TODO: Add the refill from global pool
-                    // 3. Return a batch from the pool and avoid a second tls cache call
+                    self.stats.tls_misses.fetch_add(1, Ordering::Relaxed);
 
-                    println!("Allocating..");
-                    Some(BatchObject::new())
+                    // 2. Try to refill from pool (which will allocate if global is empty)
+                    Some(self.refill_tls_cache(cache))
                 }) {
                     Some(batch) => return batch,
                     None => {
@@ -176,11 +231,6 @@ impl BatchPool {
                 }
             });
         })
-
-        //
-        //
-        //
-        //
     }
 }
 
@@ -238,9 +288,10 @@ mod tests {
             });
         });
 
-        // Assertions?
-        //
-        //
+        // We should have only done 1 allocation
+        assert_eq!(pool.stats.allocations.load(Ordering::Relaxed), 1);
+        // We should have missed tls twice
+        assert_eq!(pool.stats.tls_misses.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -263,9 +314,9 @@ mod tests {
             });
 
             let r1 = t1.join().unwrap();
-            println!("t1 index = {}", r1 % SHARD_CAP);
+            println!("t1 index = {}", r1 % NUMBER_OF_SHARDS_FOR_POOL);
             let r2 = t2.join().unwrap();
-            println!("t2 index = {}", r2 % SHARD_CAP);
+            println!("t2 index = {}", r2 % NUMBER_OF_SHARDS_FOR_POOL);
 
             //
         });
