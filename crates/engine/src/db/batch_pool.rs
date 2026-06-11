@@ -12,9 +12,12 @@
 use std::{array, ptr::NonNull};
 
 use crate::{
-    db::batch::{Batch, BatchObject, NonNullBatchPtr, Pooled, UnCommitted},
+    db::batch::{
+        Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, Pooled,
+        UnCommitted,
+    },
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
     thread_local_storage::{thread_ctx, thread_db_instance_ctx},
@@ -82,6 +85,11 @@ impl ThreadBatchCache {
     }
 }
 
+// NOTE: We would implement a drop to return cached batches back to pool on thread exit BUT this can be problematic as we'd have to hold a Weak Pointer back
+// to Pool and also may encounter some cyclic behaviour if we are shutting down so Pool is dropping and thread is exiting whilst trying to return to pool.
+//
+// Decision is to just drop the cached batches for now and stay light
+
 struct BatchPoolShard {
     batches: Mutex<Vec<NonNullBatchPtr>>,
 }
@@ -105,6 +113,8 @@ struct BatchPoolStats {
     tls_misses: AtomicUsize,
     shard_hits: AtomicUsize,
     allocations: AtomicUsize,
+    // XXX: Would like to show total_allocated_bytes
+    // Can we do this over time? Or histogram this?
 }
 
 impl Default for BatchPoolStats {
@@ -162,6 +172,8 @@ impl BatchPool {
             .shard_idx
             .unwrap_or_else(|| self.assign_shard_idx(cache))
     }
+
+    // ----- Acquire Methods ----- //
 
     fn try_acquire_from_tls(
         &self,
@@ -221,7 +233,7 @@ impl BatchPool {
                 match self.try_acquire_from_tls(cache).or_else(|| {
                     self.stats.tls_misses.fetch_add(1, Ordering::Relaxed);
 
-                    // 2. Try to refill from pool (which will allocate if global is empty)
+                    // 2. Try to refill from pool
                     Some(self.refill_tls_cache(cache))
                 }) {
                     Some(batch) => return batch,
@@ -231,6 +243,19 @@ impl BatchPool {
                 }
             });
         })
+    }
+
+    // ----- Release Methods ----- //
+
+    pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B>) {
+
+        // Want
+        // 1. Extract the Batch
+        // 2. Reset the batch to a cachable state
+        // 3. Try to return to pool
+        // 4. Destroy if no space
+
+        //
     }
 }
 

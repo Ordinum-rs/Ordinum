@@ -13,8 +13,6 @@
 // b.commit(b) // commit moves batch into it's scope and transitions state
 //
 
-use crate::sync::atomic::{AtomicBool, Ordering};
-use crate::utils;
 use std::ops::Deref;
 use std::ptr;
 use std::ptr::NonNull;
@@ -22,12 +20,40 @@ use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::db::DEFAULT_CF_ID;
+use crate::db::batch_pool::BatchPool;
 use crate::db::{self, db_impl::DbImpl};
+use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::utils;
 use crate::utils::var_int::VarInt;
 use crate::{Error, Result};
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
+
+#[repr(align(8))]
+#[derive(Debug)]
+pub(crate) enum BatchOp {
+    Put,
+    Delete,
+    Merge,
+    // XXX: More operations in later updates
+}
+
+// TODO: Add from/into
+#[repr(align(8))]
+#[derive(Debug)]
+pub(crate) enum BatchRuntimeState {
+    Pooled,
+    Acquired,
+    Committed,
+    InQueue,
+    WaitingSync,
+    WaitingApply,
+    Applied,
+}
+
+// TODO: Add bitwise functions to pack runtime state enum
 
 pub(crate) trait BatchCommitState {}
 
@@ -44,15 +70,6 @@ impl BatchCommitState for Sealed {}
 pub(crate) struct Pooled {}
 
 impl BatchCommitState for Pooled {}
-
-#[repr(align(8))]
-#[derive(Debug)]
-pub(crate) enum BatchOp {
-    Put,
-    Delete,
-    Merge,
-    // XXX: More operations in later updates
-}
 
 /// Owning pointer to a heap-allocated batch object.
 ///
@@ -87,6 +104,15 @@ impl NonNullBatchPtr {
 
     pub(super) fn as_non_null(&self) -> NonNull<Batch> {
         self.ptr
+    }
+
+    // Destroy takes the heap allocated Batch and de-alloacates.
+    //
+    // # Safety
+    //
+    // The caller must ensure that when calling destroy() no other references to the Batch are stored and no Pointers are still held
+    pub(super) unsafe fn destroy(self) {
+        drop(self);
     }
 }
 
@@ -123,6 +149,7 @@ impl Drop for NonNullBatchPtr {
 /// Batches use a compact binary representation where all operations are encoded sequentially into a byte slice
 /// the binary representation is so that batches can form the records of the WAL without any additional changes
 /// We are free to choose the endianness and for optimisation on x86 architectures we choose little endian here.
+///
 /// This applies only to the structure of the batch i.e batch count, varint and column_family_id. For the internal key, we defer to the endianness it uses which is
 /// big endian for seq number comparison
 ///
@@ -145,9 +172,11 @@ impl Drop for NonNullBatchPtr {
 /// // Internally:
 ///
 /// fn put(&self, key: &[u8], value: &[u8]) {
-///     let mut batch = Batch::new();
+///     let mut batch = self.acquire_batch();
 ///     batch.put(DEFAULT_CF, key, value);
-///     self.write(batch);
+///     self.commit(&batch)?;
+///     //
+///     batch.reset();
 /// }
 ///
 /// ```
@@ -169,6 +198,8 @@ pub(crate) struct BatchObject<B: BatchCommitState> {
     inner: NonNullBatchPtr,
 }
 
+// ---- Generic Impl ---- //
+
 impl<B: BatchCommitState> BatchObject<B> {
     pub(super) fn as_ptr(&self) -> *mut Batch {
         self.inner.as_ptr()
@@ -185,6 +216,22 @@ impl<B: BatchCommitState> BatchObject<B> {
         }
     }
 }
+
+// ---- BatchObjectHandle ---- //
+
+pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
+    pool: Arc<BatchPool>,
+    batch: BatchObject<B>,
+}
+
+impl<B: BatchCommitState> BatchObjectHandle<B> {
+    pub(crate) fn new(pool: Arc<BatchPool>, batch: BatchObject<B>) -> Self {
+        Self { pool, batch }
+    }
+}
+
+//
+// ---- Uncommitted ---- //
 
 impl BatchObject<UnCommitted> {
     fn default_cf() -> VarInt {
@@ -246,34 +293,20 @@ impl BatchObject<UnCommitted> {
     }
 }
 
-impl BatchObject<Sealed> {
-    pub(crate) fn Close(&self) -> Result<()> {
-        //
-        // This needs to make sure we check runtime state and wait for completion before doing anything
-        //
-        //
-        todo!()
-    }
+// ---- Sealed ---- //
 
-    pub(crate) fn Reset(&self) -> Result<()> {
-        //
-        // This needs to make sure we check runtime state and wait for completion before doing anything
-        //
-        //
-        todo!()
-    }
-}
+impl BatchObject<Sealed> {}
 
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct Batch {
     data: Vec<u8>,
-    /// The maximum total serialized size allowed for a single atomic WriteBatch.
+    /// The maximum total serialized size allowed for a single atomic Batch.
     ///
     /// This limit is a global operational safety bound, not a memtable-fit constraint.
     ///
-    /// A WriteBatch may span multiple column families, and its contents are applied
+    /// A Batch may span multiple column families, and its contents are applied
     /// independently into each destination memtable. As a result, the total batch
     /// size may legitimately exceed the configured write buffer size of any single
     /// column family.
@@ -295,7 +328,6 @@ pub(super) struct Batch {
     // Need inline array for touched column families in this batch
     //
     is_applied: AtomicBool,
-    is_published: AtomicBool,
     //
     //
 
@@ -315,7 +347,6 @@ impl Batch {
             count: 0,
             runtime_commit_state: AtomicU8::new(0),
             is_applied: AtomicBool::new(false),
-            is_published: AtomicBool::new(false),
         }
     }
 
@@ -331,7 +362,6 @@ impl Batch {
             count: 0,
             runtime_commit_state: AtomicU8::new(0),
             is_applied: AtomicBool::new(false),
-            is_published: AtomicBool::new(false),
         }
     }
 
@@ -386,12 +416,18 @@ impl Batch {
         self.is_applied.store(true, ordering);
     }
 
-    pub(super) fn is_published(&self, ordering: Ordering) -> bool {
-        self.is_published.load(ordering)
-    }
-
     pub(super) fn get_batch_count(&self) -> u64 {
         self.count
+    }
+
+    pub(super) fn reset(&self) {
+
+        // TODO: Complete the method
+        // Assertions
+        // - Assert that runtime state is un-committed or complete
+
+        // Want:
+        // -
     }
 }
 

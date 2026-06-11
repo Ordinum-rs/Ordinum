@@ -60,6 +60,12 @@ pub(crate) struct ThreadCtx {
 
 // TODO: Need to implement thread ctx drop
 //
+impl Drop for ThreadCtx {
+    fn drop(&mut self) {
+        println!("Dropping tls ctx");
+        // We will need to call the return method on ThreadBatchCache
+    }
+}
 
 impl ThreadCtx {
     pub(crate) fn new() -> Self {

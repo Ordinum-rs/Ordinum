@@ -513,7 +513,6 @@ mod tests {
 
         #[derive(Debug)]
         pub(super) struct ConsumerCtx {
-            pub(super) published: bool,
             pub(super) applied: bool,
             pub(super) self_dequeued: bool,
             pub(super) did_dequeue: bool,
@@ -592,7 +591,6 @@ mod tests {
                     self.set_stage(id, Stage::Done);
 
                     ConsumerCtx {
-                        published: b_ref.is_published(std::sync::atomic::Ordering::Relaxed),
                         applied: b_ref.is_applied(std::sync::atomic::Ordering::Relaxed),
                         self_dequeued: self_dq,
                         did_dequeue: r.is_some(),
