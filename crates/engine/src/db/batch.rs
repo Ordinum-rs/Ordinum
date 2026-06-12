@@ -324,8 +324,7 @@ pub(super) struct Batch {
     max_batch_size: usize,
     count: u64,
     runtime_commit_state: AtomicU8,
-    // NOTE:
-    // Need inline array for touched column families in this batch
+    /* NOTE: Need inline array for touched column families in this batch */
     //
     is_applied: AtomicBool,
     //
@@ -368,6 +367,7 @@ impl Batch {
     fn seq_num(&self) -> u64 {
         debug_assert!(self.data.len() > Self::BATCH_COUNT_OFFSET);
         let ptr = self.data[..Self::BATCH_COUNT_OFFSET].as_ptr();
+
         // SAFETY
         //
         // We know that the data slice is greater than 8 bytes
