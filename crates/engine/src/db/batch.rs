@@ -13,6 +13,7 @@
 // b.commit(b) // commit moves batch into it's scope and transitions state
 //
 
+use std::fmt::Display;
 use std::ops::Deref;
 use std::ptr;
 use std::ptr::NonNull;
@@ -40,10 +41,9 @@ pub(crate) enum BatchOp {
     // XXX: More operations in later updates
 }
 
-// TODO: Add from/into
 #[repr(align(8))]
-#[derive(Debug)]
-pub(crate) enum BatchRuntimeState {
+#[derive(Debug, PartialEq)]
+pub(super) enum BatchRuntimeState {
     Pooled,
     Acquired,
     Committed,
@@ -53,7 +53,34 @@ pub(crate) enum BatchRuntimeState {
     Applied,
 }
 
-// TODO: Add bitwise functions to pack runtime state enum
+impl Display for BatchRuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchRuntimeState::Pooled => write!(f, "Pooled"),
+            BatchRuntimeState::Acquired => write!(f, "Acquired"),
+            BatchRuntimeState::Committed => write!(f, "Committed"),
+            BatchRuntimeState::InQueue => write!(f, "InQueue"),
+            BatchRuntimeState::WaitingSync => write!(f, "WaitingSync"),
+            BatchRuntimeState::WaitingApply => write!(f, "WaitingApply"),
+            BatchRuntimeState::Applied => write!(f, "Applied"),
+        }
+    }
+}
+
+impl From<u8> for BatchRuntimeState {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => BatchRuntimeState::Pooled,
+            2 => BatchRuntimeState::Acquired,
+            3 => BatchRuntimeState::Committed,
+            4 => BatchRuntimeState::InQueue,
+            5 => BatchRuntimeState::WaitingSync,
+            6 => BatchRuntimeState::WaitingApply,
+            7 => BatchRuntimeState::Applied,
+            _ => unreachable!(),
+        }
+    }
+}
 
 pub(crate) trait BatchCommitState {}
 
@@ -193,8 +220,6 @@ impl Drop for NonNullBatchPtr {
 /// is visible to the WritePipeline or while another thread may still access it.
 pub(crate) struct BatchObject<B: BatchCommitState> {
     _state: PhantomData<B>,
-
-    // TODO: Once heap allocated this should be the heap object - either NonNull or Box
     inner: NonNullBatchPtr,
 }
 
@@ -214,6 +239,35 @@ impl<B: BatchCommitState> BatchObject<B> {
             _state: PhantomData,
             inner: ptr,
         }
+    }
+
+    /// Atomically sets the runtime state on the heap-allocated batch.
+    ///
+    /// While a batch is retained by TLS or the global pool, it is exclusively owned
+    /// by that storage and no references to it may exist. The unsafe boundary starts
+    /// once the batch has been acquired and references/pointers may be handed to the
+    /// caller or write pipeline.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that the batch allocation is still live and has not
+    /// been returned to TLS/global pool or destroyed.
+    ///
+    /// The caller must also guarantee that this state transition is valid for the
+    /// current ownership phase. This method does not enforce legal transitions or
+    /// prevent a batch from being recycled while another thread still holds a
+    /// pointer to it.
+    ///
+    /// Concurrent access to `runtime_commit_state` itself is safe because it is
+    /// atomic. This method does not protect any non-atomic batch fields.
+    pub(super) unsafe fn set_runtime_state(&self, state: BatchRuntimeState, ordering: Ordering) {
+        //
+        // SAFETY:
+        // The caller guarantees that the batch pointer is live and not currently
+        // retained by the pool. We only access the atomic runtime state field.
+        unsafe { &*self.as_ptr() }
+            .runtime_commit_state
+            .store(state as u8, ordering)
     }
 }
 
@@ -324,6 +378,7 @@ pub(super) struct Batch {
     max_batch_size: usize,
     count: u64,
     runtime_commit_state: AtomicU8,
+    //
     /* NOTE: Need inline array for touched column families in this batch */
     //
     is_applied: AtomicBool,
@@ -421,10 +476,15 @@ impl Batch {
     }
 
     pub(super) fn reset(&self) {
-
         // TODO: Complete the method
         // Assertions
         // - Assert that runtime state is un-committed or complete
+        assert!(
+            (BatchRuntimeState::from(self.runtime_commit_state.load(Ordering::Acquire))
+                == BatchRuntimeState::Acquired)
+                || (BatchRuntimeState::from(self.runtime_commit_state.load(Ordering::Acquire))
+                    == BatchRuntimeState::Applied)
+        )
 
         // Want:
         // -
@@ -460,6 +520,18 @@ mod tests {
         let mut batch = BatchObject::new();
         let b_ref = unsafe { &*batch.as_ptr() };
         assert!(b_ref.count == 0);
+    }
+
+    #[should_panic]
+    #[test]
+    fn batch_reset() {
+        let batch = Batch::new();
+
+        batch
+            .runtime_commit_state
+            .store(BatchRuntimeState::InQueue as u8, Ordering::Relaxed);
+
+        batch.reset();
     }
 
     #[test]
