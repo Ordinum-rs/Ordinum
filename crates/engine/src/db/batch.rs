@@ -1,18 +1,3 @@
-//
-// Tyring out pebble style approach of batch owns it's operations and commits them and parallel inserts into memtable - waiting to publish
-//
-//
-
-// Batch::put()
-//
-// let b: Batch<Mutable = Batch::new();
-//
-// b.push()
-// b.push()
-//
-// b.commit(b) // commit moves batch into it's scope and transitions state
-//
-
 use std::fmt::Display;
 use std::ops::Deref;
 use std::ptr;
@@ -94,9 +79,9 @@ pub(crate) struct Sealed {}
 impl BatchCommitState for Sealed {}
 
 // Pooled is the default state of a batch when pooled in the heap object pool
-pub(crate) struct Pooled {}
+pub(crate) struct Published {}
 
-impl BatchCommitState for Pooled {}
+impl BatchCommitState for Published {}
 
 /// Owning pointer to a heap-allocated batch object.
 ///
@@ -273,6 +258,8 @@ impl<B: BatchCommitState> BatchObject<B> {
 
 // ---- BatchObjectHandle ---- //
 
+// TODO: Add an <InFlight> and <Published> implementation with respective reset handles
+
 pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
     pool: Arc<BatchPool>,
     batch: BatchObject<B>,
@@ -281,6 +268,31 @@ pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
 impl<B: BatchCommitState> BatchObjectHandle<B> {
     pub(crate) fn new(pool: Arc<BatchPool>, batch: BatchObject<B>) -> Self {
         Self { pool, batch }
+    }
+
+    pub(crate) fn inner(&self) -> &BatchObject<B> {
+        &self.batch
+    }
+
+    pub(crate) fn reset(mut self) {
+        unsafe { &mut *self.batch.as_ptr() }.reset();
+    }
+}
+
+impl BatchObjectHandle<UnCommitted> {
+    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.batch.put(key, value);
+    }
+
+    pub(crate) fn seal(self) -> BatchObjectHandle<Sealed> {
+        BatchObjectHandle {
+            pool: self.pool,
+            batch: self.batch.seal(),
+        }
     }
 }
 
@@ -349,7 +361,11 @@ impl BatchObject<UnCommitted> {
 
 // ---- Sealed ---- //
 
-impl BatchObject<Sealed> {}
+impl BatchObject<Sealed> {
+    // TODO: We want a transition method to Published which asserts only if we are dequeud from
+    // the pipeline and are not waiting for sync
+    // this should ideally be returned from commit_sync
+}
 
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
@@ -381,11 +397,14 @@ pub(super) struct Batch {
     //
     /* NOTE: Need inline array for touched column families in this batch */
     //
+    // NOTE: Do we need this if we can house in runtime state?
     is_applied: AtomicBool,
     //
     //
 
     // Signalling mechanisms which will be Arc<> - The batch is heap alloacated so the signalling mechanisms will be stable
+    // A SyncWaiter will be a small view for the WAL which we can give clone() to and it can use to signal back
+    // to the batch when it is done
 }
 
 impl Batch {
@@ -475,10 +494,12 @@ impl Batch {
         self.count
     }
 
-    pub(super) fn reset(&self) {
+    pub(super) fn reset(&mut self) {
         // TODO: Complete the method
         // Assertions
         // - Assert that runtime state is un-committed or complete
+        //
+        // TODO: Make if {} instead of assert!()
         assert!(
             (BatchRuntimeState::from(self.runtime_commit_state.load(Ordering::Acquire))
                 == BatchRuntimeState::Acquired)
@@ -486,8 +507,10 @@ impl Batch {
                     == BatchRuntimeState::Applied)
         )
 
+        // NOTE: We do NOT wait on signals here - once we reach here we should have exclusive ownership and
+        // the type state batch objects should have done the runtime waiting for us
         // Want:
-        // -
+        // - We need to assess the size of the data buf and decide if we want to resize
     }
 }
 
@@ -525,7 +548,7 @@ mod tests {
     #[should_panic]
     #[test]
     fn batch_reset() {
-        let batch = Batch::new();
+        let mut batch = Batch::new();
 
         batch
             .runtime_commit_state

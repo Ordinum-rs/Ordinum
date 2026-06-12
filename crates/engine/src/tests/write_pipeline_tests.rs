@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::db::batch::BatchObjectHandle;
     use crate::{Error, Result};
     use crate::{
         db::{
@@ -40,17 +41,20 @@ mod tests {
 
         let mut wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
 
-        let mut pool = BatchPool::new();
+        let mut pool = Arc::new(BatchPool::new());
 
         // ============================================
 
         let batch = pool.acquire();
+        let b = BatchObjectHandle::new(Arc::clone(&pool), batch);
 
-        batch.put(b"Hello", b"There");
+        b.put(b"Hello", b"There");
 
-        let sealed_batch = batch.seal();
+        let sealed_batch = b.seal();
 
-        wp.commit(&sealed_batch).expect("Ahhhhhh")
+        wp.commit(&sealed_batch.inner()).expect("Ahhhhhh");
+
+        sealed_batch.reset();
 
         // The caller retains ownership of `sealed_batch` throughout the commit.
         // The pipeline only borrows the underlying Batch via its stable heap address.

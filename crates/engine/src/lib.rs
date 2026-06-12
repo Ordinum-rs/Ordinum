@@ -26,7 +26,7 @@ pub use error::{Error, Result};
 
 pub mod sync {
     #[cfg(feature = "loom")]
-    pub use loom::sync::{Arc, Condvar, Mutex};
+    pub use loom::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard};
 
     #[cfg(feature = "loom")]
     pub mod atomic {
@@ -39,7 +39,7 @@ pub mod sync {
     }
 
     #[cfg(not(feature = "loom"))]
-    pub use std::sync::{Arc, Condvar, Mutex};
+    pub use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard};
 
     #[cfg(not(feature = "loom"))]
     pub mod atomic {

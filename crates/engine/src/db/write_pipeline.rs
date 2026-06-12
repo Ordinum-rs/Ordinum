@@ -1,6 +1,7 @@
 use std::{
     array,
     ptr::{self, NonNull, null_mut},
+    sync::atomic::AtomicBool,
 };
 
 use crate::{
@@ -19,6 +20,7 @@ use crate::{
     sync::Arc,
     sync::Condvar,
     sync::Mutex,
+    sync::MutexGuard,
     sync::spin_loop,
     utils::{self, cache_padded::CachePadded},
 };
@@ -235,6 +237,85 @@ pub(crate) trait WriterEnv: Send + Sync {
     fn apply_commit<'env>(&self, batch: &'env BatchRef) -> Result<()>;
 }
 
+// --- Commit Permit --- //
+
+pub(super) struct CommitPermit {
+    state: AtomicU64,
+    sem_mu: Mutex<()>,
+    sem_cv: Condvar,
+}
+
+impl CommitPermit {
+    pub(super) fn new() -> Self {
+        Self {
+            state: AtomicU64::new(0),
+            sem_mu: Mutex::new(()),
+            sem_cv: Condvar::new(),
+        }
+    }
+
+    pub(super) fn lock<'guard>(&'guard self) -> MutexGuard<'guard, ()> {
+        // XXX: Need to handle the potential poison lock or error scenario
+        self.sem_mu.lock().unwrap_or_else(|_| panic!())
+    }
+
+    pub(super) fn wait<'guard>(&'_ self, guard: MutexGuard<'guard, ()>) -> MutexGuard<'guard, ()> {
+        self.sem_cv.wait(guard).unwrap()
+    }
+
+    pub(super) fn try_acquire(&self, limit: usize) -> bool {
+        let mut cur = self.state.load(Ordering::Acquire);
+
+        loop {
+            if cur as usize >= limit {
+                return false;
+            }
+
+            match self
+                .state
+                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    pub(super) fn acquire<F>(&self, limit: usize, mut on_wait: F)
+    where
+        F: FnMut(),
+    {
+        loop {
+            if self.try_acquire(limit) {
+                return;
+            }
+
+            let mut guard = self.lock();
+
+            while self.state.load(Ordering::Acquire) as usize >= limit {
+                on_wait();
+                guard = self.wait(guard);
+            }
+        }
+    }
+
+    pub(super) fn release(&self) {
+        let _guard = self.lock();
+        let prev = self.state.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            prev > 0,
+            "commit permit occupancy misaligned: released with zero occupancy"
+        );
+
+        self.sem_cv.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(super) fn occupancy(&self, ordering: Ordering) -> u64 {
+        self.state.load(ordering)
+    }
+}
+
 /// WritePipeline is the coordinator responsible for processing batches committed by caller threads on the write path.
 /// Batches are queued into a Single-Producer-Multi-Consumer queue and committed through stages of a state machine
 ///
@@ -254,10 +335,7 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     batch_queue: BatchQueue<N>,
 
     // Write Queue reservation
-    // TODO: Make into CommitPermit
-    batch_occupancy: AtomicU64,
-    sem_mu: Mutex<()>,
-    sem_cv: Condvar,
+    commit_sem: CommitPermit,
 
     // WAL fysnc reservation
     sync_sem: SyncQueueSem,
@@ -296,9 +374,7 @@ where
     ) -> Self {
         Self {
             batch_queue: BatchQueue::<N>::new(),
-            batch_occupancy: AtomicU64::new(0 as u64),
-            sem_mu: Mutex::new(()),
-            sem_cv: Condvar::new(),
+            commit_sem: CommitPermit::new(),
             env,
 
             seq_state,
@@ -331,58 +407,23 @@ where
                 return;
             }
 
-            // Long wait
-            // NOTE: Match on Result to avoid unwrap()?
-            let mut guard = self.sem_mu.lock().unwrap();
-
-            while self.batch_occupancy.load(Ordering::Acquire) as usize >= self.batch_queue.size() {
-                //
+            self.commit_sem.acquire(self.batch_queue.size(), || {
                 // Test invariant
                 // TODO: To be replaced with SyncPoints
                 #[cfg(test)]
                 self.condvar_waiters.fetch_add(1, Ordering::Release);
-                //
+            });
 
-                // NOTE: Match on Result to avoid unwrap()?
-                guard = self.sem_cv.wait(guard).unwrap();
-            }
-
-            // IMPORTANT: do not return here
-            // Waking only means space may exist. We need to loop again to try_reserve the space and only return if we succeed
+            return;
         }
     }
 
     fn try_reserve_space(&self) -> bool {
-        let mut cur = self.batch_occupancy.load(Ordering::Acquire);
-
-        loop {
-            if cur as usize >= self.batch_queue.size() {
-                return false;
-            }
-
-            match self.batch_occupancy.compare_exchange(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(t) => {
-                    cur = t;
-                }
-            }
-        }
+        self.commit_sem.try_acquire(self.batch_queue.size())
     }
 
     pub(super) fn release_queue_space(&self) {
-        let _guard = self.sem_mu.lock().unwrap();
-        let prev = self.batch_occupancy.fetch_sub(1, Ordering::AcqRel);
-        assert!(
-            prev > 0,
-            "batch occupancy misaligned: released with zero occupancy"
-        );
-        //
-        self.sem_cv.notify_one();
+        self.commit_sem.release();
     }
 
     //
@@ -708,7 +749,7 @@ mod tests {
         // The maint outer scope will be the base writer thread just to occupy the queue and make scoped thread wait on try_reserve
 
         wp.try_reserve_space();
-        assert!(wp.batch_occupancy.load(Ordering::Acquire) == 1);
+        assert!(wp.commit_sem.occupancy(Ordering::Acquire) == 1);
 
         let barrier = Barrier::new(2);
         let reserved = AtomicBool::new(false);
@@ -733,17 +774,13 @@ mod tests {
                 spin_loop();
             }
 
-            let old = wp.batch_occupancy.fetch_sub(1, Ordering::AcqRel);
-            assert_eq!(old, 1);
-            assert!(wp.batch_occupancy.load(Ordering::Acquire) == 0);
-
-            wp.sem_cv.notify_all();
+            wp.release_queue_space();
 
             //
         });
 
         assert!(reserved.load(Ordering::Acquire) == true);
-        assert!(wp.batch_occupancy.load(Ordering::Acquire) == 1);
+        assert!(wp.commit_sem.occupancy(Ordering::Acquire) == 1);
 
         //
     }
@@ -863,7 +900,7 @@ mod loom_tests {
             t1.join().unwrap();
             t2.join().unwrap();
 
-            assert_eq!(wp.batch_occupancy.load(Ordering::SeqCst), 0);
+            assert_eq!(wp.commit_sem.occupancy(Ordering::SeqCst), 0);
             assert_eq!(inside.load(Ordering::SeqCst), 0);
         });
 

@@ -13,7 +13,7 @@ use std::{array, ptr::NonNull};
 
 use crate::{
     db::batch::{
-        Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, Pooled,
+        Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, Published,
         UnCommitted,
     },
     sync::{
