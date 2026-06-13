@@ -34,7 +34,6 @@ pub(super) enum BatchRuntimeState {
     Committed,
     InQueue,
     WaitingSync,
-    WaitingApply,
     Applied,
 }
 
@@ -46,7 +45,6 @@ impl Display for BatchRuntimeState {
             BatchRuntimeState::Committed => write!(f, "Committed"),
             BatchRuntimeState::InQueue => write!(f, "InQueue"),
             BatchRuntimeState::WaitingSync => write!(f, "WaitingSync"),
-            BatchRuntimeState::WaitingApply => write!(f, "WaitingApply"),
             BatchRuntimeState::Applied => write!(f, "Applied"),
         }
     }
@@ -67,20 +65,20 @@ impl From<u8> for BatchRuntimeState {
     }
 }
 
+// --- Batch Type States --- //
+
 pub(crate) trait BatchCommitState {}
 
 pub(crate) struct UnCommitted {}
-
 impl BatchCommitState for UnCommitted {}
 
-// TODO: Move into BatchInner and expose only through type state methods
 pub(crate) struct Sealed {}
-
 impl BatchCommitState for Sealed {}
 
-// Pooled is the default state of a batch when pooled in the heap object pool
-pub(crate) struct Published {}
+pub(crate) struct InFlight {}
+impl BatchCommitState for InFlight {}
 
+pub(crate) struct Published {}
 impl BatchCommitState for Published {}
 
 /// Owning pointer to a heap-allocated batch object.
@@ -157,6 +155,46 @@ impl Drop for NonNullBatchPtr {
 //
 // Operation:
 // | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
+
+// ---- BatchObjectHandle ---- //
+
+// TODO: Add an <InFlight> and <Published> implementation with respective reset handles
+
+pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
+    pool: Arc<BatchPool>,
+    batch: BatchObject<B>,
+}
+
+impl<B: BatchCommitState> BatchObjectHandle<B> {
+    pub(crate) fn new(pool: Arc<BatchPool>, batch: BatchObject<B>) -> Self {
+        Self { pool, batch }
+    }
+
+    pub(crate) fn inner(&self) -> &BatchObject<B> {
+        &self.batch
+    }
+
+    pub(crate) fn reset(mut self) {
+        unsafe { &mut *self.batch.as_ptr() }.reset();
+    }
+}
+
+impl BatchObjectHandle<UnCommitted> {
+    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.batch.put(key, value);
+    }
+
+    pub(crate) fn seal(self) -> BatchObjectHandle<Sealed> {
+        BatchObjectHandle {
+            pool: self.pool,
+            batch: self.batch.seal(),
+        }
+    }
+}
 
 /// Batches use a compact binary representation where all operations are encoded sequentially into a byte slice
 /// the binary representation is so that batches can form the records of the WAL without any additional changes
@@ -254,45 +292,16 @@ impl<B: BatchCommitState> BatchObject<B> {
             .runtime_commit_state
             .store(state as u8, ordering)
     }
-}
 
-// ---- BatchObjectHandle ---- //
-
-// TODO: Add an <InFlight> and <Published> implementation with respective reset handles
-
-pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
-    pool: Arc<BatchPool>,
-    batch: BatchObject<B>,
-}
-
-impl<B: BatchCommitState> BatchObjectHandle<B> {
-    pub(crate) fn new(pool: Arc<BatchPool>, batch: BatchObject<B>) -> Self {
-        Self { pool, batch }
-    }
-
-    pub(crate) fn inner(&self) -> &BatchObject<B> {
-        &self.batch
-    }
-
-    pub(crate) fn reset(mut self) {
-        unsafe { &mut *self.batch.as_ptr() }.reset();
-    }
-}
-
-impl BatchObjectHandle<UnCommitted> {
-    pub(crate) fn put<K, V>(&self, key: K, value: V)
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        self.batch.put(key, value);
-    }
-
-    pub(crate) fn seal(self) -> BatchObjectHandle<Sealed> {
-        BatchObjectHandle {
-            pool: self.pool,
-            batch: self.batch.seal(),
-        }
+    pub(crate) fn is_state(&self, state: BatchRuntimeState) -> bool {
+        // SAFTEY:
+        //
+        // We are safe to dereference here because the BatchObject ensures the underlying batch heap allocation is alive and we are
+        // accessing an atomic field only
+        unsafe { &*self.as_ptr() }
+            .runtime_commit_state
+            .load(Ordering::Relaxed)
+            == state as u8
     }
 }
 
@@ -365,6 +374,26 @@ impl BatchObject<Sealed> {
     // TODO: We want a transition method to Published which asserts only if we are dequeud from
     // the pipeline and are not waiting for sync
     // this should ideally be returned from commit_sync
+
+    pub(crate) fn publish(self) -> BatchObject<Published> {
+        // The runtime state must be applied for us to return a published object
+        assert!(self.is_state(BatchRuntimeState::Applied));
+
+        BatchObject {
+            _state: PhantomData,
+            inner: self.inner,
+        }
+    }
+
+    pub(crate) fn in_flight(self) -> BatchObject<InFlight> {
+        // To return an inflight batch object, the batch runtime must be in a state of waiting for sync
+        assert!(self.is_state(BatchRuntimeState::WaitingSync));
+
+        BatchObject {
+            _state: PhantomData,
+            inner: self.inner,
+        }
+    }
 }
 
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
