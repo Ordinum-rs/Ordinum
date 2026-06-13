@@ -14,8 +14,19 @@ use crate::utils;
 use crate::utils::var_int::VarInt;
 use crate::{Error, Result};
 
+// ---- Constants ---- //
+
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
+
+// ---- Module Errors ---- //
+//
+
+//
+//
+//
+//
+// ---- Batch Operations Enum ---- //
 
 #[repr(align(8))]
 #[derive(Debug)]
@@ -25,6 +36,8 @@ pub(crate) enum BatchOp {
     Merge,
     // XXX: More operations in later updates
 }
+
+// ---- Batch Runtime State ---- //
 
 #[repr(align(8))]
 #[derive(Debug, PartialEq)]
@@ -58,7 +71,6 @@ impl From<u8> for BatchRuntimeState {
             3 => BatchRuntimeState::Committed,
             4 => BatchRuntimeState::InQueue,
             5 => BatchRuntimeState::WaitingSync,
-            6 => BatchRuntimeState::WaitingApply,
             7 => BatchRuntimeState::Applied,
             _ => unreachable!(),
         }
@@ -74,12 +86,6 @@ impl BatchCommitState for UnCommitted {}
 
 pub(crate) struct Sealed {}
 impl BatchCommitState for Sealed {}
-
-pub(crate) struct InFlight {}
-impl BatchCommitState for InFlight {}
-
-pub(crate) struct Published {}
-impl BatchCommitState for Published {}
 
 /// Owning pointer to a heap-allocated batch object.
 ///
@@ -157,8 +163,6 @@ impl Drop for NonNullBatchPtr {
 // | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
 
 // ---- BatchObjectHandle ---- //
-
-// TODO: Add an <InFlight> and <Published> implementation with respective reset handles
 
 pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
     pool: Arc<BatchPool>,
@@ -351,6 +355,7 @@ impl BatchObject<UnCommitted> {
         self.put_cf(Self::default_cf(), key, value);
     }
 
+    // XXX: May want to change the cf_id to a column family handle OR we allow the layers above to resolve the handle and we only deal with the id
     pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
     // XXX: Result?
     where
@@ -371,28 +376,18 @@ impl BatchObject<UnCommitted> {
 // ---- Sealed ---- //
 
 impl BatchObject<Sealed> {
-    // TODO: We want a transition method to Published which asserts only if we are dequeud from
-    // the pipeline and are not waiting for sync
-    // this should ideally be returned from commit_sync
-
-    pub(crate) fn publish(self) -> BatchObject<Published> {
-        // The runtime state must be applied for us to return a published object
-        assert!(self.is_state(BatchRuntimeState::Applied));
-
-        BatchObject {
-            _state: PhantomData,
-            inner: self.inner,
+    //
+    // TODO: Add try_reset method
+    pub(crate) fn try_reset(self) -> std::result::Result<BatchObject<UnCommitted>, Self> {
+        // We try and reset
+        //
+        {
+            // Here
         }
-    }
 
-    pub(crate) fn in_flight(self) -> BatchObject<InFlight> {
-        // To return an inflight batch object, the batch runtime must be in a state of waiting for sync
-        assert!(self.is_state(BatchRuntimeState::WaitingSync));
+        // If we fail - return our object back
 
-        BatchObject {
-            _state: PhantomData,
-            inner: self.inner,
-        }
+        return Err(self);
     }
 }
 

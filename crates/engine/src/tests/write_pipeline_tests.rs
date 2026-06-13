@@ -52,6 +52,9 @@ mod tests {
 
         let sealed_batch = b.seal();
 
+        // We borrow the object because we want ownership to remain in the callers scope, this allows us to return early from pipeline whilst the
+        // ptr reference is still queued. If we moved ownership of the Object, then the pipeline would own the NonNullBatchPtr meaning lifetime misery
+        // The only problem is we can't return a transitioned state handle from the commit.
         wp.commit(&sealed_batch.inner()).expect("Ahhhhhh");
 
         sealed_batch.reset();
