@@ -109,4 +109,6 @@ Ordinum is not trying to hide the hard parts of database engineering. It is tryi
 
 There is the sales pitch. In fact, it's much more a mantra than a pitch and even less about sales.
 
-Ordinum's storage engine is and always will be open-source. It draws inspiration from **RocksDB**, **LevelDB** and, **PebbleDB**. And like them, it is focused on improving the accessability and innovation around database internals.
+Odinum is a passion project originally started as a means to build a deeper knowledge of database internals, and to explore a love for low-level system design.
+
+Ordinum's storage engine is and always will be open-source. In the spirit of not re-inventing the wheel it is inspired by the likes of **RocksDB**, **LevelDB** and, **PebbleDB** whilst also implementing key research papers. This allows Ordinum to remain at the cutting edge of modern design whilst also saving space for iterating and improving where possible.

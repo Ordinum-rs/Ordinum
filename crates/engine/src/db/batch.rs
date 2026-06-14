@@ -6,6 +6,7 @@ use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::db::DEFAULT_CF_ID;
+use crate::db::batch::TryResetError::InvalidState;
 use crate::db::batch_pool::BatchPool;
 use crate::db::{self, db_impl::DbImpl};
 use crate::sync::Arc;
@@ -25,18 +26,16 @@ pub(crate) const RESET_SAFE_STATES: [BatchRuntimeState; 2] =
 // ---- Module Errors ---- //
 
 #[derive(Debug)]
-pub(super) enum BatchError {
-    InvalidRuntimeState {
+pub(super) enum TryResetError<T> {
+    InvalidState {
+        object: T,
         expected: [BatchRuntimeState; 2],
         got: BatchRuntimeState,
     },
-}
-
-pub(super) type BatchResult<T> = std::result::Result<T, BatchError>;
-
-pub(super) enum TryResetError<T> {
-    NotReady(T),
-    Error { handle: T, error: BatchError },
+    Error {
+        handle: T,
+        error: Error,
+    },
 }
 
 /* NOTE: We use std::result::Result<T, Error> as opposed to the alias in [errror.rs]("error.rs") because we want to change
@@ -110,6 +109,7 @@ impl BatchRuntimeState {
 
 pub(crate) trait BatchCommitState {}
 
+#[derive(Debug)]
 pub(crate) struct UnCommitted {}
 impl BatchCommitState for UnCommitted {}
 
@@ -138,6 +138,7 @@ impl BatchCommitState for Sealed {}
 ///   exclusive access.
 /// - Cross-thread state changes after publication must use atomics or other
 ///   synchronization.
+#[derive(Debug)]
 pub(super) struct NonNullBatchPtr {
     ptr: NonNull<Batch>,
 }
@@ -220,8 +221,11 @@ impl<B: BatchCommitState> BatchObjectHandle<B> {
 
             // This should not be possible. If we error on this, after waiting for sync signal, then we have a critical
             // issue and must panic because it would not be safe to drop the allocation
-            Err(TryResetError::NotReady(_)) => {
-                unreachable!("wait returned but batch was still not reset-safe")
+            Err(TryResetError::InvalidState { expected, got, .. }) => {
+                eprintln!(
+                    "wait returned but batch was still not reset-safe - expected: {expected:?}, got: {got}"
+                );
+                std::process::abort();
             }
 
             // Policy level error - we don't really want caller handling this but we may want to handle this internally in the future
@@ -300,6 +304,7 @@ impl BatchObjectHandle<UnCommitted> {
 ///
 /// A batch allocation must remain alive and must not return to the pool while it
 /// is visible to the WritePipeline or while another thread may still access it.
+#[derive(Debug)]
 pub(crate) struct BatchObject<B: BatchCommitState> {
     _state: PhantomData<B>,
     inner: NonNullBatchPtr,
@@ -382,6 +387,8 @@ impl<B: BatchCommitState> BatchObject<B> {
     pub(super) fn wait_until_reusable(&self) -> Result<()> {
         let batch = unsafe { &*self.as_ptr() };
 
+        // TODO: Need to wait on the sync signal - do we need a timeout?
+
         Ok(())
     }
 
@@ -391,7 +398,11 @@ impl<B: BatchCommitState> BatchObject<B> {
         let state = self.state(Ordering::Acquire);
 
         if !state.is_reset_safe() {
-            return Err(TryResetError::NotReady(self));
+            return Err(TryResetError::InvalidState {
+                object: self,
+                expected: RESET_SAFE_STATES,
+                got: state,
+            });
         }
 
         // SAFETY
@@ -399,14 +410,6 @@ impl<B: BatchCommitState> BatchObject<B> {
         // We are safe to dereference because we own exlcusive access to the BatchObject which
         // owns the NonNullBatchPtr which points to the stable batch allocation
         let batch = unsafe { &mut *self.as_ptr() };
-
-        // Now try to reset and propagate any errors
-        if let Err(error) = batch.reset() {
-            return Err(TryResetError::Error {
-                handle: self,
-                error,
-            });
-        }
 
         // If no errors; we have reset and are safe to transition state and return
         Ok(self.transition())
@@ -610,20 +613,25 @@ impl Batch {
         self.count
     }
 
-    pub(super) fn reset(&mut self) -> BatchResult<()> {
-        // TODO: Complete the method
-        // Assertions
-        // - Assert that runtime state is un-committed or complete
-        //
-
-        // We want to return a BatchError if we can
-
+    pub(super) fn reset(&mut self) {
         // NOTE: We do NOT wait on signals here - once we reach here we should have exclusive ownership and
         // the type state batch objects should have done the runtime waiting for us
+        //
         // Want:
         // - We need to assess the size of the data buf and decide if we want to resize
 
-        Ok(())
+        self.count = 0;
+        //
+        self.runtime_commit_state
+            .store(BatchRuntimeState::Acquired as u8, Ordering::Relaxed);
+        //
+
+        // Reset the data buffer
+        self.data.clear();
+
+        // Decide if we need to resize
+        //
+        //
     }
 }
 
@@ -668,6 +676,22 @@ mod tests {
             .store(BatchRuntimeState::InQueue as u8, Ordering::Relaxed);
 
         batch.reset();
+    }
+
+    #[test]
+    fn batch_object_reset_error() {
+        let batch = BatchObject::new();
+
+        unsafe { batch.set_runtime_state(BatchRuntimeState::InQueue, Ordering::Relaxed) };
+
+        // Now if we try and reset we should get the error message
+
+        match batch.try_reset() {
+            Err(err) => {
+                println!("{:?}", err);
+            }
+            _ => (),
+        }
     }
 
     #[test]
