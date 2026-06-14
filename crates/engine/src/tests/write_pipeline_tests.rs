@@ -57,7 +57,7 @@ mod tests {
         // The only problem is we can't return a transitioned state handle from the commit.
         wp.commit(&sealed_batch.inner()).expect("Ahhhhhh");
 
-        sealed_batch.reset();
+        let object = sealed_batch.reset();
 
         // The caller retains ownership of `sealed_batch` throughout the commit.
         // The pipeline only borrows the underlying Batch via its stable heap address.

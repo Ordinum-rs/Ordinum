@@ -468,7 +468,7 @@ where
         //
         //
         //
-        todo!()
+        Ok(())
     }
 
     pub(crate) fn prepare(&self, batch: NonNull<Batch>) -> Result<()> {

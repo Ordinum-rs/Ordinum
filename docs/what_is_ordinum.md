@@ -87,11 +87,13 @@ All of this combines to create an elegant system designed for simplicity and bui
 
 These are the principles Ordinum endeavours to capture and harness, which brings us to the next section.
 
-### Why Ordinum
+### Why Ordinum?
 
-The purpose of **Ordinum** is to be a storage-engine-first database: simple in design, reliable in persistence, and fast by construction.
+>The purpose of **Ordinum** is to be a storage-engine-first database: simple in design, reliable in persistence, and fast by construction.
 
 Ordinum exists to make the core mechanics of database storage explicit. It does not start with a query language, a distributed protocol, or a large feature surface. It starts with the foundation: bytes written to disk, recovered after failure, organised into sorted structures, and compacted over time into a durable key-value store.
+
+Once we get that right, building from that strong foundation becomes easier and an entirely better experience. Knowing and owning our internals is crucial and a pillar to this project.
 
 That focus matters. A database is only as strong as its storage engine. If writes are not durable, reads are not correct, deletes are not handled carefully, or compaction corrupts state, every layer above it becomes meaningless. Ordinum treats the storage engine as the product, not an implementation detail.
 
@@ -104,3 +106,7 @@ The project is built around a few clear principles:
 - **Rust-native reliability**: ownership, types, and explicit state transitions should help enforce the shape of the system.
 
 Ordinum is not trying to hide the hard parts of database engineering. It is trying to expose them, implement them, and make them understandable. Its purpose is to grow into a database engine that stays true to the LSM model: durable writes, ordered data, deliberate compaction, and a design that remains small enough to reason about as it becomes more capable.
+
+There is the sales pitch. In fact, it's much more a mantra than a pitch and even less about sales.
+
+Ordinum's storage engine is and always will be open-source. It draws inspiration from **RocksDB**, **LevelDB** and, **PebbleDB**. And like them, it is focused on improving the accessability and innovation around database internals.
