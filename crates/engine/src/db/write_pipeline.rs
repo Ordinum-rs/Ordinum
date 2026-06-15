@@ -337,7 +337,11 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     // Write Queue reservation
     commit_sem: CommitPermit,
 
-    // WAL fysnc reservation
+    // Global WAL fsync reservation/backpressure.
+    //
+    // This is separate from a batch's SyncWaiter. sync_sem bounds how much
+    // WAL sync work may be outstanding across the whole pipeline; the
+    // per-batch waiter records completion for one specific batch.
     sync_sem: SyncQueueSem,
 
     // Env trait

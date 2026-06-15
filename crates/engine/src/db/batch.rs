@@ -390,7 +390,7 @@ impl<B: BatchCommitState> BatchObject<B> {
 
         // TODO: Need to wait on the sync signal - do we need a timeout?
 
-        batch.sync_waiter.wait()?;
+        batch.sync_waiter.wait().unwrap();
 
         Ok(())
     }
@@ -522,9 +522,12 @@ pub(super) struct Batch {
     //
     //
 
-    // Signalling mechanisms which will be Arc<> - The batch is heap alloacated so the signalling mechanisms will be stable
-    // A SyncWaiter will be a small view for the WAL which we can give clone() to and it can use to signal back
-    // to the batch when it is done
+    // Per-batch WAL fsync completion.
+    //
+    // The batch owns this stable Arc for its whole allocation lifetime. The WAL
+    // worker receives a clone when this batch is written, then signals it when
+    // the batch's WAL bytes are durable. Reset/reuse must wait on this waiter
+    // when the batch has outstanding sync work.
     sync_waiter: SyncWaiter,
 }
 
