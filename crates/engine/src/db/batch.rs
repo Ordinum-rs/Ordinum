@@ -13,6 +13,7 @@ use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::utils;
 use crate::utils::var_int::VarInt;
+use crate::wal::{SyncLogWaiter, SyncWaiter};
 use crate::{Error, Result};
 
 // ---- Constants ---- //
@@ -389,6 +390,8 @@ impl<B: BatchCommitState> BatchObject<B> {
 
         // TODO: Need to wait on the sync signal - do we need a timeout?
 
+        batch.sync_waiter.wait()?;
+
         Ok(())
     }
 
@@ -516,14 +519,13 @@ pub(super) struct Batch {
     //
     /* NOTE: Need inline array for touched column families in this batch */
     //
-    // NOTE: Do we need this if we can house in runtime state?
-    is_applied: AtomicBool,
     //
     //
 
     // Signalling mechanisms which will be Arc<> - The batch is heap alloacated so the signalling mechanisms will be stable
     // A SyncWaiter will be a small view for the WAL which we can give clone() to and it can use to signal back
     // to the batch when it is done
+    sync_waiter: SyncWaiter,
 }
 
 impl Batch {
@@ -538,7 +540,7 @@ impl Batch {
             max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(BatchRuntimeState::Pooled as u8),
-            is_applied: AtomicBool::new(false),
+            sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
     }
 
@@ -553,7 +555,7 @@ impl Batch {
             max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(0),
-            is_applied: AtomicBool::new(false),
+            sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
     }
 
@@ -602,11 +604,13 @@ impl Batch {
     }
 
     pub(super) fn is_applied(&self, ordering: Ordering) -> bool {
-        self.is_applied.load(ordering)
+        BatchRuntimeState::from(self.runtime_commit_state.load(ordering))
+            == BatchRuntimeState::Applied
     }
 
     pub(super) fn mark_applied(&self, ordering: Ordering) {
-        self.is_applied.store(true, ordering);
+        self.runtime_commit_state
+            .store(BatchRuntimeState::Applied as u8, ordering)
     }
 
     pub(super) fn get_batch_count(&self) -> u64 {
