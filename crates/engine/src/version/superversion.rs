@@ -12,6 +12,7 @@ use crate::column_family::cf::ColumnFamilyData;
 use crate::memtable::memtable::{Immutable, Memtable, Mutable, ReadableMemtable};
 use crate::sync::Arc;
 use crate::sync::atomic::AtomicPtr;
+use crate::utils::tagged_pointer::AtomicTaggedPtr;
 use crate::version::memtable_list::MemListVersion;
 
 pub(crate) const DEFAULT_SV_CACHE_SIZE: usize = 4;
@@ -40,37 +41,79 @@ pub(crate) struct Superversion {
     //
 }
 
-//
-// Readers CAS the SV Pointer and tries to install SV_IN_USE
-// If successful, we are free to use the SV and then return it once done
-// If we fail and instead get back SV_NULL then we must clear() then hazard slot and drop the pointer
-//
-// Only writers can invalidate a SVCache by walking the array
+// ---- Super Version Cache Entry ---- //
 
-// TODO: Think about the reclamation and reader/writer relationship and how to expose methods which keep hazard ptrs and raw ptrs in sync
+// CacheEntry is a per-(DB, CF) TLS cache slot for a SuperVersion.
+//
+// Design:
+// - Hazard pointers provide lifetime safety.
+// - Tagged pointer states provide cache validity and reader/writer coordination.
+// - Writers never mutate hazard pointers.
+// - Readers never dereference a pointer that is not protected by `hazard`.
+//
+// State machine:
+//
+// Empty
+//   -> Cached(ptr)          Reader refreshes from global SV and protects ptr.
+//
+// Cached(ptr)
+//   -> InUse(ptr)           Reader successfully acquires the cached SV.
+//   -> Invalid(ptr)         Writer invalidates cached SV after installing a newer SV.
+//
+// InUse(ptr)
+//   -> Cached(ptr)          Reader finishes and returns SV to cache.
+//   -> Invalid(ptr)         Writer invalidates while reader is actively using SV.
+//
+// Invalid(ptr)
+//   -> Empty               Reader observes invalidation, clears hazard protection
+//                          and refreshes from the current global SV.
+//
+// Safety invariant:
+//
+// If the tagged pointer contains `ptr` in any non-empty state
+// (Cached, InUse, Invalid), then `hazard` must currently protect `ptr`.
+//
+// Reclamation:
+//
+// Writers install a new global SuperVersion and retire the old one into the
+// hazard domain.
+//
+// Writers may walk registered SVCache entries and transition
+// Cached(ptr) -> Invalid(ptr)
+// InUse(ptr)  -> Invalid(ptr)
+//
+// Writers never clear a reader's hazard pointer.
+//
+// Old SuperVersions are reclaimed only after:
+//
+// 1. All cache entries have dropped references to the retired SV.
+// 2. No hazard pointer in the domain protects the retired SV.
+//
 struct CacheEntry {
-    protected_ptr: AtomicPtr<Superversion>,
+    // Tagged states:
+    // Empty | Cached(ptr) | InUse(ptr) | Invalid(ptr)
+    tagged_ptr: AtomicTaggedPtr<Superversion>,
+
+    // Protects the pointer currently stored in `tagged_ptr`.
+    //
+    // Readers must update `tagged_ptr` and `hazard` together through
+    // dedicated APIs to preserve invariants.
     hazard: HzdPtr<'static, Global>,
 }
 
-// SuperVersion Cache to be stored in Thread Local Storage which is effectively static for the lifetime of the programme
+// XXX: To be implemented - just putting something here so tls can store something
 pub(crate) struct SVCache<const N: usize> {
-    pub(crate) cache: Vec<CacheEntry>,
+    cache: Option<()>,
 }
 
 impl SVCache<DEFAULT_SV_CACHE_SIZE> {
     pub(crate) fn new() -> Self {
-        Self::new_with_size()
+        Self { cache: None }
     }
 }
 
 impl<const N: usize> SVCache<N> {
     pub(crate) fn new_with_size() -> Self {
-        let vec: Vec<CacheEntry>;
-
-        Self {
-            cache: Vec::with_capacity(N),
-        }
+        Self { cache: None }
     }
-    // Methods operating or deferencing the ptr MUST use a pin()
 }

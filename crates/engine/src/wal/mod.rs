@@ -12,6 +12,8 @@ use crate::sync::atomic::Ordering;
 use crate::sync::spin_loop;
 use crate::{Error, Result};
 
+// TODO: Need to make SyncQueue
+
 // ---- SyncQueue Sem ---- //
 
 pub(crate) type SyncQueueSem = Arc<SyncSem>;
@@ -38,14 +40,60 @@ impl Default for SyncSem {
 }
 
 // ---- Sync Log Waiter ---- //
-
-/* NOTE: Currently Im thinking to keep WalSyncError very lightweight when we pass them back to Batches. We want to give enough of a distinction
-// between error types to make decision, but for the heavy error, I want to store in the WAL state itself. That way, the batch (or db level once propagated)
-// can return the heavy error to the caller
 //
-// NOTE: Do we actually need Error distinctions here?
-// Need to think about what the Batch actually needs to get back in terms of WAL error and how we get this to the caller
-// */
+
+// Note on error handling
+
+// Sync completion is tracked per-batch through WalSyncState rather than storing
+// a full error object on every batch.
+//
+// The state answers:
+//
+//     "Did my batch succeed or fail?"
+//
+// while the DB-level background error answers:
+//
+//     "Why did the failure occur?"
+//
+// Example:
+//
+//     Group 1
+//     -------
+//     Batch A
+//     fsync succeeds
+//
+//     Group 2
+//     -------
+//     Batch B
+//     Batch C
+//     fsync fails with EIO
+//
+// Completion state:
+//
+//     Batch A -> SyncDone
+//     Batch B -> IoError
+//     Batch C -> IoError
+//
+// DB background error:
+//
+//     db.error() -> EIO
+//
+// This separation allows callers to determine whether a specific batch was
+// affected by a failure while avoiding duplication of heavyweight error objects
+// on the write path.
+//
+// Importantly, a later DB error does not retroactively affect successful
+// batches:
+//
+//     batch_a.wait() -> Ok(())
+//     batch_b.wait() -> Err(IoError)
+//     batch_c.wait() -> Err(IoError)
+//
+//     db.error() -> EIO
+//
+// The batch state identifies the failing operation, while the DB error provides
+// detailed diagnostic information for the underlying failure.
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalSyncResultState {
@@ -97,6 +145,8 @@ impl Default for SyncLogWaiter {
             state: AtomicU8::new(WalSyncResultState::Init.into()),
             mu: Mutex::new(()),
             cv: Condvar::new(),
+            // NOTE: We can potentially store a Arc<WalError> BUT - it would be quite heavy
+            // error: Mutex<Option<Arc<WalError>>>,
         }
     }
 }
@@ -104,16 +154,40 @@ impl Default for SyncLogWaiter {
 // Impl for SyncLogWaiter
 
 impl SyncLogWaiter {
+    #[inline(always)]
+    fn is_terminal(&self, state: WalSyncResultState) -> bool {
+        state != WalSyncResultState::Init
+    }
+
+    #[inline(always)]
+    fn to_result(state: WalSyncResultState) -> Option<std::result::Result<(), WalSyncResultState>> {
+        match state {
+            WalSyncResultState::SyncDone => Some(Ok(())),
+            WalSyncResultState::IoError => Some(Err(WalSyncResultState::IoError)),
+            WalSyncResultState::WalError => Some(Err(WalSyncResultState::WalError)),
+            WalSyncResultState::Init => None,
+        }
+    }
+
     // TODO: Test this
     pub(crate) fn wait(&self) -> std::result::Result<(), WalSyncResultState> {
         // Fast path - may not need to wait on condvar
         for _ in 0..200 {
             let state = WalSyncResultState::from(self.state.load(Ordering::Acquire));
 
-            // TODO: Do full match branch here
+            if state == WalSyncResultState::Init {
+                spin_loop();
+                continue;
+            }
 
-            spin_loop();
+            if let Some(result) = Self::to_result(state) {
+                return result;
+            }
+
+            unreachable!("invalid terminal WAL sync state");
         }
+
+        // TODO: Insert TEST_SYNC_POINT
 
         // Fallback to condvar
 
@@ -131,8 +205,41 @@ impl SyncLogWaiter {
                 .unwrap_or_else(|e| panic!("error waiting on sync waiter condvar: {e}"));
         }
 
-        // TODO: Do full match branch here to return a result
+        match Self::to_result(WalSyncResultState::from(self.state.load(Ordering::Acquire))) {
+            Some(r) => return r,
+            None => {
+                // Should panic but we need to make sure that unwinding the thread doesn't cause UB through other
+                // processes that may have references or access to thread local state
 
-        Ok(())
+                // Do this for now
+                return Err(WalSyncResultState::WalError);
+            }
+        }
+    }
+
+    // Signalling
+
+    pub(crate) fn signal(&self, state: WalSyncResultState) {
+        assert!(state != WalSyncResultState::Init);
+
+        let _guard = self
+            .mu
+            .lock()
+            .unwrap_or_else(|e| panic!("error on unwrapping the sync waiter mutex: {e}"));
+
+        self.state.store(state as u8, Ordering::Release);
+        self.cv.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_sync_waiter() {
+        //
+
+        //
     }
 }
