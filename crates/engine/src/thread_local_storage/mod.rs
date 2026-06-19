@@ -1,59 +1,86 @@
 pub(crate) mod registry;
 pub(crate) mod scratch;
 
+use std::ptr::null_mut;
+
+use crate::sync::Mutex;
 use crate::sync::atomic::AtomicUsize;
+use crate::sync::atomic::Ordering;
+use crate::sync::cell::UnsafeCell;
 use crate::thread_local_storage::registry::{DBInstanceCtx, ThreadCtx};
 
-// DOCS: Add information about this and maybe think about where this is best placed
-pub(crate) static NEXT_TLS_ID: AtomicUsize = AtomicUsize::new(0);
+// Static Meta data which is a singleton and hold the meta information and control logic for all threads in the global process
 
-/*
+pub(crate) struct StaticMeta {
+    thread_mu: Mutex<()>,
+    //
+    pub(crate) next_tls_id: AtomicUsize,
 
-
-
-
-Thread Context gives us a thread local storage container for different structures
-
-Example:
-
-struct ThreadContext {
-    ebr: LocalHandle,
-    metrics: Metrics,
-    sv: *const SuperVersion, //NOTE: Cached pointer with tagged generated number
-    //...
+    // Sentinel node for the global intrusive list of ThreadCtx objects.
+    //
+    // ThreadLocalPtr operations use this list to traverse every registered
+    // thread and access entries[id] for their particular TLS slot.
+    head: UnsafeCell<ThreadCtx>,
+    //
+    // XXX: Later we will want a free list of tls_id or the mechanisms to maintain non-sparse tls_id indexes
 }
 
- */
+// TODO: Review this - May be able to wrap head in something which limits the need for unsafe impl
+unsafe impl Sync for StaticMeta {}
+unsafe impl Send for StaticMeta {}
 
-// Thread Local Storage Gurantees:
-//
-// 1. Per-thread isolation must be ensured and enforced. Deliberate and intentional sharing of state between threads must be carefully planned
-// and explicit
-//
-// 2. Single mutable access at a time. Unless explicit lock-free data structures or atomics are used, we must observe exclusivity for mutable access
-// and enforce that through api design
-//
-// 3. References must not escape the scope of mutation or the scope of the thread unless designed for.
+impl StaticMeta {
+    fn new() -> Self {
+        Self {
+            thread_mu: Mutex::new(()),
+            next_tls_id: AtomicUsize::new(0),
+            head: UnsafeCell::new(ThreadCtx::new()),
+        }
+    }
+}
 
-use crate::sync::cell::RefCell;
+pub(crate) fn static_meta() -> &'static StaticMeta {
+    #[cfg(not(feature = "loom"))]
+    {
+        use std::sync::OnceLock;
 
-// TODO: Should i remove ref cell and wrap the hazard_pointer in UnsafeCell or RefCell so we don't borrow_mut() on whole TLS?
+        static STATIC_META: OnceLock<StaticMeta> = OnceLock::new();
+        STATIC_META.get_or_init(StaticMeta::new)
+    }
+    #[cfg(feature = "loom")]
+    {
+        loom::lazy_static!(
+            static ref STATIC_META: StaticMeta = StaticMeta::new();
+        ) & STATIC_META
+    }
+}
+
+// ---- TLS ---- //
+
 thread_local! {
     static TCTX: ThreadCtx = ThreadCtx::new()
 }
+
+// TODO: Check and complete the access functions + test
 
 pub(crate) fn thread_ctx<F, R>(f: F) -> R
 where
     F: FnOnce(&ThreadCtx) -> R,
 {
-    TCTX.with(|ctx| f(ctx))
+    TCTX.with(|ctx| {
+        ctx.ensure_registered();
+        f(ctx)
+    })
 }
 
 pub(crate) fn thread_db_instance_ctx<F, R>(db_id: usize, f: F) -> R
 where
     F: FnOnce(&DBInstanceCtx) -> R,
 {
-    TCTX.with(|ctx| f(ctx.db_instance(db_id)))
+    TCTX.with(|ctx| {
+        ctx.ensure_registered();
+        f(ctx.db_instance(db_id))
+    })
 }
 
 #[cfg(test)]
