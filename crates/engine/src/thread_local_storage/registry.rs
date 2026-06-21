@@ -20,65 +20,123 @@ use crate::version::superversion::SVCache;
 use std::cell::UnsafeCell;
 use std::ops::Bound::Unbounded;
 use std::pin::{self, Pin};
+use std::ptr;
 use std::ptr::NonNull;
 use std::ptr::null_mut;
 
 // Thread Local Storage
 //
-// TLS will house both Thread object and Per-DB instanced objects.
+// TLS stores per-thread state plus per-thread-per-DB state.
 //
-// Other threads may walk thread storage and access shared data, we need a way to store TLS and access it in a way that allows us to link
-// between threads and also db_instances.
+// The global StaticMeta owns a linked list of all registered ThreadCtx objects.
+// This list lets DB maintenance code walk every thread and inspect the entry
+// for a specific DB.
 //
-// For this, we must think about what has access to where:
+// Each DBImpl owns a tls_id. The tls_id is a column index into every
+// ThreadCtx.instances vector.
 //
-// The DB is an instance and should own a vertical stack of threads which touch it
-// Threads are a process and should own a horizontal stack of instances they touch
+// Conceptually:
 //
-// Similar to Rocks this forms a sort of matrix
-//
-//                  column 0      column 1      column 2
 //                  DB A          DB B          DB C
-// ThreadData 1     entries[0]    entries[1]    entries[2]
-// ThreadData 2     entries[0]    entries[1]    entries[2]
-// ThreadData 3     entries[0]    entries[1]    entries[2]
+//                  tls_id=0      tls_id=1      tls_id=2
 //
+// ThreadCtx 1      entries[0]    entries[1]    entries[2]
+// ThreadCtx 2      entries[0]    entries[1]    entries[2]
+// ThreadCtx 3      entries[0]    entries[1]    entries[2]
 //
-// Each DB instance will own a ThreadLocalPtr sentinel which forms the head of a linked list to the threads which touch it. The DB will form a column
-// in this matrix. It will acquire a TLS ID which new threads will use to index to columns (DB Instances).
+// StaticMeta.head links the rows:
 //
-// Each ThreadCtx will hold a list of Entries which are the columns that it touches. It will also hold a Next and a Prev pointer to form a doubly linked list
-// allowing it to traverse the rows of that column.
+//     head <-> ThreadCtx 1 <-> ThreadCtx 2 <-> ThreadCtx 3
 //
+// A DB does not own a linked-list head for its column. To invalidate DB A,
+// DBImpl uses its tls_id and walks StaticMeta.head:
+//
+//     for each ThreadCtx:
+//         if tls_id < instances.len():
+//             invalidate instances[tls_id]
+//
+// ThreadCtx.instances is grown lazily. If a thread has never touched a DB
+// whose tls_id is N, its vector may be shorter than N + 1. Walkers must check
+// bounds and skip missing slots.
 
 // TODO: Next is to build the close functionality where we walk all threads and de-register
 
+/// One per-thread, per-DB TLS slot.
+///
+/// `Entry` owns an optional heap-allocated `DBInstanceCtx`. A null pointer means
+/// this thread has not touched that DB slot yet.
+///
+/// Ownership:
+/// - The pointed-to `DBInstanceCtx`, when present, was allocated with
+///   `Box::into_raw`.
+/// - `Entry::drop` reclaims it with `Box::from_raw`.
+///
+/// Synchronization:
+/// - The owning thread may initialize/read its own entry through `&mut Entry`.
+/// - Cross-thread walkers must hold `StaticMeta::thread_mu` while traversing
+///   `ThreadCtx.instances` and must not retain returned pointers after
+///   releasing that lock.
+/// - The pointer is not atomic; do not read or write it concurrently without the
+///   registry mutex or exclusive owner-thread access.
 pub(super) struct Entry {
-    ptr: AtomicPtr<DBInstanceCtx>,
+    ptr: UnsafeCell<*mut DBInstanceCtx>,
+}
+
+impl Default for Entry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Entry {
+    fn drop(&mut self) {
+        // SAFETY
+        //
+        // We maintain that every Entry is stored in the instances of a ThreadCtx and is only accessed through the thread.mu Mutex by walkers
+        // traversing the linked list of ThreadCtx's
+        let ptr = unsafe { *self.ptr.get() };
+
+        if !ptr.is_null() {
+            // SAFETY
+            //
+            // We are safe to drop as we hold exclusive access and we should hold the thread_mu Mutex in static_meta()
+            // We maintain through API that no ptr references exist outside of the mutex
+            unsafe { drop(Box::from_raw(ptr)) }
+        }
+    }
 }
 
 impl Entry {
     pub(super) fn new() -> Self {
         Self {
-            ptr: AtomicPtr::new(null_mut()),
+            ptr: UnsafeCell::new(null_mut()),
         }
     }
 
-    pub(super) fn from(ptr: AtomicPtr<DBInstanceCtx>) -> Self {
-        Self { ptr }
+    pub(super) fn get(&self) -> Option<&DBInstanceCtx> {
+        let ptr = unsafe { *self.ptr.get() };
+
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
     }
 
     pub(super) fn get_or_insert_new(&mut self) -> &DBInstanceCtx {
-        let ptr = self.ptr.load(Ordering::Acquire);
+        let ptr = unsafe { *self.ptr.get() };
 
         if !ptr.is_null() {
             return unsafe { &*ptr };
         }
 
         let new_ptr = Box::into_raw(Box::new(DBInstanceCtx::new()));
-        self.ptr.store(new_ptr, Ordering::Release);
 
-        unsafe { &*new_ptr }
+        // Add Safety
+        unsafe {
+            *self.ptr.get() = new_ptr;
+            &*new_ptr
+        }
     }
 }
 
@@ -178,11 +236,6 @@ impl ThreadCtx {
 
         let _ = self.registered.replace(true);
     }
-
-    // pub(crate) fn sv_cache_mut(&self) -> &mut SVCache {
-    // unsafe { &mut *self.sv_cache.get() }
-    // }
-    //
 
     pub(super) fn db_instance(&self, tls_id: usize) -> &DBInstanceCtx {
         {
