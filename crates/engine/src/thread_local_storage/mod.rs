@@ -73,13 +73,14 @@ where
     })
 }
 
-pub(crate) fn thread_db_instance_ctx<F, R>(db_id: usize, f: F) -> R
+// TODO: Change tls_id to TlsSlot newtype as it is mixing index with count which will cause problems
+pub(crate) fn thread_db_instance_ctx<F, R>(tls_id: usize, f: F) -> R
 where
     F: FnOnce(&DBInstanceCtx) -> R,
 {
     TCTX.with(|ctx| {
         ctx.ensure_registered();
-        f(ctx.db_instance(db_id))
+        f(ctx.db_instance(tls_id))
     })
 }
 

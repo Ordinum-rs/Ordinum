@@ -5,7 +5,10 @@
 //
 
 use crate::db::batch_pool::ThreadBatchCache;
+use crate::db::db_impl::DbImpl;
 use crate::sync::Mutex;
+use crate::sync::atomic::AtomicPtr;
+use crate::sync::atomic::Ordering;
 use crate::sync::cell::Cell;
 use crate::sync::cell::RefCell;
 use crate::sync::cell::RefMut;
@@ -50,6 +53,35 @@ use std::ptr::null_mut;
 
 // TODO: Next is to build the close functionality where we walk all threads and de-register
 
+pub(super) struct Entry {
+    ptr: AtomicPtr<DBInstanceCtx>,
+}
+
+impl Entry {
+    pub(super) fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(null_mut()),
+        }
+    }
+
+    pub(super) fn from(ptr: AtomicPtr<DBInstanceCtx>) -> Self {
+        Self { ptr }
+    }
+
+    pub(super) fn get_or_insert_new(&mut self) -> &DBInstanceCtx {
+        let ptr = self.ptr.load(Ordering::Acquire);
+
+        if !ptr.is_null() {
+            return unsafe { &*ptr };
+        }
+
+        let new_ptr = Box::into_raw(Box::new(DBInstanceCtx::new()));
+        self.ptr.store(new_ptr, Ordering::Release);
+
+        unsafe { &*new_ptr }
+    }
+}
+
 pub(crate) struct ThreadCtx {
     // Linked
     next: *mut ThreadCtx,
@@ -63,7 +95,7 @@ pub(crate) struct ThreadCtx {
     //
 
     // DB Instanced
-    instances: UnsafeCell<Vec<Option<Box<DBInstanceCtx>>>>,
+    instances: UnsafeCell<Vec<Entry>>,
     // NOTE: Can also be -> UnsafeCell<Vec<Entry<DBInstanceCtx>>> Where entry is Entry { ptr: AtomicPtr<()> } ??
 }
 
@@ -88,17 +120,37 @@ impl ThreadCtx {
         }
     }
 
-    // TODO: Need to test
+    #[inline]
+    fn resize_instances(&self, tls_id: usize) {
+        let _guard = static_meta().thread_mu.lock().unwrap();
+
+        let instances = unsafe { &mut *self.instances.get() };
+
+        if tls_id >= instances.len() {
+            instances.resize_with(tls_id + 1, Entry::new);
+        }
+    }
+
     pub(super) fn ensure_registered(&self) {
         if self.registered.get() {
             return;
         }
 
-        // We need to register in the static meta
+        // We need to register in the static meta and initialise the instances to tls_id global
 
         let meta = static_meta();
 
         let guard = meta.thread_mu.lock().unwrap_or_else(|e| panic!("{e}"));
+
+        // Re-size instances first
+
+        let tls_id = meta.next_tls_id.load(Ordering::Acquire);
+
+        let instances = unsafe { &mut *self.instances.get() };
+
+        if instances.len() < tls_id {
+            instances.resize_with(tls_id, Entry::new);
+        }
 
         // Insert ctx into doubly linked list
         //
@@ -123,6 +175,8 @@ impl ThreadCtx {
 
             sentinel.next = ptr;
         }
+
+        let _ = self.registered.replace(true);
     }
 
     // pub(crate) fn sv_cache_mut(&self) -> &mut SVCache {
@@ -130,17 +184,18 @@ impl ThreadCtx {
     // }
     //
 
-    pub(super) fn db_instance(&self, db_id: usize) -> &DBInstanceCtx {
-        //
+    pub(super) fn db_instance(&self, tls_id: usize) -> &DBInstanceCtx {
+        {
+            let instances = unsafe { &*self.instances.get() };
 
-        // TODO: Fix after
-        let dvec = unsafe { &mut *self.instances.get() };
-
-        if dvec.len() <= db_id {
-            dvec.resize_with(db_id + 1, || None);
+            if tls_id >= instances.len() {
+                self.resize_instances(tls_id);
+            }
         }
 
-        dvec[db_id].get_or_insert_with(|| Box::new(DBInstanceCtx::new()))
+        let instances = unsafe { &mut *self.instances.get() };
+
+        instances[tls_id].get_or_insert_new()
     }
 }
 
@@ -171,5 +226,112 @@ impl DBInstanceCtx {
     {
         let mut cache = unsafe { &mut *self.batch_cache.get() };
         f(&mut cache)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use crate::sync::spin_loop;
+    use crate::thread_local_storage::{thread_ctx, thread_db_instance_ctx};
+
+    use super::*;
+
+    #[test]
+    fn thread_ctx_registered() {
+        // Now walk the static meta linked list and should have 1 entry
+
+        let meta = static_meta();
+
+        assert!(unsafe { &*meta.head.get() }.next.is_null());
+        //
+        thread_ctx(|ctx| assert_eq!(ctx.registered.get(), true));
+        //
+        assert!(!unsafe { &*meta.head.get() }.next.is_null());
+    }
+
+    #[test]
+    fn mutli_thread_register() {
+        let meta = static_meta();
+
+        let mut registered_count = 0;
+
+        thread::scope(|t| {
+            //
+
+            t.spawn(|| thread_ctx(|_| ()));
+            //
+            t.spawn(|| thread_ctx(|_| ()));
+            //
+            t.spawn(|| thread_ctx(|_| ()));
+        });
+
+        let mut next = unsafe { &*meta.head.get() }.next;
+
+        while !next.is_null() {
+            registered_count += 1;
+
+            next = unsafe { &*next }.next
+        }
+
+        assert_eq!(registered_count, 3);
+    }
+
+    #[test]
+    fn thread_instances_initialised_to_db_instances() {
+        let meta = static_meta();
+
+        meta.next_tls_id.store(3, Ordering::Release);
+
+        thread::scope(|t| {
+            //
+
+            t.spawn(|| thread_ctx(|_| ()));
+            //
+            t.spawn(|| thread_ctx(|_| ()));
+            //
+            t.spawn(|| {
+                thread_ctx(|ctx| {
+                    // Check instances len
+                    assert_eq!(unsafe { &*ctx.instances.get() }.len(), 3);
+                })
+            });
+        });
+    }
+
+    #[test]
+    fn check_thread_instance_resize_on_new_db_instance() {
+        let meta = static_meta();
+
+        meta.next_tls_id.store(3, Ordering::Release);
+
+        // tls_id:
+        //  1, 2, 3, 4, 5
+        // index:
+        // [0, 1, 2, 3, 4]
+        //              ^
+        //         tls_id = 5 = index 4
+
+        thread::scope(|t| {
+            t.spawn(|| {
+                thread_ctx(|ctx| {
+                    assert_eq!(unsafe { &*ctx.instances.get() }.len(), 3);
+                });
+
+                meta.next_tls_id.store(5, Ordering::Release);
+
+                thread_ctx(|ctx| {
+                    assert_eq!(unsafe { &*ctx.instances.get() }.len(), 3);
+                });
+
+                // Only resize when accessing the db instance
+
+                thread_db_instance_ctx(4, |_| {});
+                thread_ctx(|ctx| {
+                    assert_eq!(unsafe { &*ctx.instances.get() }.len(), 5);
+                });
+            });
+        });
     }
 }
