@@ -112,3 +112,70 @@ There is the sales pitch. In fact, it's much more a mantra than a pitch and even
 Odinum is a passion project originally started as a means to build a deeper knowledge of database internals, and to explore a love for low-level system design.
 
 Ordinum's storage engine is and always will be open-source. In the spirit of not re-inventing the wheel it is inspired by the likes of **RocksDB**, **LevelDB** and, **PebbleDB** whilst also implementing key research papers. This allows Ordinum to remain at the cutting edge of modern design whilst also saving space for iterating and improving where possible.
+
+You may be asking, 'What makes Ordinum different?' or 'Why another database?' and honestly, I wish I had a better answer than that we hope to take something incredibly complex by design and make it beautifully simple. That the innovation is taking years worth of iteration and many different implementations and condensing that into one focused application with proven efficiency.
+
+And on that, it was worth maybe talking about the architecture of Ordinum and some of the design decisions.
+
+### Architecture and Design
+
+Ordinum stays true to the LSM structure as a whole. That being, the engine is broken up into two distinct stages of memory. `In-memory` and `Persisted memory`.
+
+```mermaid
+flowchart LR
+
+    IN([Bytes In])
+
+    subgraph Engine
+        MEM(In-Memory Processing)
+        DISK(Persistent Storage)
+
+        MEM --> DISK
+    end
+
+    OUT([Bytes Out])
+
+    IN --> MEM
+    DISK --> OUT
+
+```
+
+
+
+This is, of course, a highly simplistic way of reducing the engine. The two stages each have their own complexities and sub-systems, which must ultimately be woven together to create a seamless transition from bytes entering the engine, to bytes being persisted, and finally to bytes being read back again.
+
+Many of these subsystems are what give an LSM database its character. Writes do not immediately become sorted files on disk. They first pass through an in-memory write path, where they may be batched, assigned sequence numbers, written to the WAL, and inserted into mutable in-memory structures. In Ordinum, this means thinking carefully about how batches move through the pipeline, how ordering is preserved, and how multiple writer threads can safely apply their work concurrently.
+
+The memtable is one of the most important pieces of this stage. It acts as the first searchable home for newly written keys, while also buffering writes before they are flushed into immutable on-disk tables. A structure such as a Skiplist is a natural fit here because it maintains sorted order while supporting efficient inserts and lookups. The interesting part is not simply choosing a Skiplist, but making it work safely under concurrency: allocating nodes, publishing links, handling retries, and ensuring readers never observe partially-installed state.
+
+Once the memtable reaches a threshold, the problem changes shape. The in-memory structure must become immutable, handed off for flushing, and eventually encoded into SSTables on disk. At that point, the engine shifts from fast concurrent mutation to careful persistence: block layout, indexes, filters, checksums, compression, and metadata all become part of the story.
+
+Reads then have to stitch these worlds back together. A lookup may need to consult the current memtable, immutable memtables waiting to be flushed, and several levels of SSTables. The engine must make this feel like one coherent view of the database, even though the data is physically spread across memory and disk, and may exist in multiple versions due to updates, deletes, and snapshots.
+
+So while the simplified model is “bytes in, bytes persisted, bytes out,” the real design is about coordinating many smaller systems: the write pipeline, WAL, memtables, flushes, SSTables, version management, snapshots, iterators, and compaction. The strength of an LSM engine comes from how cleanly these pieces are connected.
+
+A slightly more accurate, high level picture therefore represents the two caller paths `Writer` and `Reader` and shows how they flow through the two memory stages.
+
+
+```mermaid
+
+flowchart LR
+
+    R(Read Path)
+    W(Write Path)
+
+    subgraph Memory
+        MT(Memtable)
+    end
+
+    subgraph Disk
+        SST(SSTables)
+    end
+
+    W --> MT
+    MT -. Flush .-> SST
+
+    R --> MT
+    R --> SST
+
+```
