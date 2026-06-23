@@ -1,5 +1,6 @@
 pub(crate) mod registry;
 pub(crate) mod scratch;
+pub(crate) mod thread_local;
 
 use std::ptr::null_mut;
 

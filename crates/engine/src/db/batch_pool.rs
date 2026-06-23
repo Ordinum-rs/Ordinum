@@ -70,6 +70,7 @@ const MAX_BATCHES_PER_THREAD_CACHE: usize = 4;
 // - The pool may destroy returned batches using Box::from_raw when retention limits are exceeded.
 // - Thread-local cached batches are destroyed when ThreadCtx drops.
 
+// TODO: Move into thread_local_storage folder?
 pub(crate) struct ThreadBatchCache {
     pub(crate) shard_idx: Option<usize>,
     pub(crate) batches: Vec<NonNullBatchPtr>,
