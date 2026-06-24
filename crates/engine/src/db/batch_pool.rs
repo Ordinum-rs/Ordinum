@@ -144,6 +144,8 @@ pub(crate) struct BatchPool {
     next_shard: AtomicUsize,
     //
     stats: BatchPoolStats,
+    //
+    // TODO: Add the thread_local_ptr<BatchCache> here so we can use the tls storage
 }
 
 impl BatchPool {

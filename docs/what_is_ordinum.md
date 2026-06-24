@@ -201,21 +201,10 @@ flowchart LR
     R --> F3
 ```
 
-#### Topics to Expand
-
-TODO: Durability and recovery - how the WAL protects acknowledged writes, how recovery rebuilds in-memory state, and when old log files can be recycled.
-
-TODO: Read visibility - how sequence numbers, snapshots, and tombstones decide which version of a key is visible.
-
-TODO: SSTables - the high-level role of data blocks, sparse indexes, filters, checksums, compression, and metadata.
-
-TODO: Version management - how readers keep a stable view while writers, flushes, and compactions install new state.
-
-TODO: Compaction policy - how Ordinum will decide what to compact, when to throttle writes, and how to balance write, read, and space amplification.
-
----
 
 Ordinum seeks to compile the latest advancements and implementations of LSM databases as well as leading academic papers in trying to create a robust and simple storage engine. Another key aspect of this which informs the design architecture of the engine is the separation of Keys and Values.
+
+#### Key Value Separation
 
 The paper [WiscKey: Separating Keys from Values
 in SSD-conscious Storage](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf) details the optimisations that come with separating large Values from Keys when storing bytes.
@@ -257,3 +246,19 @@ flowchart LR
 ```
 
 >Unlike WiscKey, Ordinum does not separate values during the write path. All writes are stored in the WAL and memtables as complete key-value pairs. Value separation occurs only during memtable flush, where large values are redirected into the Value Log and replaced with compact value pointers in SSTables. This preserves fast in-memory reads while still achieving the reduced write amplification benefits of key-value separation for persisted data.
+
+#### Version Management
+
+Versioning is an important part of any storage engine
+
+#### Topics to Expand
+
+TODO: Durability and recovery - how the WAL protects acknowledged writes, how recovery rebuilds in-memory state, and when old log files can be recycled.
+
+TODO: Read visibility - how sequence numbers, snapshots, and tombstones decide which version of a key is visible.
+
+TODO: SSTables - the high-level role of data blocks, sparse indexes, filters, checksums, compression, and metadata.
+
+TODO: Version management - how readers keep a stable view while writers, flushes, and compactions install new state.
+
+TODO: Compaction policy - how Ordinum will decide what to compact, when to throttle writes, and how to balance write, read, and space amplification.

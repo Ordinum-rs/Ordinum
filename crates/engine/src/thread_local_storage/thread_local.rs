@@ -8,6 +8,14 @@ use crate::sync::atomic::AtomicUsize;
 use crate::sync::cell::Cell;
 use crate::sync::cell::UnsafeCell;
 
+// Thread Matrix
+
+//                  tls_id=0      tls_id=1      tls_id=2
+//
+// ThreadCtx 1      entries[0]    entries[1]    entries[2]
+// ThreadCtx 2      entries[0]    entries[1]    entries[2]
+// ThreadCtx 3      entries[0]    entries[1]    entries[2]
+
 // ---- TLS Init ---- //
 
 thread_local! {
@@ -18,14 +26,12 @@ thread_local! {
 
 // ---- Thread Static Meta ---- //
 
-pub(crate) type UnrefHandler = unsafe fn(*mut ());
-
 pub(crate) struct ThreadMetaGlobal {
     thread_mu: Mutex<()>,
 
     head: UnsafeCell<ThreadData>,
 
-    unref_handler_map: UnsafeCell<HashMap<usize, UnrefHandler>>,
+    unref_handler_map: UnsafeCell<HashMap<usize, super::thread_local_ptr::UnrefHandler>>,
 
     next_tls_id: AtomicUsize,
 
@@ -92,6 +98,52 @@ impl Default for ThreadData {
             entries: UnsafeCell::new(Vec::new()),
             registered: Cell::new(false),
         }
+    }
+}
+
+impl ThreadData {
+    fn ensure_registered(&self) {
+        if self.registered.get() {
+            return;
+        }
+
+        let meta = thread_meta();
+
+        let _guard = meta.thread_mu.lock().unwrap_or_else(|e| {
+            // XXX: In future we may want to handle the poison lock
+            panic!("{e}")
+        });
+
+        // We don't assign tls_id here, as it will be per-entry
+
+        // TODO: Add safety note
+        let sentinal = unsafe { &mut *meta.head.get() };
+
+        let ptr = self as *const Self as *mut Self;
+
+        let old_ptr = sentinal.next.get();
+
+        // Insert ctx into doubly linked list
+        //
+        //            Prev <--- current_head ---> Next ---> null
+        //             |             ^
+        //  Prev <--- Self ----------┘
+
+        unsafe {
+            (*ptr).prev.set(sentinal as *mut ThreadData);
+            (*ptr).next.set(old_ptr);
+
+            if !old_ptr.is_null() {
+                (*old_ptr).prev.set(ptr);
+            } else {
+                sentinal.prev.set(ptr);
+            }
+        }
+
+        sentinal.next.set(ptr);
+
+        // Registered
+        self.registered.set(true);
     }
 }
 
