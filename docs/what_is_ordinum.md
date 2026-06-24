@@ -109,7 +109,7 @@ Ordinum is not trying to hide the hard parts of database engineering. It is tryi
 
 There is the sales pitch. In fact, it's much more a mantra than a pitch and even less about sales.
 
-Odinum is a passion project originally started as a means to build a deeper knowledge of database internals, and to explore a love for low-level system design.
+Ordinum is a passion project originally started as a means to build a deeper knowledge of database internals, and to explore a love for low-level system design.
 
 Ordinum's storage engine is and always will be open-source. In the spirit of not re-inventing the wheel it is inspired by the likes of **RocksDB**, **LevelDB** and, **PebbleDB** whilst also implementing key research papers. This allows Ordinum to remain at the cutting edge of modern design whilst also saving space for iterating and improving where possible.
 
@@ -139,7 +139,6 @@ flowchart LR
     DISK --> OUT
 
 ```
-
 
 
 This is, of course, a highly simplistic way of reducing the engine. The two stages each have their own complexities and sub-systems, which must ultimately be woven together to create a seamless transition from bytes entering the engine, to bytes being persisted, and finally to bytes being read back again.
@@ -179,3 +178,82 @@ flowchart LR
     R --> SST
 
 ```
+
+Traditionally, the in-memory part of the engine would be made up of a single active memtable and a single frozen memtable. The active memtable, on becoming full, would trigger a rotation and would become frozen and be swapped for the secondary memtable which would then become the active one. The frozen memtable would then be flushed to disk in the background.
+
+Ordinum, similar to Rocks, expands on this by allowing multiple frozen memtables (up to a configured `n` amount) which speeds up the write and read path by not stalling on rotations whilst waiting for the secondary memtable to flush. Particularly on increased write workloads which can cause a lot of memtable churn. By allowing multiple frozen memtables to build up in a queue, writes and reads can continue to hit the in-memory portion of the engine while background threads handle flushing.
+
+```mermaid
+flowchart LR
+    W[Writes] --> A[Active Memtable]
+
+    subgraph Immutable Memtable Queue
+        F1[Frozen 1] --> F2[Frozen 2] --> F3[Frozen N]
+    end
+
+    A -- Rotate --> F1
+    F3 --> X[Flushing]
+    X --> S[(SSTable)]
+
+    R[Reads] --> A
+    R --> F1
+    R --> F2
+    R --> F3
+```
+
+#### Topics to Expand
+
+TODO: Durability and recovery - how the WAL protects acknowledged writes, how recovery rebuilds in-memory state, and when old log files can be recycled.
+
+TODO: Read visibility - how sequence numbers, snapshots, and tombstones decide which version of a key is visible.
+
+TODO: SSTables - the high-level role of data blocks, sparse indexes, filters, checksums, compression, and metadata.
+
+TODO: Version management - how readers keep a stable view while writers, flushes, and compactions install new state.
+
+TODO: Compaction policy - how Ordinum will decide what to compact, when to throttle writes, and how to balance write, read, and space amplification.
+
+---
+
+Ordinum seeks to compile the latest advancements and implementations of LSM databases as well as leading academic papers in trying to create a robust and simple storage engine. Another key aspect of this which informs the design architecture of the engine is the separation of Keys and Values.
+
+The paper [WiscKey: Separating Keys from Values
+in SSD-conscious Storage](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf) details the optimisations that come with separating large Values from Keys when storing bytes.
+
+Typically, in standard storage engines, both the Key and the Value are stored inline together, meaning they are run through the write path through to being persisted on disk as a contiguous block of memory. This may be fine for small Values, the read becomes quite trivial, we use a `LookUpKey` to find the latest visible key in the LSM Tree and the Value is right there next to it.
+
+For large values, the traditional LSM design begins to suffer from significant write amplification. Every time a value moves through the compaction hierarchy, the entire key-value pair must be rewritten. A 32-byte key with a 4 KB value is treated as a 4 KB record, meaning compactions repeatedly read and rewrite large quantities of data even though the expensive portion is rarely used for ordering or searching.
+
+The key observation made by WiscKey is that the LSM tree primarily exists to organise keys. During a lookup, the engine searches for a key and only needs the associated value once the latest visible version has been located. Storing large values inline therefore causes the LSM to perform work that is unrelated to its core purpose.
+
+To address this, WiscKey separates keys from values. Values are written to an append-only Value Log while the LSM tree stores only the key and a small pointer describing where the value resides within the log. This pointer typically contains a file identifier, offset and length.
+
+Pure WiscKey creates the value pointer during the write path and only inserts the pointer into the memtable. Ordinum's design is closer to Pebble/RocksDB in that the memtable remains a complete representation of recently written data. Every write enters the WAL and memtable as a normal key-value pair, allowing reads from active and frozen memtables without ever touching the Value Log.
+
+Only when a memtable is flushed do we decide whether a value should remain inline or be separated. During flush, values larger than a configured threshold are written into the Value Log and replaced with a ValuePointer in the generated SSTable. Smaller values continue to be embedded directly within the SSTable.
+
+This preserves the simplicity and performance of the write path. Memtable inserts remain a single operation, readers can access recent writes directly from memory, and value separation becomes a storage-level optimisation rather than a write-path concern.
+
+The trade-off is that the flush process becomes slightly more expensive, as it must decide how each value should be encoded and potentially append large values to the Value Log. In return, the LSM tree benefits from reduced compaction costs once data reaches disk.
+
+```mermaid
+flowchart LR
+    A[Write Key + 64KB Value]
+
+    A --> B[WAL]
+    B --> C[Memtable<br/>Stores Full Value]
+
+    C --> D[Frozen Memtable]
+
+    D --> E[Flush]
+
+    E --> F[Write 64KB Value<br/>to Value Log]
+
+    F --> G[Create ValuePointer]
+
+    G --> H[SSTable<br/>Key + Pointer]
+
+    H --> I[Future Compactions<br/>Move Only Key + Pointer]
+```
+
+>Unlike WiscKey, Ordinum does not separate values during the write path. All writes are stored in the WAL and memtables as complete key-value pairs. Value separation occurs only during memtable flush, where large values are redirected into the Value Log and replaced with compact value pointers in SSTables. This preserves fast in-memory reads while still achieving the reduced write amplification benefits of key-value separation for persisted data.
