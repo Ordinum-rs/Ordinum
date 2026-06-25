@@ -19,7 +19,7 @@ use crate::sync::cell::UnsafeCell;
 // ---- TLS Init ---- //
 
 thread_local! {
-    static TLS_THREAD_ROW: ThreadData = ThreadData::default();
+    pub(crate) static TLS_THREAD_ROW: ThreadData = ThreadData::default();
 
     // XXX: Future thread local fields can be separate static entries here ONLY if they are for the thread and not per db instance
 }
@@ -27,15 +27,15 @@ thread_local! {
 // ---- Thread Static Meta ---- //
 
 pub(crate) struct ThreadMetaGlobal {
-    thread_mu: Mutex<()>,
+    pub(super) thread_mu: Mutex<()>,
 
-    head: UnsafeCell<ThreadData>,
+    pub(super) head: UnsafeCell<ThreadData>,
 
-    unref_handler_map: UnsafeCell<HashMap<usize, super::thread_local_ptr::UnrefHandler>>,
+    pub(super) unref_handler_map: UnsafeCell<HashMap<usize, super::thread_local_ptr::UnrefHandler>>,
 
-    next_tls_id: AtomicUsize,
+    pub(super) next_tls_id: AtomicUsize,
 
-    tls_id_free_list: Vec<usize>,
+    pub(super) tls_id_free_list: UnsafeCell<Vec<usize>>,
 }
 
 // TODO: Need safety notes - can we avoid this?
@@ -49,7 +49,7 @@ impl Default for ThreadMetaGlobal {
             head: UnsafeCell::new(ThreadData::default()),
             unref_handler_map: UnsafeCell::new(HashMap::new()),
             next_tls_id: AtomicUsize::new(0),
-            tls_id_free_list: Vec::new(),
+            tls_id_free_list: UnsafeCell::new(Vec::new()),
         }
     }
 }
@@ -86,7 +86,7 @@ pub(crate) struct ThreadData {
     prev: Cell<*mut ThreadData>,
 
     // Entries - columns in the thread local matrix, each column can comprise of multiple thread-local-storage sub-systems each with a unique tls_id
-    entries: UnsafeCell<Vec<*mut ()>>,
+    pub(crate) entries: UnsafeCell<Vec<*mut ()>>,
     registered: Cell<bool>,
 }
 
@@ -102,7 +102,7 @@ impl Default for ThreadData {
 }
 
 impl ThreadData {
-    fn ensure_registered(&self) {
+    pub(super) fn ensure_registered(&self) {
         if self.registered.get() {
             return;
         }
