@@ -4,8 +4,18 @@ use crate::thread_local_storage::thread_local::{TLS_THREAD_ROW, thread_meta};
 
 pub(crate) type UnrefHandler = unsafe fn(*mut ());
 
-pub(crate) trait ThreadLocalObject {
-    const HANDLER: Option<UnrefHandler> = None;
+pub(crate) trait ThreadLocalObject: Sized {
+    fn handler() -> Option<UnrefHandler> {
+        None
+    }
+
+    unsafe fn unref_erased(ptr: *mut ()) {
+        unsafe {
+            Self::unref(ptr.cast::<Self>());
+        }
+    }
+
+    unsafe fn unref(ptr: *mut Self) {}
 }
 
 //
@@ -117,4 +127,51 @@ impl<T> ThreadLocalPtr<T> {
 
     //
     //
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_entry() {
+        let meta = thread_meta();
+
+        struct Entry {
+            thing: usize,
+        }
+
+        struct ThreadOwner {
+            ptr: ThreadLocalPtr<Entry>,
+        }
+
+        impl ThreadLocalObject for Entry {
+            fn handler() -> Option<UnrefHandler> {
+                Some(Self::unref_erased)
+            }
+
+            unsafe fn unref(ptr: *mut Self) {
+                let entry = unsafe { Box::from_raw(ptr) };
+                println!("dropping {}", entry.thing);
+            }
+        }
+
+        let tlo = ThreadOwner {
+            ptr: ThreadLocalPtr::new_with_handler(Entry::handler()),
+        };
+
+        let _guard = meta.thread_mu.lock().unwrap();
+
+        let handler = unsafe { &*meta.unref_handler_map.get() }
+            .get(&tlo.ptr.tls_id)
+            .copied()
+            .unwrap();
+
+        let entry = Box::new(Entry { thing: 10 });
+        let ptr = Box::into_raw(entry).cast::<()>();
+
+        unsafe {
+            handler(ptr);
+        }
+    }
 }
