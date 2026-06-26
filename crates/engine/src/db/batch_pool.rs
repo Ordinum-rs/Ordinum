@@ -145,7 +145,7 @@ pub(crate) struct BatchPool {
     //
     stats: BatchPoolStats,
     //
-    // TODO: Add the thread_local_ptr<BatchCache> here so we can use the tls storage
+    // TODO: Add the thread_local_ptr<ThreadBatchCache> here so we can use the tls storage
 }
 
 impl BatchPool {

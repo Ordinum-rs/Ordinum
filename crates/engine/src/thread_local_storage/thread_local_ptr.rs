@@ -1,9 +1,19 @@
-use std::{marker::PhantomData, ops::Index, ptr::null_mut};
+use std::{
+    marker::PhantomData,
+    ops::Index,
+    ptr::{NonNull, null_mut},
+};
 
 use crate::thread_local_storage::thread_local::{TLS_THREAD_ROW, thread_meta};
 
+// ---- UnrefHandler Type ---- //
+
 pub(crate) type UnrefHandler = unsafe fn(*mut ());
 
+// ---- ThreadLocalObject Trait ---- //
+
+/// Defines how an object stored within a ThreadLocalPtr TLS entry should be
+/// reclaimed when its owning ThreadLocalPtr reclaims the TLS column.
 pub(crate) trait ThreadLocalObject: Sized {
     fn handler() -> Option<UnrefHandler> {
         None
@@ -15,26 +25,30 @@ pub(crate) trait ThreadLocalObject: Sized {
         }
     }
 
-    unsafe fn unref(ptr: *mut Self) {}
+    unsafe fn unref(_: *mut Self) {
+        unreachable!("handler() must return Some before unref() can be called");
+    }
 }
 
-//
-//
-//
-//
+// ---- ThreadLocalPtr ---- //
+
+/// ThreadLocalPtr represents a single column within the global TLS matrix.
+///
+/// The owner of a ThreadLocalPtr is responsible for allocating and inserting
+/// per-thread entry objects. ThreadLocalPtr stores typed pointers to those
+/// objects for each thread, and on reclamation walks the column and invokes
+/// the registered handler for each entry.
+///
+/// The entry type determines its own reclamation semantics by implementing
+/// `ThreadLocalObject`. ThreadLocalPtr does not own the allocation strategy
+/// or lifetime protocol of the stored objects; it only manages their storage
+/// and reclamation within the TLS matrix.
 pub(crate) struct ThreadLocalPtr<T> {
     tls_id: usize,
     _type: PhantomData<T>,
 }
 
 impl<T> ThreadLocalPtr<T> {
-    fn new() -> Self {
-        Self {
-            tls_id: 0,
-            _type: PhantomData,
-        }
-    }
-
     pub(crate) fn new_with_handler(handler: Option<UnrefHandler>) -> Self {
         // Acquire tls_id from meta
 
@@ -69,10 +83,28 @@ impl<T> ThreadLocalPtr<T> {
         }
     }
 
+    // TODO: Finish
+    // SAFETY:
+    // `entry` must point to a valid instance of `T` that remains valid for the
+    // lifetime of this TLS entry, or until it is replaced or reclaimed.
+    //
+    // Allocation of the entry object is the responsibility of the owner of this
+    // ThreadLocalPtr. ThreadLocalPtr only stores the pointer within the current
+    // thread's TLS row and does not assume any ownership semantics.
+    //
+    // The lifetime and reclamation strategy of the stored object is defined by
+    // the registered `ThreadLocalObject` handler. This may involve dropping a
+    // heap allocation, decrementing a reference count, retiring the object
+    // through a reclamation scheme, or performing no action, depending on the
+    // semantics of `T`.
+    pub(crate) fn reset(&self, entry: NonNull<T>) {
+        let ptr = entry;
+    }
+
     // TODO: Implement get_mut() and reset() and swap()
 
     // TODO: Test get()
-    pub(super) fn get(&self) -> Option<&T> {
+    pub(crate) fn get(&self) -> Option<NonNull<T>> {
         let tls_id = self.tls_id;
 
         TLS_THREAD_ROW.with(|data| {
@@ -93,7 +125,7 @@ impl<T> ThreadLocalPtr<T> {
             if ptr.is_null() {
                 return None;
             } else {
-                return Some(unsafe { &*ptr.cast::<T>() });
+                return Some(unsafe { NonNull::new_unchecked(ptr.cast::<T>()) });
             }
         })
     }
@@ -129,49 +161,75 @@ impl<T> ThreadLocalPtr<T> {
     //
 }
 
+impl<T: ThreadLocalObject> ThreadLocalPtr<T> {
+    pub(crate) fn new() -> Self {
+        Self::new_with_handler(T::handler())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn simple_entry() {
+    struct Entry {
+        thing: usize,
+    }
+
+    struct ThreadOwner {
+        ptr: ThreadLocalPtr<Entry>,
+    }
+
+    impl ThreadLocalObject for Entry {
+        fn handler() -> Option<UnrefHandler> {
+            Some(Self::unref_erased)
+        }
+
+        unsafe fn unref(ptr: *mut Self) {
+            let _entry = unsafe { Box::from_raw(ptr) };
+        }
+    }
+
+    fn setup_thread_owner() -> ThreadOwner {
+        ThreadOwner {
+            ptr: ThreadLocalPtr::new(),
+        }
+    }
+
+    fn handler_for(ptr: &ThreadLocalPtr<Entry>) -> UnrefHandler {
         let meta = thread_meta();
-
-        struct Entry {
-            thing: usize,
-        }
-
-        struct ThreadOwner {
-            ptr: ThreadLocalPtr<Entry>,
-        }
-
-        impl ThreadLocalObject for Entry {
-            fn handler() -> Option<UnrefHandler> {
-                Some(Self::unref_erased)
-            }
-
-            unsafe fn unref(ptr: *mut Self) {
-                let entry = unsafe { Box::from_raw(ptr) };
-                println!("dropping {}", entry.thing);
-            }
-        }
-
-        let tlo = ThreadOwner {
-            ptr: ThreadLocalPtr::new_with_handler(Entry::handler()),
-        };
-
         let _guard = meta.thread_mu.lock().unwrap();
 
-        let handler = unsafe { &*meta.unref_handler_map.get() }
-            .get(&tlo.ptr.tls_id)
+        unsafe { &*meta.unref_handler_map.get() }
+            .get(&ptr.tls_id)
             .copied()
-            .unwrap();
+            .unwrap()
+    }
 
-        let entry = Box::new(Entry { thing: 10 });
-        let ptr = Box::into_raw(entry).cast::<()>();
+    fn entry_ptr(thing: usize) -> *mut () {
+        Box::into_raw(Box::new(Entry { thing })).cast::<()>()
+    }
+
+    #[test]
+    fn simple_entry() {
+        let mut handler_called = false;
+
+        let owner = setup_thread_owner();
+        let handler = handler_for(&owner.ptr);
+        let ptr = entry_ptr(10);
 
         unsafe {
             handler(ptr);
+            handler_called = true;
         }
+
+        assert_eq!(handler_called, true);
+    }
+
+    #[test]
+    fn simple_get_on_tlp() {
+        let owner = setup_thread_owner();
+
+        let entry = owner.ptr.get();
+        assert!(entry.is_none());
     }
 }
