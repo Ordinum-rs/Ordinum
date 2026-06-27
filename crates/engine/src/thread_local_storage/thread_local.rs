@@ -4,6 +4,7 @@ use std::ptr::null_mut;
 
 use crate::db::batch_pool::ThreadBatchCache;
 use crate::sync::Mutex;
+use crate::sync::atomic::AtomicPtr;
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::cell::Cell;
 use crate::sync::cell::UnsafeCell;
@@ -86,7 +87,7 @@ pub(crate) struct ThreadData {
     prev: Cell<*mut ThreadData>,
 
     // Entries - columns in the thread local matrix, each column can comprise of multiple thread-local-storage sub-systems each with a unique tls_id
-    pub(crate) entries: UnsafeCell<Vec<*mut ()>>,
+    pub(crate) entries: UnsafeCell<Vec<AtomicPtr<*mut ()>>>,
     registered: Cell<bool>,
 }
 
