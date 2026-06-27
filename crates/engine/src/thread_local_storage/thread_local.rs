@@ -6,6 +6,7 @@ use crate::db::batch_pool::ThreadBatchCache;
 use crate::sync::Mutex;
 use crate::sync::atomic::AtomicPtr;
 use crate::sync::atomic::AtomicUsize;
+use crate::sync::atomic::Ordering;
 use crate::sync::cell::Cell;
 use crate::sync::cell::UnsafeCell;
 
@@ -55,13 +56,44 @@ impl Default for ThreadMetaGlobal {
     }
 }
 
+impl ThreadMetaGlobal {
+    pub(crate) fn new() -> Box<Self> {
+        let mut meta = Box::new(Self {
+            thread_mu: Mutex::new(()),
+            head: UnsafeCell::new(ThreadData::default()),
+            unref_handler_map: UnsafeCell::new(HashMap::new()),
+            next_tls_id: AtomicUsize::new(0),
+            tls_id_free_list: UnsafeCell::new(Vec::new()),
+        });
+
+        let head = meta.head.get();
+
+        unsafe {
+            (*head).next.set(head);
+            (*head).prev.set(head);
+        }
+
+        // Empty:
+        //   +-----------+
+        //   | Sentinel  |
+        //   +-----------+
+        //    ^         |
+        //    |         v
+        //   prev     next
+        //    |         |
+        //    +---------+
+
+        meta
+    }
+}
+
 pub(crate) fn thread_meta() -> &'static ThreadMetaGlobal {
     #[cfg(not(feature = "loom"))]
     {
         use std::sync::OnceLock;
 
-        static STATIC_META: OnceLock<ThreadMetaGlobal> = OnceLock::new();
-        STATIC_META.get_or_init(ThreadMetaGlobal::default)
+        static STATIC_META: OnceLock<Box<ThreadMetaGlobal>> = OnceLock::new();
+        STATIC_META.get_or_init(ThreadMetaGlobal::new)
     }
     #[cfg(feature = "loom")]
     {
@@ -87,7 +119,7 @@ pub(crate) struct ThreadData {
     prev: Cell<*mut ThreadData>,
 
     // Entries - columns in the thread local matrix, each column can comprise of multiple thread-local-storage sub-systems each with a unique tls_id
-    pub(crate) entries: UnsafeCell<Vec<AtomicPtr<*mut ()>>>,
+    pub(crate) entries: UnsafeCell<Vec<AtomicPtr<()>>>,
     registered: Cell<bool>,
 }
 
@@ -103,6 +135,14 @@ impl Default for ThreadData {
 }
 
 impl ThreadData {
+    // SAFETY:
+    //
+    // The caller must hold `thread_meta.thread_mu`, which serializes all
+    // structural modifications to this thread's TLS row.
+    fn entries_mut(&self) -> &mut Vec<AtomicPtr<()>> {
+        unsafe { &mut *self.entries.get() }
+    }
+
     pub(super) fn ensure_registered(&self) {
         if self.registered.get() {
             return;
@@ -115,36 +155,85 @@ impl ThreadData {
             panic!("{e}")
         });
 
-        // We don't assign tls_id here, as it will be per-entry
-
         // TODO: Add safety note
-        let sentinal = unsafe { &mut *meta.head.get() };
+        let sentinal = unsafe { &mut *meta.head.get() } as *mut ThreadData;
 
-        let ptr = self as *const Self as *mut Self;
+        let this = self as *const Self as *mut Self;
 
-        let old_ptr = sentinal.next.get();
+        let first = unsafe { &*sentinal }.next.get();
 
-        // Insert ctx into doubly linked list
-        //
-        //            Prev <--- current_head ---> Next ---> null
-        //             |             ^
-        //  Prev <--- Self ----------┘
+        // Before:
+
+        // Sentinel ----> First
+        //     ^            |
+        //     |            v
+        //     <------------
+
+        // After:
+
+        // Sentinel ----> Self ----> First
+        //     ^            |          |
+        //     |            |          v
+        //     <------------<----------
 
         unsafe {
-            (*ptr).prev.set(sentinal as *mut ThreadData);
-            (*ptr).next.set(old_ptr);
+            // Link self
+            (*this).prev.set(sentinal);
+            (*this).next.set(first);
 
-            if !old_ptr.is_null() {
-                (*old_ptr).prev.set(ptr);
-            } else {
-                sentinal.prev.set(ptr);
-            }
+            // Correct sentinel next
+            (*first).prev.set(this);
+
+            (*sentinal).next.set(this);
+
+            // We don't need to set first.next because it is either the next node OR sentinel which keeps
+            // the circular linked list
         }
-
-        sentinal.next.set(ptr);
 
         // Registered
         self.registered.set(true);
+    }
+
+    pub(super) fn drop_row(&self) {
+        //
+        let meta = thread_meta();
+
+        // We are dropping the row, so only need to unlink from the linked list and walk the entries vec
+
+        let _guard = meta.thread_mu.lock().unwrap_or_else(|e| panic!("{e}"));
+
+        let mut next = self.next.get();
+        let mut prev = self.prev.get();
+
+        unsafe {
+            if next.is_null() {
+                (*prev).next.set(null_mut())
+            }
+
+            (*next).prev.set(prev);
+            (*prev).next.set(next);
+        }
+
+        // Loop the entries, if !null then we need to call the handler and null the entry and handler
+
+        for (idx, e) in self.entries_mut().iter_mut().enumerate() {
+            //
+
+            let ptr = e.swap(null_mut(), Ordering::AcqRel);
+
+            if ptr.is_null() {
+                continue;
+            }
+
+            /* XXX: As a future optimisation we could collect the entry ptr's and id's and handlers? in a vec so we can
+            release the lock and call the handlers outside of the lock to reduce lock time */
+
+            let handler = unsafe { &*meta.unref_handler_map.get() };
+
+            if let Some(unref) = handler.get(&idx) {
+                unsafe { unref(ptr) }
+            }
+        }
     }
 }
 
@@ -162,4 +251,6 @@ mod tests {
         let ptr = &td2 as *const ThreadData as *mut ThreadData;
         td.next.set(ptr);
     }
+
+    // TODO: Test link logic
 }

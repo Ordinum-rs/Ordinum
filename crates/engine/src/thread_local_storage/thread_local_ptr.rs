@@ -85,7 +85,6 @@ impl<T> ThreadLocalPtr<T> {
         }
     }
 
-    // TODO: Finish
     // SAFETY:
     // `entry` must point to a valid instance of `T` that remains valid for the
     // lifetime of this TLS entry, or until it is removed or reclaimed.
@@ -127,9 +126,6 @@ impl<T> ThreadLocalPtr<T> {
         })
     }
 
-    // TODO: Implement get_mut() and reset() and swap()
-
-    // TODO: Test get()
     pub(crate) fn get(&self) -> Option<NonNull<T>> {
         let tls_id = self.tls_id;
 
