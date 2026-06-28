@@ -109,7 +109,7 @@ impl<T> ThreadLocalPtr<T> {
         TLS_THREAD_ROW.with(|data| {
             data.ensure_registered();
 
-            let entries = unsafe { &mut *data.entries.get() };
+            let entries = data.entries_mut();
 
             if entries.len() <= tls_id {
                 let _guard = thread_meta().thread_mu.lock().unwrap();
@@ -129,11 +129,11 @@ impl<T> ThreadLocalPtr<T> {
     pub(crate) fn get(&self) -> Option<NonNull<T>> {
         let tls_id = self.tls_id;
 
+        // TODO: Abstract this into thread_local so tlp only calls in to the row and gets an entry based on the id given
         TLS_THREAD_ROW.with(|data| {
             data.ensure_registered();
 
-            // TODO: Make a method to return &Entries instead of using unsafe
-            let entries = unsafe { &mut *data.entries.get() };
+            let entries = data.entries_mut();
 
             if entries.len() <= tls_id {
                 let _guard = thread_meta().thread_mu.lock().unwrap();

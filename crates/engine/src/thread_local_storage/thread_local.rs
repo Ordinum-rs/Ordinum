@@ -21,7 +21,7 @@ use crate::sync::cell::UnsafeCell;
 // ---- TLS Init ---- //
 
 thread_local! {
-    pub(crate) static TLS_THREAD_ROW: ThreadData = ThreadData::default();
+    pub(crate) static TLS_THREAD_ROW: ThreadData = ThreadData::new();
 
     // XXX: Future thread local fields can be separate static entries here ONLY if they are for the thread and not per db instance
 }
@@ -48,7 +48,7 @@ impl Default for ThreadMetaGlobal {
     fn default() -> Self {
         Self {
             thread_mu: Mutex::new(()),
-            head: UnsafeCell::new(ThreadData::default()),
+            head: UnsafeCell::new(ThreadData::new()),
             unref_handler_map: UnsafeCell::new(HashMap::new()),
             next_tls_id: AtomicUsize::new(0),
             tls_id_free_list: UnsafeCell::new(Vec::new()),
@@ -60,7 +60,7 @@ impl ThreadMetaGlobal {
     pub(crate) fn new() -> Box<Self> {
         let mut meta = Box::new(Self {
             thread_mu: Mutex::new(()),
-            head: UnsafeCell::new(ThreadData::default()),
+            head: UnsafeCell::new(ThreadData::new()),
             unref_handler_map: UnsafeCell::new(HashMap::new()),
             next_tls_id: AtomicUsize::new(0),
             tls_id_free_list: UnsafeCell::new(Vec::new()),
@@ -114,17 +114,17 @@ pub(crate) fn thread_meta() -> &'static ThreadMetaGlobal {
  * We define a trait to bind the ThreadLocalPtr<T> to which must implement a handler func
  */
 
-pub(crate) struct ThreadData {
+pub(super) struct ThreadData {
     next: Cell<*mut ThreadData>,
     prev: Cell<*mut ThreadData>,
 
     // Entries - columns in the thread local matrix, each column can comprise of multiple thread-local-storage sub-systems each with a unique tls_id
-    pub(crate) entries: UnsafeCell<Vec<AtomicPtr<()>>>,
+    entries: UnsafeCell<Vec<AtomicPtr<()>>>,
     registered: Cell<bool>,
 }
 
-impl Default for ThreadData {
-    fn default() -> Self {
+impl ThreadData {
+    fn new() -> Self {
         Self {
             next: Cell::new(null_mut()),
             prev: Cell::new(null_mut()),
@@ -132,14 +132,12 @@ impl Default for ThreadData {
             registered: Cell::new(false),
         }
     }
-}
 
-impl ThreadData {
     // SAFETY:
     //
     // The caller must hold `thread_meta.thread_mu`, which serializes all
     // structural modifications to this thread's TLS row.
-    fn entries_mut(&self) -> &mut Vec<AtomicPtr<()>> {
+    pub(super) fn entries_mut(&self) -> &mut Vec<AtomicPtr<()>> {
         unsafe { &mut *self.entries.get() }
     }
 
@@ -202,17 +200,17 @@ impl ThreadData {
 
         let _guard = meta.thread_mu.lock().unwrap_or_else(|e| panic!("{e}"));
 
-        let mut next = self.next.get();
-        let mut prev = self.prev.get();
+        let prev = self.prev.get();
+        let next = self.next.get();
 
         unsafe {
-            if next.is_null() {
-                (*prev).next.set(null_mut())
-            }
-
-            (*next).prev.set(prev);
             (*prev).next.set(next);
+            (*next).prev.set(prev);
         }
+
+        // Null out self prev/next just for safety so we don't access other threads if we do wrongfully dereference next/prev fields
+        self.next.set(null_mut());
+        self.prev.set(null_mut());
 
         // Loop the entries, if !null then we need to call the handler and null the entry and handler
 
@@ -242,15 +240,64 @@ mod tests {
     use super::*;
 
     #[test]
+    // TODO: Fix this test to use tls closure rather than create ThreadData outside of thread_local!()
     fn link_access() {
         let meta = thread_meta();
 
-        let td = ThreadData::default();
-        let td2 = ThreadData::default();
+        let td = ThreadData::new();
+        let td2 = ThreadData::new();
 
         let ptr = &td2 as *const ThreadData as *mut ThreadData;
         td.next.set(ptr);
     }
 
-    // TODO: Test link logic
+    #[test]
+    // TODO: Clean up and make more robust
+    fn drop_row() {
+        let meta = thread_meta();
+
+        struct Entry {
+            switch: Cell<bool>,
+        }
+
+        let mock_entry = Box::new(Entry {
+            switch: Cell::new(false),
+        });
+
+        let me_ptr = Box::into_raw(mock_entry);
+
+        unsafe fn unref(ptr: *mut ()) {
+            let entry = ptr.cast::<Entry>();
+            unsafe { &*entry }.switch.set(true);
+        }
+
+        TLS_THREAD_ROW.with(|data| {
+            data.ensure_registered();
+
+            assert!(!data.next.get().is_null());
+
+            // Set the handler and entry
+
+            {
+                let _gaurd = meta.thread_mu.lock().unwrap();
+
+                let handler = unsafe { &mut *meta.unref_handler_map.get() };
+                let _ = handler.insert(0, unref);
+
+                // Safe to push because we only have 1 entry and we know tls_id is basically 0
+                data.entries_mut().push(AtomicPtr::new(me_ptr.cast::<()>()));
+            }
+        });
+
+        TLS_THREAD_ROW.with(|data| {
+            data.drop_row();
+
+            assert!(data.entries_mut()[0].load(Ordering::Relaxed).is_null());
+            assert!(data.next.get().is_null());
+            assert!(data.next.get().is_null());
+        });
+
+        let e = unsafe { Box::from_raw(me_ptr) };
+        assert_eq!(e.switch.get(), true);
+    }
 }
