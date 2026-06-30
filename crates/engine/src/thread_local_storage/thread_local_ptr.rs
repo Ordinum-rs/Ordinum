@@ -4,9 +4,9 @@ use std::{
     ptr::{NonNull, null_mut},
 };
 
-use crate::sync::atomic::AtomicPtr;
 use crate::sync::atomic::Ordering;
 use crate::thread_local_storage::thread_local::{TLS_THREAD_ROW, thread_meta};
+use crate::{sync::atomic::AtomicPtr, thread_local_storage::thread_local::ThreadData};
 
 // ---- UnrefHandler Type ---- //
 
@@ -106,50 +106,118 @@ impl<T> ThreadLocalPtr<T> {
     pub(crate) fn init(&self, entry: NonNull<T>) {
         let tls_id = self.tls_id;
 
-        TLS_THREAD_ROW.with(|data| {
-            data.ensure_registered();
-
-            let entries = data.entries_mut();
-
-            if entries.len() <= tls_id {
-                let _guard = thread_meta().thread_mu.lock().unwrap();
-
-                if entries.len() <= tls_id {
-                    entries.resize_with(tls_id + 1, || AtomicPtr::new(null_mut()));
-                }
-            }
-
-            // Init
-
-            debug_assert!(entries[tls_id].load(Ordering::Acquire).is_null());
-            entries[tls_id].store(entry.as_ptr().cast(), Ordering::Release);
+        TLS_THREAD_ROW.with(|data| unsafe {
+            data.with_tlp_ptr(tls_id, |ptr| {
+                debug_assert!(ptr.load(Ordering::Acquire).is_null());
+                ptr.store(entry.as_ptr().cast(), Ordering::Release);
+            })
         })
     }
 
     pub(crate) fn get(&self) -> Option<NonNull<T>> {
         let tls_id = self.tls_id;
 
-        // TODO: Abstract this into thread_local so tlp only calls in to the row and gets an entry based on the id given
-        TLS_THREAD_ROW.with(|data| {
-            data.ensure_registered();
+        TLS_THREAD_ROW.with(|data| unsafe {
+            data.with_tlp_ptr(tls_id, |ptr| {
+                let ptr = ptr.load(Ordering::Acquire);
 
-            let entries = data.entries_mut();
-
-            if entries.len() <= tls_id {
-                let _guard = thread_meta().thread_mu.lock().unwrap();
-
-                if entries.len() <= tls_id {
-                    entries.resize_with(tls_id + 1, || AtomicPtr::new(null_mut()));
+                if ptr.is_null() {
+                    return None;
+                } else {
+                    return Some(unsafe { NonNull::new_unchecked(ptr.cast::<T>()) });
                 }
-            }
+            })
+        })
+    }
 
-            let ptr = entries[tls_id].load(Ordering::Acquire);
+    pub(crate) fn get_or_init(&self, init: impl FnOnce() -> NonNull<T>) -> NonNull<T> {
+        let tls_id = self.tls_id;
 
-            if ptr.is_null() {
-                return None;
-            } else {
-                return Some(unsafe { NonNull::new_unchecked(ptr.cast::<T>()) });
-            }
+        // SAFETY:
+        //
+        // This method returns the raw pointer stored in the calling thread's TLS cell.
+        // Unlike `get_or_init_mut`, no Rust reference is created and therefore no
+        // aliasing or lifetime guarantees are expressed through the type system.
+        //
+        // The returned pointer remains valid only while the owning subsystem's
+        // lifecycle invariants hold. In particular:
+        //
+        // - A thread cannot access its own TLS row after thread teardown begins.
+        // - The owner of the ThreadLocalPtr must quiesce all accesses before the
+        //   ThreadLocalPtr is destroyed and its TLS column reclaimed.
+        // - The registered ThreadLocalObject handler defines how the object is
+        //   reclaimed once those lifecycle invariants have been established.
+        //
+        // Consequently, callers remain responsible for ensuring that any
+        // dereference of the returned pointer is performed under the appropriate
+        // subsystem-specific synchronization and lifetime rules.
+
+        TLS_THREAD_ROW.with(|data| unsafe {
+            data.with_tlp_ptr(tls_id, |cell| {
+                let ptr = cell.load(Ordering::Acquire);
+
+                if let Some(ptr) = NonNull::new(ptr.cast::<T>()) {
+                    return ptr;
+                }
+
+                let ptr = init();
+
+                // We want to init only once - if we are not null at this point something is very wrong
+                debug_assert!(cell.load(Ordering::Acquire).is_null());
+                cell.store(ptr.as_ptr().cast(), Ordering::Release);
+
+                ptr
+            })
+        })
+    }
+
+    pub(crate) fn get_or_init_mut<F, R>(&self, init: impl FnOnce() -> NonNull<T>, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        let tls_id = self.tls_id;
+
+        // SAFETY:
+        //
+        // Each ThreadLocalPtr access resolves to the calling thread's own TLS row.
+        // Therefore only the owning thread can obtain mutable access to the stored
+        // object through this API.
+        //
+        // A temporary `&mut T` is created from the raw pointer stored in the TLS cell.
+        // This reference is intentionally scoped to the supplied closure rather than
+        // returned to the caller. ThreadLocalPtr does not own the underlying allocation
+        // and therefore cannot express its lifetime through Rust's borrow checker. By
+        // containing the reference within the closure, it cannot outlive the access or
+        // escape beyond the point at which the required invariants are known to hold.
+        //
+        // The soundness of creating `&mut T` relies on the following invariants:
+        //
+        // - The owning thread is the only thread that may obtain a mutable reference to
+        //   the object through normal ThreadLocalPtr access.
+        // - Cross-thread operations (e.g. ReclaimId, thread teardown, or subsystem
+        //   walkers) never construct Rust references from the raw pointer. They operate
+        //   only on the TLS cell itself or invoke object-specific lifecycle logic.
+        // - The owner of the ThreadLocalPtr is responsible for quiescing all accesses
+        //   before the TLS row or column may be reclaimed. Consequently, the object
+        //   cannot be removed or destroyed while this closure is executing.
+
+        TLS_THREAD_ROW.with(|data| unsafe {
+            data.with_tlp_ptr(tls_id, |cell| {
+                let ptr = cell.load(Ordering::Acquire);
+
+                if let Some(ptr) = NonNull::new(ptr.cast::<T>()) {
+                    return unsafe { f(&mut *ptr.as_ptr()) };
+                }
+
+                // We want to init only once - if we are not null at this point something is very wrong
+                debug_assert!(ptr.is_null());
+
+                let ptr = init();
+
+                cell.store(ptr.as_ptr().cast(), Ordering::Release);
+
+                unsafe { f(&mut *ptr.as_ptr()) }
+            })
         })
     }
 

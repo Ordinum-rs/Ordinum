@@ -233,6 +233,38 @@ impl ThreadData {
             }
         }
     }
+
+    // SAFETY:
+    //
+    // This returns the raw pointer currently stored in the calling thread's TLS
+    // cell for `tls_id`. The pointer is type-erased and may be null.
+    //
+    // This function does not prove that the pointer is valid, uniquely borrowed,
+    // or safe to dereference. It only ensures that the current thread is
+    // registered and that the row has a cell for `tls_id`.
+    //
+    // The caller is responsible for interpreting the pointer according to the
+    // owning ThreadLocalPtr<T>'s protocol.
+    pub(super) unsafe fn with_tlp_ptr<F, R>(&self, tls_id: usize, f: F) -> R
+    where
+        F: FnOnce(&AtomicPtr<()>) -> R,
+    {
+        self.ensure_registered();
+
+        let entries = self.entries_mut();
+
+        if entries.len() <= tls_id {
+            let _guard = thread_meta().thread_mu.lock().unwrap();
+
+            if entries.len() <= tls_id {
+                entries.resize_with(tls_id + 1, || AtomicPtr::new(null_mut()));
+            }
+        }
+
+        let ptr = &entries[tls_id];
+
+        f(ptr)
+    }
 }
 
 #[cfg(test)]
@@ -252,7 +284,6 @@ mod tests {
     }
 
     #[test]
-    // TODO: Clean up and make more robust
     fn drop_row() {
         let meta = thread_meta();
 
@@ -300,4 +331,7 @@ mod tests {
         let e = unsafe { Box::from_raw(me_ptr) };
         assert_eq!(e.switch.get(), true);
     }
+
+    #[test]
+    fn thread_local_cell_method() {}
 }

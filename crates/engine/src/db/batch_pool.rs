@@ -19,7 +19,10 @@ use crate::{
         Arc, Mutex,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
-    thread_local_storage::{thread_ctx, thread_db_instance_ctx},
+    thread_local_storage::{
+        thread_ctx, thread_db_instance_ctx,
+        thread_local_ptr::{ThreadLocalObject, ThreadLocalPtr, UnrefHandler},
+    },
     utils::cache_padded::CachePadded,
 };
 
@@ -76,6 +79,16 @@ pub(crate) struct ThreadBatchCache {
     pub(crate) batches: Vec<NonNullBatchPtr>,
 }
 
+impl ThreadLocalObject for ThreadBatchCache {
+    fn handler() -> Option<UnrefHandler> {
+        Some(Self::unref_erased)
+    }
+
+    unsafe fn unref(ptr: *mut Self) {
+        let _entry = unsafe { Box::from_raw(ptr) };
+    }
+}
+
 impl ThreadBatchCache {
     pub(crate) fn new() -> Self {
         Self {
@@ -85,10 +98,9 @@ impl ThreadBatchCache {
     }
 }
 
-// NOTE: We would implement a drop to return cached batches back to pool on thread exit BUT this can be problematic as we'd have to hold a Weak Pointer back
-// to Pool and also may encounter some cyclic behaviour if we are shutting down so Pool is dropping and thread is exiting whilst trying to return to pool.
-//
-// Decision is to just drop the cached batches for now and stay light
+/* NOTE: We would implement a drop to return cached batches back to pool on thread exit BUT this can be problematic as we'd have to hold a Weak Pointer back
+to Pool and also may encounter some cyclic behaviour if we are shutting down so Pool is dropping and thread is exiting whilst trying to return to pool.
+Decision is to just drop the cached batches for now and stay light */
 
 struct BatchPoolShard {
     batches: Mutex<Vec<NonNullBatchPtr>>,
@@ -145,8 +157,11 @@ pub(crate) struct BatchPool {
     //
     stats: BatchPoolStats,
     //
-    // TODO: Add the thread_local_ptr<ThreadBatchCache> here so we can use the tls storage
+    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache>,
 }
+
+// TODO: Think about this - need justification
+unsafe impl Sync for BatchPool {}
 
 impl BatchPool {
     // XXX: Once we have a stable DB we can make this pub(super) so that only objects that hold a pool can create one
@@ -155,6 +170,8 @@ impl BatchPool {
             pool: array::from_fn(|_| CachePadded::new(BatchPoolShard::default())),
             next_shard: AtomicUsize::new(0),
             stats: BatchPoolStats::default(),
+
+            thread_local_ptr: ThreadLocalPtr::new(),
         }
     }
 
@@ -176,6 +193,32 @@ impl BatchPool {
     }
 
     // ----- Acquire Methods ----- //
+
+    fn thread_local_batch_ptr<'a>(&self) -> &'a ThreadBatchCache {
+        let ptr = self.thread_local_ptr.get_or_init(|| {
+            // Need to allocate the thread batch cache
+            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(ThreadBatchCache::new()))) }
+        });
+
+        unsafe { &*ptr.as_ptr() }
+        //
+    }
+
+    fn thread_local_batch_cache_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut ThreadBatchCache) -> R,
+    {
+        self.thread_local_ptr.get_or_init_mut(
+            //
+            || unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(ThreadBatchCache::new()))) },
+            //
+            // Nested closure, only really have this thread_local_batch_cache_mut method to avoid having to use two closures in a function signature
+            // Nice API surface
+            f,
+        )
+    }
+
+    // TODO: Check these methods + test
 
     fn try_acquire_from_tls(
         &self,
@@ -224,26 +267,22 @@ impl BatchPool {
     pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
         // 0. Assertions
 
-        thread_db_instance_ctx(0, |ctx| {
-            //
+        self.thread_local_batch_cache_mut(|cache| {
+            // Lazy shard check
 
-            return ctx.thread_batch_cache_mut(|cache| {
-                // Lazy shard check
+            // 1. Try acquire from TLS cache
+            //    - Return immediately on hit
+            match self.try_acquire_from_tls(cache).or_else(|| {
+                self.stats.tls_misses.fetch_add(1, Ordering::Relaxed);
 
-                // 1. Try acquire from TLS cache
-                //    - Return immediately on hit
-                match self.try_acquire_from_tls(cache).or_else(|| {
-                    self.stats.tls_misses.fetch_add(1, Ordering::Relaxed);
-
-                    // 2. Try to refill from pool
-                    Some(self.refill_tls_cache(cache))
-                }) {
-                    Some(batch) => return batch,
-                    None => {
-                        panic!("Could not acquire from TLS or Pool and could not Allocate")
-                    }
+                // 2. Try to refill from pool
+                Some(self.refill_tls_cache(cache))
+            }) {
+                Some(batch) => return batch,
+                None => {
+                    panic!("Could not acquire from TLS or Pool and could not Allocate")
                 }
-            });
+            }
         })
     }
 
