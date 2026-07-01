@@ -23,7 +23,7 @@ use crate::sync::cell::UnsafeCell;
 thread_local! {
     pub(crate) static TLS_THREAD_ROW: ThreadData = ThreadData::new();
 
-    // XXX: Future thread local fields can be separate static entries here ONLY if they are for the thread and not per db instance
+    // XXX: Future thread local fields can be separate static entries here ONLY if they are for the thread and not per entry subsystems
 }
 
 // ---- Thread Static Meta ---- //
@@ -105,18 +105,9 @@ pub(crate) fn thread_meta() -> &'static ThreadMetaGlobal {
 
 // ---- ThreadData ---- //
 
-/*
- * NOTE:
- * We can either store a blank pointer as an entry and let ThreadLocalPtr<T> cast to it and use the index to lookup in the meta hashtable to call the handler
- * OR
- * We define an Entry which stores the pointer and func within
- * OR
- * We define a trait to bind the ThreadLocalPtr<T> to which must implement a handler func
- */
-
 pub(super) struct ThreadData {
-    next: Cell<*mut ThreadData>,
-    prev: Cell<*mut ThreadData>,
+    pub(super) next: Cell<*mut ThreadData>,
+    pub(super) prev: Cell<*mut ThreadData>,
 
     // Entries - columns in the thread local matrix, each column can comprise of multiple thread-local-storage sub-systems each with a unique tls_id
     entries: UnsafeCell<Vec<AtomicPtr<()>>>,
@@ -276,7 +267,7 @@ mod tests {
     fn link_access() {
         let meta = thread_meta();
 
-        let td = ThreadData::new();
+        let mut td = ThreadData::new();
         let td2 = ThreadData::new();
 
         let ptr = &td2 as *const ThreadData as *mut ThreadData;

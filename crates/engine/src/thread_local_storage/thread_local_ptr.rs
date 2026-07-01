@@ -245,7 +245,16 @@ impl<T> ThreadLocalPtr<T> {
     // thread-local object's registered unref handler, clear the entries, and
     // return the TLS ID to the free list.
     fn drop(self) {
-        // TODO: Implement safe drop for thread local pointer
+        let meta = thread_meta();
+        let tls_id = self.tls_id;
+
+        let _guard = meta.thread_mu.lock().unwrap_or_else(|e| panic!("{e}"));
+
+        let mut current = meta.head.get();
+
+        // XXX: Im thinking of making a method which takes mutex guard and returns an Impl IntoIterator? ... For now it might be easier to traverse manually
+
+        // TODO: Traverse the linked list and continue the drop method
     }
 
     //
@@ -344,4 +353,7 @@ mod tests {
 
         assert_eq!(unsafe { &*object.unwrap().as_ptr() }.thing, 10);
     }
+
+    // Test two threads creating a subsystem - assert entries vec len is 2
+    // Test two threads create subsystem, 1 thread drops, another thread creates subsystem, assert tls_id reuse entries vec len is 2
 }
