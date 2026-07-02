@@ -114,6 +114,15 @@ pub(super) struct ThreadData {
     registered: Cell<bool>,
 }
 
+impl Drop for ThreadData {
+    fn drop(&mut self) {
+        // TODO: Need to carefully look at the thread drop logic
+        // NOTE: For now we'll just call the drop_row() method
+        //
+        self.drop_row();
+    }
+}
+
 impl ThreadData {
     fn new() -> Self {
         Self {
@@ -222,6 +231,10 @@ impl ThreadData {
             if let Some(unref) = handler.get(&idx) {
                 unsafe { unref(ptr) }
             }
+
+            // Return tls_id to free list
+            let free_list = unsafe { &mut *meta.tls_id_free_list.get() };
+            free_list.push(idx);
         }
     }
 

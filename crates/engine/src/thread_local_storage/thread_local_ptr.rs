@@ -250,15 +250,37 @@ impl<T> ThreadLocalPtr<T> {
 
         let _guard = meta.thread_mu.lock().unwrap_or_else(|e| panic!("{e}"));
 
-        let mut current = meta.head.get();
+        let handler = unsafe { &mut *meta.unref_handler_map.get() }.remove(&tls_id);
 
         // XXX: Im thinking of making a method which takes mutex guard and returns an Impl IntoIterator? ... For now it might be easier to traverse manually
 
-        // TODO: Traverse the linked list and continue the drop method
-    }
+        let head = meta.head.get();
 
-    //
-    //
+        let mut next = unsafe { &mut *head }.next.get();
+
+        while next != head {
+            let current = next;
+            next = unsafe { &*current }.next.get();
+
+            let entries = unsafe { &mut *next }.entries_mut();
+
+            if entries.len() <= tls_id {
+                continue;
+            }
+
+            // NOTE: Do we need to use CAS here?
+            let ptr = entries[tls_id].swap(null_mut(), Ordering::Acquire);
+
+            if !ptr.is_null() {
+                if let Some(handler) = handler {
+                    unsafe { handler(ptr) };
+                }
+            }
+        }
+
+        // Add tls_id to the free_list
+        unsafe { &mut *meta.tls_id_free_list.get() }.push(tls_id);
+    }
 }
 
 impl<T: ThreadLocalObject> ThreadLocalPtr<T> {
@@ -269,6 +291,11 @@ impl<T: ThreadLocalObject> ThreadLocalPtr<T> {
 
 #[cfg(test)]
 mod tests {
+
+    use std::thread;
+
+    use crate::sync::spin_loop;
+
     use super::*;
 
     struct Entry {
@@ -354,6 +381,74 @@ mod tests {
         assert_eq!(unsafe { &*object.unwrap().as_ptr() }.thing, 10);
     }
 
-    // Test two threads creating a subsystem - assert entries vec len is 2
-    // Test two threads create subsystem, 1 thread drops, another thread creates subsystem, assert tls_id reuse entries vec len is 2
+    #[test]
+    fn two_entries_vec_len() {
+        thread::scope(|t| {
+            let tlp = setup_thread_owner();
+
+            tlp.ptr.init(unsafe {
+                NonNull::new_unchecked(Box::into_raw(Box::new(Entry { thing: 10 })))
+            });
+
+            let tlp_2 = setup_thread_owner();
+
+            tlp_2.ptr.init(unsafe {
+                NonNull::new_unchecked(Box::into_raw(Box::new(Entry { thing: 20 })))
+            });
+
+            TLS_THREAD_ROW.with(|data| {
+                assert_eq!(data.entries_mut().len(), 2);
+            })
+        });
+    }
+
+    #[test]
+    fn two_threads_entry_reuse() {
+        let ready = std::sync::atomic::AtomicBool::new(false);
+
+        let base_tlp = setup_thread_owner();
+
+        base_tlp
+            .ptr
+            .init(unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(Entry { thing: 5 }))) });
+
+        base_tlp.ptr.drop();
+
+        ready.store(true, Ordering::Release);
+
+        thread::scope(|t| {
+            t.spawn(|| {
+                while ready.load(Ordering::Acquire) != true {
+                    spin_loop();
+                }
+
+                let tlp = setup_thread_owner();
+
+                tlp.ptr.init(unsafe {
+                    NonNull::new_unchecked(Box::into_raw(Box::new(Entry { thing: 10 })))
+                });
+
+                let tlp_2 = setup_thread_owner();
+
+                tlp_2.ptr.init(unsafe {
+                    NonNull::new_unchecked(Box::into_raw(Box::new(Entry { thing: 20 })))
+                });
+
+                TLS_THREAD_ROW.with(|data| {
+                    assert_eq!(data.entries_mut().len(), 2);
+                });
+            });
+        });
+
+        // After the thread drops we should have 2 tls_id's in the free list
+
+        let meta = thread_meta();
+
+        let free_list = unsafe { &*meta.tls_id_free_list.get() };
+
+        assert_eq!(free_list.len(), 2);
+    }
+
+    // Need to test competing threads with conflicting actions which the mutex and our safety invariants should protect against
+    // TODO: Concurrent Tests
 }
