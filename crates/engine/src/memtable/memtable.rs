@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::atomic::{AtomicU8, AtomicU16};
 
+use crate::arena::allocator::Allocator;
+use crate::arena::arena::{Arena, ArenaPolicy};
 use crate::db::write_batch::WBatch;
 use crate::iterator::internal_iterator::InternalIterator;
 use crate::key::comparator::Comparator;
 use crate::key::internal_key::{InternalKeyRef, OperationType, encode_trailer};
 use crate::memtable::skip_list::{Iter, Node, SkipList};
-use mem::allocator::Allocator;
-use mem::arena::{Arena, ArenaPolicy};
 
 pub(crate) type MemID = u64;
 

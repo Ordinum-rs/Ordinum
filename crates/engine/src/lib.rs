@@ -5,6 +5,7 @@
 //
 //
 //
+mod arena;
 mod column_family;
 mod db;
 pub mod error;

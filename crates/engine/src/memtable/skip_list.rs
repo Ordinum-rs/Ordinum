@@ -47,9 +47,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{alloc::Layout, sync::atomic::AtomicPtr};
 use std::{panic, slice};
 
+use crate::arena::arena::{Arena, ArenaError};
 use crate::key::comparator::{Comparator, DefaultComparator};
 use crate::key::internal_key::InternalKeyRef;
-use mem::arena::{Arena, ArenaError};
 
 // ------------------------------------------------------
 
@@ -65,8 +65,8 @@ impl From<std::alloc::LayoutError> for SkipListError {
     }
 }
 
-impl From<mem::arena::ArenaError> for SkipListError {
-    fn from(err: mem::arena::ArenaError) -> Self {
+impl From<crate::arena::arena::ArenaError> for SkipListError {
+    fn from(err: crate::arena::arena::ArenaError) -> Self {
         SkipListError::Arena(err)
     }
 }
@@ -147,7 +147,9 @@ impl Node {
     ) -> *mut Node {
         let node = ptr_memory.as_ptr() as *mut Node;
 
-        // SAFETY: ptr_memory is a NonNull<u8> allocated by Arena::alloc, so it is valid and aligned.
+        // SAFETY:
+        //
+        // ptr_memory is a NonNull<u8> allocated by Arena::alloc, so it is valid and aligned.
         // We have already been given enough memory to write the Node struct and tower pointers so it is safe to write
         unsafe {
             ptr::write(
@@ -173,7 +175,9 @@ impl Node {
     //
     #[inline(always)]
     unsafe fn tower_ptr(node: *mut Node) -> *mut AtomicPtr<Node> {
-        // SAFETY: tower is a Flexible Array Member (FAM) at the end of the struct, so adding the offset gives us the tower ptr.
+        // SAFETY:
+        //
+        // tower is a Flexible Array Member (FAM) at the end of the struct, so adding the offset gives us the tower ptr.
         // We are safe to access the tower ptr because it is the start of the flexible array, and we have already allocated enough memory for it.
         unsafe { (node as *mut u8).add(core::mem::offset_of!(Node, tower)) as *mut AtomicPtr<Node> }
     }
@@ -823,8 +827,8 @@ impl<'a> Iterator for RangeIter<'a> {
 mod tests {
 
     use super::*;
-    use mem::allocator::*;
-    use mem::arena::*;
+    use crate::arena::allocator::*;
+    use crate::arena::arena::*;
 
     mod helpers {}
 

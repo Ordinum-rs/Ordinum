@@ -214,26 +214,9 @@ impl<B: BatchCommitState> BatchObjectHandle<B> {
         //
         self.wait().expect("batch wait failed before reset");
 
-        match self.batch.try_reset() {
-            Ok(batch) => BatchObjectHandle {
-                pool: self.pool,
-                batch,
-            },
-
-            // This should not be possible. If we error on this, after waiting for sync signal, then we have a critical
-            // issue and must panic because it would not be safe to drop the allocation
-            Err(TryResetError::InvalidState { expected, got, .. }) => {
-                eprintln!(
-                    "wait returned but batch was still not reset-safe - expected: {expected:?}, got: {got}"
-                );
-                std::process::abort();
-            }
-
-            // Policy level error - we don't really want caller handling this but we may want to handle this internally in the future
-            // If we encounter errors which are recoverable
-            Err(TryResetError::Error { error, .. }) => {
-                panic!("batch reset failed: {error:?}")
-            }
+        BatchObjectHandle {
+            pool: self.pool,
+            batch: self.batch.reset_batch(),
         }
     }
 
@@ -395,18 +378,15 @@ impl<B: BatchCommitState> BatchObject<B> {
         Ok(())
     }
 
-    pub(crate) fn try_reset(mut self) -> TryResetResult<BatchObject<UnCommitted>, Self> {
+    pub(crate) fn can_reset(&self) -> bool {
+        let state = self.state(Ordering::Acquire);
+        if !state.is_reset_safe() { false } else { true }
+    }
+
+    pub(crate) fn reset_batch(mut self) -> BatchObject<UnCommitted> {
         //
         // Check our state
-        let state = self.state(Ordering::Acquire);
-
-        if !state.is_reset_safe() {
-            return Err(TryResetError::InvalidState {
-                object: self,
-                expected: RESET_SAFE_STATES,
-                got: state,
-            });
-        }
+        debug_assert!(self.state(Ordering::Acquire).is_reset_safe());
 
         // SAFETY
         //
@@ -415,7 +395,7 @@ impl<B: BatchCommitState> BatchObject<B> {
         let batch = unsafe { &mut *self.as_ptr() };
 
         // If no errors; we have reset and are safe to transition state and return
-        Ok(self.transition())
+        self.transition()
     }
 }
 
@@ -685,6 +665,7 @@ mod tests {
         batch.reset();
     }
 
+    #[should_panic]
     #[test]
     fn batch_object_reset_error() {
         let batch = BatchObject::new();
@@ -693,12 +674,7 @@ mod tests {
 
         // Now if we try and reset we should get the error message
 
-        match batch.try_reset() {
-            Err(err) => {
-                println!("{:?}", err);
-            }
-            _ => (),
-        }
+        batch.reset_batch();
     }
 
     #[test]

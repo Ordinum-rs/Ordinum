@@ -4,7 +4,7 @@
 //
 //
 
-use mem::arena::ArenaPolicy;
+use crate::arena::arena::ArenaPolicy;
 
 //
 pub(crate) struct CFOptions {

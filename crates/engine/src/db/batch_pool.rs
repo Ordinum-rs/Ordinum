@@ -9,7 +9,7 @@
 // 5. acquire must clear/detach pool_next before returning the batch.
 // 6. shutdown must drain the pool and free retained batches.
 
-use std::{array, ptr::NonNull};
+use std::{array, mem::MaybeUninit, ptr::NonNull};
 
 use crate::{
     db::batch::{
@@ -43,7 +43,7 @@ const NUMBER_OF_SHARDS_FOR_POOL: usize = 4;
 const MAX_RETAINED_POOL_BYTES: usize =
     (MAX_BATCHES_PER_SHARD * NUMBER_OF_SHARDS_FOR_POOL) * crate::db::batch::DEFAULT_BATCH_INIT_SIZE;
 
-const MAX_BATCHES_PER_THREAD_CACHE: usize = 4;
+const MAX_BATCHES_PER_THREAD_CACHE: usize = 6;
 
 // For pooling we want to be very memory light and still rely on the allocator to do most of the work if we spill
 //
@@ -52,31 +52,58 @@ const MAX_BATCHES_PER_THREAD_CACHE: usize = 4;
 // - no diving (lol)
 //
 // Acquire:
-// - Try pop one Batch from TLS.
-// - If TLS is empty, refill TLS from the assigned shard.
-// - If shard is empty, allocate a new Box<Batch>.
-// - Return one Batch to caller.
-
-// Release:
-// - Sanitise/reset Batch.
-// - If Batch retained capacity is too large, destroy it.
-// - Else push Batch into TLS.
-// - If TLS exceeds its cap, spill about half to the assigned shard.
-// - If shard exceeds its cap, destroy the overflow.
+// - Try to pop one Batch from the thread-local cache.
+// - If TLS is empty, refill TLS from this thread's assigned shard.
+// - If the shard is empty, allocate a new Box<Batch>.
+// - Return one exclusively-owned Batch to the caller.
 //
-// Pool invariants:
+// Release:
+// - The Batch must already be in a terminal completion state.
+// - Sanitise/reset the Batch.
+// - If its retained buffers exceed the retention limit, destroy it.
+// - Otherwise push it into TLS.
+// - If TLS exceeds its cap, spill approximately half into the assigned shard
+//   We do this because every subsequent release call will grab the global mutex.
+// - If the shard exceeds its cap, destroy the overflow.
+//
+// Invariants:
 // - Batches are allocated with Box::new and converted with Box::into_raw.
 // - TLS and shard pools store only NonNull<Batch>; they track availability, not active use.
 // - An acquired Batch is exclusively owned by the caller/pipeline.
-// - A Batch may be returned only after WAL, memtable apply, publish, signalling, and caller-visible completion are finished.
-// - After return, no thread may hold or dereference any pointer/reference to that Batch.
-// - The pool may destroy returned batches using Box::from_raw when retention limits are exceeded.
-// - Thread-local cached batches are destroyed when ThreadCtx drops.
+// - A Batch may not be returned while it is queued, WAL-pending, memtable-pending,
+//   publish-pending, signal-pending, or externally observable through a live handle.
+// - Returning a Batch requires that no thread can still wait on it, inspect it,
+//   reset it, or dereference any pointer/reference into it.
+// - After return, the pool owns the Batch and may hand it to another writer immediately.
+// - The pool may destroy returned batches using Box::from_raw when retention limits
+//   are exceeded.
+// - Thread-local caches are drained when the tls thread row drops: batches may be returned
+//   to the global shard or destroyed according to the pool's retention policy.
 
 // TODO: Move into thread_local_storage folder?
-pub(crate) struct ThreadBatchCache {
+pub(crate) struct ThreadBatchCache<const CACHE_CAP: usize = MAX_BATCHES_PER_THREAD_CACHE> {
     pub(crate) shard_idx: Option<usize>,
-    pub(crate) batches: Vec<NonNullBatchPtr>,
+    len: u8,
+    pub(crate) batches: [MaybeUninit<NonNullBatchPtr>; CACHE_CAP],
+    // Do we need an index here?
+}
+
+impl ThreadBatchCache {
+    pub(crate) fn new() -> Self {
+        Self::new_with_size()
+    }
+
+    // TODO: Make Tiny helpers to access elements in the batches array safely
+}
+
+impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
+    pub(crate) fn new_with_size() -> Self {
+        Self {
+            shard_idx: None,
+            len: 0,
+            batches: array::from_fn(|_| MaybeUninit::zeroed()),
+        }
+    }
 }
 
 impl ThreadLocalObject for ThreadBatchCache {
@@ -86,15 +113,6 @@ impl ThreadLocalObject for ThreadBatchCache {
 
     unsafe fn unref(ptr: *mut Self) {
         let _entry = unsafe { Box::from_raw(ptr) };
-    }
-}
-
-impl ThreadBatchCache {
-    pub(crate) fn new() -> Self {
-        Self {
-            shard_idx: None,
-            batches: Vec::new(),
-        }
     }
 }
 
@@ -241,12 +259,13 @@ impl BatchPool {
 
         self.stats.shard_hits.fetch_add(1, Ordering::Relaxed);
 
+        // Grab a batch we can return straight away
         let returnable_batch = shard.pop().unwrap_or_else(|| {
             self.stats.allocations.fetch_add(1, Ordering::Relaxed);
             BatchObject::new().into_inner()
         });
 
-        //
+        // While we're here we will also try to hydrate the tls cache by grabbing batches from global
         while cache.batches.len() < MAX_BATCHES_PER_THREAD_CACHE / 2 {
             // We want to pop from global pool - if pool is empty then we allocate a new batch
             match shard.pop() {
@@ -268,8 +287,6 @@ impl BatchPool {
         // 0. Assertions
 
         self.thread_local_batch_cache_mut(|cache| {
-            // Lazy shard check
-
             // 1. Try acquire from TLS cache
             //    - Return immediately on hit
             match self.try_acquire_from_tls(cache).or_else(|| {
@@ -288,15 +305,27 @@ impl BatchPool {
 
     // ----- Release Methods ----- //
 
-    pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B>) {
+    fn try_return_to_cache(
+        &self,
+        batch: BatchObject<UnCommitted>,
+        cache: &ThreadBatchCache,
+    ) -> Result<(), BatchObject<UnCommitted>> {
+        //
 
+        Ok(())
+    }
+
+    pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B>) {
         // Want
         // 1. Extract the Batch
         // 2. Reset the batch to a cachable state
         // 3. Try to return to pool
         // 4. Destroy if no space
-
         //
+
+        let batch = batch.reset_batch();
+
+        self.thread_local_batch_cache_mut(|cache| ())
     }
 }
 

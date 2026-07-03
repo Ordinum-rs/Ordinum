@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod tests {
 
+    use crate::arena::allocator::*;
+    use crate::arena::arena::*;
     use crate::iterator::internal_iterator::InternalIterator;
     use crate::key::comparator::InternalKeyComparator;
     use crate::key::internal_key::{InternalKeyRef, OperationType};
     use crate::key::lookup_key::{LookUpInternalKey, LookUpKey};
     use crate::memtable::memtable::*;
-    use mem::allocator::*;
-    use mem::arena::*;
 
     #[test]
     fn memtable_internal_iterator() {

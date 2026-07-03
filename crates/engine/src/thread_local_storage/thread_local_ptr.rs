@@ -252,8 +252,6 @@ impl<T> ThreadLocalPtr<T> {
 
         let handler = unsafe { &mut *meta.unref_handler_map.get() }.remove(&tls_id);
 
-        // XXX: Im thinking of making a method which takes mutex guard and returns an Impl IntoIterator? ... For now it might be easier to traverse manually
-
         let head = meta.head.get();
 
         let mut next = unsafe { &mut *head }.next.get();
@@ -451,4 +449,113 @@ mod tests {
 
     // Need to test competing threads with conflicting actions which the mutex and our safety invariants should protect against
     // TODO: Concurrent Tests
+
+    #[test]
+    fn concurrent_get_or_init_same_thread_row_is_stable() {
+        // Test that repeated concurrent-style access patterns on a single thread
+        // row never allocate more than one entry for the same `tls_id`.
+        //
+        // What to verify:
+        // - `get_or_init()` installs exactly one pointer for the calling thread.
+        // - subsequent `get()` / `get_or_init()` calls observe the same pointer.
+        // - the row length remains stable once the slot has been created.
+        //
+        // This is primarily a same-thread invariant test for lazy slot creation
+        // and entry installation.
+    }
+
+    #[test]
+    fn concurrent_threads_isolate_per_thread_entries() {
+        // Test that different threads accessing the same `ThreadLocalPtr`
+        // install distinct per-thread entries rather than racing on a shared
+        // object.
+        //
+        // What to verify:
+        // - each thread gets a unique pointer for the same `tls_id`.
+        // - each thread only mutates and reads back its own entry.
+        // - the global thread list contains both registered rows while both
+        //   threads are alive.
+    }
+
+    #[test]
+    fn concurrent_registration_and_slot_growth_preserves_indices() {
+        // Test concurrent first-touch registration while multiple
+        // `ThreadLocalPtr`s are being created and initialized.
+        //
+        // What to verify:
+        // - `ThreadData::ensure_registered()` and `with_tlp_ptr()` do not lose
+        //   a row or corrupt the intrusive list.
+        // - growing `entries` for larger `tls_id` values preserves previously
+        //   initialized indices.
+        // - every thread can still read back the value it stored after vector
+        //   growth caused by other slots.
+    }
+
+    #[test]
+    fn concurrent_drop_requires_quiesced_access() {
+        // Test the lifecycle boundary around `ThreadLocalPtr::drop()`.
+        //
+        // What to verify:
+        // - with proper external quiescence, dropping the TLP reclaims every
+        //   live per-thread entry exactly once.
+        // - the handler is invoked once per non-null entry in the reclaimed
+        //   column.
+        // - the `tls_id` is returned to the free list after reclamation.
+        //
+        // This should be written as a positive test only after the harness can
+        // guarantee that no worker thread is still calling `get()` / `init()` /
+        // `get_or_init_mut()` while drop runs.
+    }
+
+    #[test]
+    fn concurrent_drop_and_access_is_not_permitted() {
+        // Document the forbidden case where one thread is still accessing a
+        // TLP while another thread reclaims it.
+        //
+        // What to verify:
+        // - this is not a supported behavior to make "work".
+        // - if modeled with loom or a dedicated stress harness, the test should
+        //   assert the required precondition instead of depending on runtime
+        //   behavior after the invariant is broken.
+        //
+        // This belongs more as an invariant test / documentation test than as a
+        // normal unit test.
+    }
+
+    #[test]
+    fn concurrent_reuse_of_freed_tls_id_clears_stale_state() {
+        // Test reuse of a freed `tls_id` after one TLP is dropped and another is
+        // created on a different thread.
+        //
+        // What to verify:
+        // - the reused `tls_id` does not retain a stale handler entry.
+        // - the new owner observes a clean null slot before initialization.
+        // - old per-thread pointers from the reclaimed column are gone before
+        //   the new owner installs its entries.
+    }
+
+    #[test]
+    fn concurrent_handler_invocation_reclaims_each_entry_once() {
+        // Test that reclamation of a populated column invokes the registered
+        // handler exactly once per thread-local entry.
+        //
+        // What to verify:
+        // - multiple threads can populate the same TLP column independently.
+        // - `drop()` swaps each slot to null before invoking the handler.
+        // - no entry is leaked and no entry is reclaimed twice.
+    }
+
+    #[test]
+    fn concurrent_thread_teardown_and_column_reclamation_do_not_conflict() {
+        // Test interaction between thread teardown and global column
+        // reclamation, since both touch the registered thread rows.
+        //
+        // What to verify:
+        // - `thread_mu` correctly serializes row unlink / teardown with TLP
+        //   traversal during drop.
+        // - a row disappearing during reclamation does not lead to use-after-free
+        //   on the intrusive list.
+        // - teardown either reclaims its own entries safely or leaves them in a
+        //   state that `drop()` can safely reclaim.
+    }
 }

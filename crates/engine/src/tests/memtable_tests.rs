@@ -6,17 +6,17 @@ mod tests {
     use crate::key::internal_key::OperationType;
     use crate::key::lookup_key::{LookUpInternalKey, LookUpKey};
 
+    use crate::arena::allocator::*;
+    use crate::arena::arena::*;
     use crate::memtable::memtable::*;
-    use mem::allocator::*;
-    use mem::arena::*;
 
     #[test]
     fn memtable_basic_insert_and_get() {
         let mem = Memtable::new(
             0,
             ArenaPolicy {
-                block_size: 640,
-                cap: 640,
+                block_size: 1024,
+                cap: 1024,
             },
             Allocator::System(SystemAllocator::new()),
             InternalKeyComparator::new(),

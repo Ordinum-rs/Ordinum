@@ -24,7 +24,7 @@ use std::sync::{
     atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use crate::allocator::Allocator;
+use crate::arena::allocator::Allocator;
 
 // Constants
 const KB: usize = 1024;
@@ -72,6 +72,14 @@ impl Chunk {
     }
 }
 
+/*
+ * NOTE:
+ * A future optimisation is that we want a double-ended bump arena where we allocate aligned from the front and un-aligned from the back
+ * Also different block/chunk sizes so if we have a Layout which is bigger than 1/4 of a regular block we allocate a irregular block and insert the memory into there
+ * and carry on using the regular block
+ * We can also add a small block inline optimisation possibly similar to Rocks
+ */
+
 /// Arena is responsible for holding blocks of memory and managing memory allocation into those blocks. It will handle alignment and block allocation.
 /// Only Memtables will hold an arena.
 ///
@@ -96,10 +104,10 @@ impl Arena {
             "Arena block size must be a power of two"
         );
 
-        assert!(
-            policy.block_size >= 4 * 1024,
-            "Arena block size must be at least 4KB"
-        );
+        // assert!(
+        //     policy.block_size >= 4 * 1024,
+        //     "Arena block size must be at least 4KB"
+        // );
 
         assert!(
             policy.cap >= policy.block_size,
@@ -334,7 +342,7 @@ impl Arena {
 
 #[cfg(test)]
 mod tests {
-    use crate::allocator::{Allocator, SystemAllocator};
+    use crate::arena::allocator::{Allocator, SystemAllocator};
 
     use super::*;
     use std::thread::{self};

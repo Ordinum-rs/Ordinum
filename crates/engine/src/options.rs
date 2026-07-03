@@ -1,7 +1,7 @@
 // Memtable Options
 //
 
-use mem::arena::ArenaPolicy;
+use crate::arena::arena::ArenaPolicy;
 
 const MB: usize = 1024;
 
