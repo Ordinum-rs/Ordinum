@@ -6,7 +6,6 @@ use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::db::DEFAULT_CF_ID;
-use crate::db::batch::TryResetError::InvalidState;
 use crate::db::batch_pool::BatchPool;
 use crate::db::{self, db_impl::DbImpl};
 use crate::sync::Arc;
@@ -26,22 +25,6 @@ pub(crate) const RESET_SAFE_STATES: [BatchRuntimeState; 2] =
 
 // ---- Module Errors ---- //
 
-#[derive(Debug)]
-pub(super) enum TryResetError<T> {
-    InvalidState {
-        object: T,
-        expected: [BatchRuntimeState; 2],
-        got: BatchRuntimeState,
-    },
-    Error {
-        handle: T,
-        error: Error,
-    },
-}
-
-/* NOTE: We use std::result::Result<T, Error> as opposed to the alias in [errror.rs]("error.rs") because we want to change
-// the error type we use the crate level error.*/
-pub(super) type TryResetResult<T, E> = std::result::Result<T, TryResetError<E>>;
 //
 //
 //
@@ -407,8 +390,6 @@ impl BatchObject<UnCommitted> {
         VarInt::new(DEFAULT_CF_ID)
     }
 
-    // We need to document and maybe think of a safe way to avoid leaking the memory from box leak
-    // Maybe through a custom NewType which wraps NonNull<Batch> and ensure through drop that we Box::from_raw(_) and destroy properly
     pub(super) fn new() -> Self {
         let inner = Box::new(Batch::new());
 
@@ -453,6 +434,7 @@ impl BatchObject<UnCommitted> {
         V: AsRef<[u8]>,
     {
         //
+        // TODO: Finish this when we have column families and can use a resolver
     }
 
     pub(crate) fn seal(self) -> BatchObject<Sealed> {
@@ -473,6 +455,7 @@ impl BatchObject<Sealed> {
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct Batch {
+    // NOTE: Do we still want to use a vec?
     data: Vec<u8>,
     /// The maximum total serialized size allowed for a single atomic Batch.
     ///
@@ -493,6 +476,7 @@ pub(super) struct Batch {
     /// Memtable flush and large-batch heuristics are evaluated separately on a
     /// per-column-family basis using the batch footprint for each destination
     /// memtable.
+    // XXX: Would we not want max_batch_size to be a const on the Impl?
     max_batch_size: usize,
     count: u64,
     runtime_commit_state: AtomicU8,
@@ -601,7 +585,8 @@ impl Batch {
     }
 
     pub(super) fn reset(&mut self) {
-        // NOTE: We do NOT wait on signals here - once we reach here we should have exclusive ownership and
+        // NOTE:
+        // We do NOT wait on signals here - once we reach here we should have exclusive ownership and
         // the type state batch objects should have done the runtime waiting for us
         //
         // Want:
@@ -616,9 +601,7 @@ impl Batch {
         // Reset the data buffer
         self.data.clear();
 
-        // Decide if we need to resize
-        //
-        //
+        // TODO: Finish reset
     }
 }
 

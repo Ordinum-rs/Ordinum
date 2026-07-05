@@ -15,10 +15,9 @@ use crate::{
     db::batch::{
         Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, UnCommitted,
     },
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
-    },
+    sync::atomic::AtomicUsize,
+    sync::atomic::Ordering,
+    sync::{Arc, Mutex},
     thread_local_storage::{
         thread_ctx, thread_db_instance_ctx,
         thread_local_ptr::{ThreadLocalObject, ThreadLocalPtr, UnrefHandler},
@@ -334,8 +333,10 @@ impl BatchPool {
         cache: &mut ThreadBatchCache,
     ) -> Result<(), BatchObject<UnCommitted>> {
         //
-
-        Ok(())
+        cache
+            .push(batch.into_inner())
+            .map_err(|b_ptr| BatchObject::from_batch_ptr(b_ptr))
+        //
     }
 
     pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B>) {
