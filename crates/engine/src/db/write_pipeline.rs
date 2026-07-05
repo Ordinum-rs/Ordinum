@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     db::batch::{BatchRef, NonNullBatchPtr},
-    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering},
     version::SeqNumState,
     wal::SyncQueueSem,
 };
@@ -239,41 +239,34 @@ pub(crate) trait WriterEnv: Send + Sync {
 
 // --- Commit Permit --- //
 
-pub(super) struct CommitPermit {
-    state: AtomicU64,
+pub(super) struct PipelineAdmission<const COUNTING_SEM_LIMIT: usize> {
+    count: AtomicU16,
     sem_mu: Mutex<()>,
     sem_cv: Condvar,
 }
 
-impl CommitPermit {
+impl<const COUNTING_SEM_LIMIT: usize> PipelineAdmission<COUNTING_SEM_LIMIT> {
     pub(super) fn new() -> Self {
+        debug_assert!(COUNTING_SEM_LIMIT <= u16::MAX as usize);
         Self {
-            state: AtomicU64::new(0),
+            count: AtomicU16::new(COUNTING_SEM_LIMIT as u16),
             sem_mu: Mutex::new(()),
             sem_cv: Condvar::new(),
         }
     }
 
-    pub(super) fn lock<'guard>(&'guard self) -> MutexGuard<'guard, ()> {
-        // XXX: Need to handle the potential poison lock or error scenario
-        self.sem_mu.lock().unwrap_or_else(|_| panic!())
-    }
-
-    pub(super) fn wait<'guard>(&'_ self, guard: MutexGuard<'guard, ()>) -> MutexGuard<'guard, ()> {
-        self.sem_cv.wait(guard).unwrap()
-    }
-
-    pub(super) fn try_acquire(&self, limit: usize) -> bool {
-        let mut cur = self.state.load(Ordering::Acquire);
+    // This is the fast CAS path for the Semaphore without mutex locking
+    pub(super) fn try_acquire(&self) -> bool {
+        let mut cur = self.count.load(Ordering::Acquire);
 
         loop {
-            if cur as usize >= limit {
+            if cur == 0 {
                 return false;
             }
 
             match self
-                .state
-                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                .count
+                .compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
@@ -281,38 +274,40 @@ impl CommitPermit {
         }
     }
 
-    pub(super) fn acquire<F>(&self, limit: usize, mut on_wait: F)
-    where
-        F: FnMut(),
-    {
+    // Slow path where we wait on Mutex and CondVar for space to become available
+    pub(super) fn acquire(&self) {
+        if self.try_acquire() {
+            return;
+        }
+
+        let mut guard = self.sem_mu.lock().unwrap();
+
         loop {
-            if self.try_acquire(limit) {
-                return;
+            while self.count.load(Ordering::Acquire) == 0 {
+                guard = self.sem_cv.wait(guard).unwrap();
             }
 
-            let mut guard = self.lock();
-
-            while self.state.load(Ordering::Acquire) as usize >= limit {
-                on_wait();
-                guard = self.wait(guard);
+            if self.try_acquire() {
+                return;
             }
         }
     }
 
     pub(super) fn release(&self) {
-        let _guard = self.lock();
-        let prev = self.state.fetch_sub(1, Ordering::AcqRel);
+        let _guard = self.sem_mu.lock().unwrap();
+        let prev = self.count.fetch_add(1, Ordering::AcqRel);
+
         assert!(
-            prev > 0,
-            "commit permit occupancy misaligned: released with zero occupancy"
+            (prev as usize) < COUNTING_SEM_LIMIT,
+            "Semaphore released at count limit"
         );
 
         self.sem_cv.notify_one();
     }
 
     #[cfg(test)]
-    pub(super) fn occupancy(&self, ordering: Ordering) -> u64 {
-        self.state.load(ordering)
+    pub(super) fn available_permits(&self, ordering: Ordering) -> usize {
+        self.count.load(ordering) as usize
     }
 }
 
@@ -335,7 +330,7 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     batch_queue: BatchQueue<N>,
 
     // Write Queue reservation
-    commit_sem: CommitPermit,
+    commit_sem: PipelineAdmission<N>,
 
     // Global WAL fsync reservation/backpressure.
     //
@@ -378,7 +373,7 @@ where
     ) -> Self {
         Self {
             batch_queue: BatchQueue::<N>::new(),
-            commit_sem: CommitPermit::new(),
+            commit_sem: PipelineAdmission::new(),
             env,
 
             seq_state,
@@ -406,24 +401,14 @@ where
             spin_loop();
         }
 
-        loop {
-            if self.try_reserve_space() {
-                return;
-            }
+        // Slow path condvar wait
+        self.commit_sem.acquire();
 
-            self.commit_sem.acquire(self.batch_queue.size(), || {
-                // Test invariant
-                // TODO: To be replaced with SyncPoints
-                #[cfg(test)]
-                self.condvar_waiters.fetch_add(1, Ordering::Release);
-            });
-
-            return;
-        }
+        return;
     }
 
     fn try_reserve_space(&self) -> bool {
-        self.commit_sem.try_acquire(self.batch_queue.size())
+        self.commit_sem.try_acquire()
     }
 
     pub(super) fn release_queue_space(&self) {
@@ -750,41 +735,30 @@ mod tests {
 
         assert!(wp.batch_queue.size() == 1);
 
-        // The maint outer scope will be the base writer thread just to occupy the queue and make scoped thread wait on try_reserve
+        assert!(wp.try_reserve_space());
+        assert!(!wp.try_reserve_space());
+        assert_eq!(wp.commit_sem.available_permits(Ordering::Acquire), 0);
 
-        wp.try_reserve_space();
-        assert!(wp.commit_sem.occupancy(Ordering::Acquire) == 1);
-
-        let barrier = Barrier::new(2);
         let reserved = AtomicBool::new(false);
 
         thread::scope(|s| {
-            // Thread which will try and reserve and should be caused to wait
-            //
-
             s.spawn(|| {
-                //
-                barrier.wait();
-
                 wp.reserve_space();
                 reserved.store(true, Ordering::Release);
+                wp.release_queue_space();
             });
 
-            barrier.wait();
-
-            // I should be able to decrement the token and the scoped thread should be waiting
-
-            while wp.condvar_waiters.load(Ordering::Acquire) == 0 {
-                spin_loop();
-            }
+            thread::sleep(Duration::from_millis(10));
+            assert!(!reserved.load(Ordering::Acquire));
 
             wp.release_queue_space();
 
-            //
+            while !reserved.load(Ordering::Acquire) {
+                spin_loop();
+            }
         });
 
-        assert!(reserved.load(Ordering::Acquire) == true);
-        assert!(wp.commit_sem.occupancy(Ordering::Acquire) == 1);
+        assert_eq!(wp.commit_sem.available_permits(Ordering::Acquire), 1);
 
         //
     }
@@ -816,7 +790,8 @@ mod tests {
 
         // Increase occupancy by one
 
-        wp.try_reserve_space();
+        assert!(wp.try_reserve_space());
+        assert_eq!(wp.commit_sem.available_permits(Ordering::Acquire), 0);
 
         thread::scope(|s| {
             s.spawn(|| {
@@ -904,7 +879,7 @@ mod loom_tests {
             t1.join().unwrap();
             t2.join().unwrap();
 
-            assert_eq!(wp.commit_sem.occupancy(Ordering::SeqCst), 0);
+            assert_eq!(wp.commit_sem.available_permits(Ordering::SeqCst), 1);
             assert_eq!(inside.load(Ordering::SeqCst), 0);
         });
 

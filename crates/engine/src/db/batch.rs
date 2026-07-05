@@ -42,7 +42,7 @@ pub(crate) enum BatchOp {
 
 // ---- Batch Runtime State ---- //
 
-#[repr(align(8))]
+#[repr(u8)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum BatchRuntimeState {
     Pooled,
@@ -69,12 +69,12 @@ impl Display for BatchRuntimeState {
 impl From<u8> for BatchRuntimeState {
     fn from(value: u8) -> Self {
         match value {
-            1 => BatchRuntimeState::Pooled,
-            2 => BatchRuntimeState::Acquired,
-            3 => BatchRuntimeState::Committed,
-            4 => BatchRuntimeState::InQueue,
-            5 => BatchRuntimeState::WaitingSync,
-            7 => BatchRuntimeState::Applied,
+            0 => BatchRuntimeState::Pooled,
+            1 => BatchRuntimeState::Acquired,
+            2 => BatchRuntimeState::Committed,
+            3 => BatchRuntimeState::InQueue,
+            4 => BatchRuntimeState::WaitingSync,
+            5 => BatchRuntimeState::Applied,
             _ => unreachable!(),
         }
     }
@@ -591,6 +591,11 @@ impl Batch {
         //
         // Want:
         // - We need to assess the size of the data buf and decide if we want to resize
+
+        debug_assert!(
+            BatchRuntimeState::from(self.runtime_commit_state.load(Ordering::Acquire))
+                .is_reset_safe()
+        );
 
         self.count = 0;
         //
