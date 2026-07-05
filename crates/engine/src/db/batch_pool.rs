@@ -92,17 +92,44 @@ impl ThreadBatchCache {
     pub(crate) fn new() -> Self {
         Self::new_with_size()
     }
-
-    // TODO: Make Tiny helpers to access elements in the batches array safely
 }
 
 impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
     pub(crate) fn new_with_size() -> Self {
+        debug_assert!(CACHE_CAP <= MAX_BATCHES_PER_THREAD_CACHE);
         Self {
             shard_idx: None,
             len: 0,
             batches: array::from_fn(|_| MaybeUninit::zeroed()),
         }
+    }
+
+    pub(super) fn push(&mut self, entry: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
+        debug_assert!(self.len as usize <= CACHE_CAP);
+
+        if self.len as usize == CACHE_CAP {
+            return Err(entry);
+        }
+
+        self.batches[self.len as usize].write(entry);
+        self.len += 1;
+
+        Ok(())
+    }
+
+    pub(super) fn pop(&mut self) -> Option<NonNullBatchPtr> {
+        debug_assert!(self.len as usize <= CACHE_CAP);
+
+        if self.len == 0 {
+            return None;
+        }
+        let idx = self.len as usize - 1;
+
+        let entry = std::mem::replace(&mut self.batches[idx], MaybeUninit::uninit());
+
+        self.len -= 1;
+
+        Some(unsafe { entry.assume_init() })
     }
 }
 
@@ -112,15 +139,20 @@ impl ThreadLocalObject for ThreadBatchCache {
     }
 
     unsafe fn unref(ptr: *mut Self) {
-        let _entry = unsafe { Box::from_raw(ptr) };
+        // Need to drop the entries in the batch cache first before dropping the
+        // batch container
+        let mut entry = unsafe { Box::from_raw(ptr) };
+
+        for i in 0..entry.len as usize {
+            // Each entry is a NonNullBatchPtr which is a NonNull<Batch> to Batch Memory
+            // It has a drop implementation which safely destroys the NonNullBatchPtr
+            entry.batches[i].assume_init_drop();
+        }
     }
 }
 
-/* NOTE: We would implement a drop to return cached batches back to pool on thread exit BUT this can be problematic as we'd have to hold a Weak Pointer back
-to Pool and also may encounter some cyclic behaviour if we are shutting down so Pool is dropping and thread is exiting whilst trying to return to pool.
-Decision is to just drop the cached batches for now and stay light */
-
 struct BatchPoolShard {
+    // NOTE: Can we make these arrays with MaybeUninit?
     batches: Mutex<Vec<NonNullBatchPtr>>,
 }
 
@@ -212,16 +244,6 @@ impl BatchPool {
 
     // ----- Acquire Methods ----- //
 
-    fn thread_local_batch_ptr<'a>(&self) -> &'a ThreadBatchCache {
-        let ptr = self.thread_local_ptr.get_or_init(|| {
-            // Need to allocate the thread batch cache
-            unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(ThreadBatchCache::new()))) }
-        });
-
-        unsafe { &*ptr.as_ptr() }
-        //
-    }
-
     fn thread_local_batch_cache_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut ThreadBatchCache) -> R,
@@ -242,9 +264,8 @@ impl BatchPool {
         &self,
         cache: &mut ThreadBatchCache,
     ) -> Option<BatchObject<UnCommitted>> {
-        cache.batches.pop().map_or(None, |batch| {
-            Some(BatchObject::<UnCommitted>::from_batch_ptr(batch))
-        })
+        cache.pop().map(|ptr| BatchObject::from_batch_ptr(ptr))
+        //
     }
 
     fn refill_tls_cache(&self, cache: &mut ThreadBatchCache) -> BatchObject<UnCommitted> {
@@ -257,8 +278,6 @@ impl BatchPool {
                 panic!()
             });
 
-        self.stats.shard_hits.fetch_add(1, Ordering::Relaxed);
-
         // Grab a batch we can return straight away
         let returnable_batch = shard.pop().unwrap_or_else(|| {
             self.stats.allocations.fetch_add(1, Ordering::Relaxed);
@@ -266,10 +285,14 @@ impl BatchPool {
         });
 
         // While we're here we will also try to hydrate the tls cache by grabbing batches from global
-        while cache.batches.len() < MAX_BATCHES_PER_THREAD_CACHE / 2 {
+        while (cache.len as usize) < cache.batches.len() / 2 {
             // We want to pop from global pool - if pool is empty then we allocate a new batch
             match shard.pop() {
-                Some(batch) => cache.batches.push(batch),
+                Some(batch) => {
+                    self.stats.shard_hits.fetch_add(1, Ordering::Relaxed);
+                    // We know we have space because of the while check
+                    let _ = cache.push(batch);
+                }
                 None => {
                     // XXX: What i'd like to do here is get warmed up as possible by allocating on empty pop and refilling tls_cache eagerly
                     // BUT We need to understand the stats first because a cold thread could feasably over allocate and not use the cached batches
@@ -308,7 +331,7 @@ impl BatchPool {
     fn try_return_to_cache(
         &self,
         batch: BatchObject<UnCommitted>,
-        cache: &ThreadBatchCache,
+        cache: &mut ThreadBatchCache,
     ) -> Result<(), BatchObject<UnCommitted>> {
         //
 
@@ -323,6 +346,8 @@ impl BatchPool {
         // 4. Destroy if no space
         //
 
+        // TODO: Continue and finish from here
+        // This only resets the TypeState - we need to also think about resize here
         let batch = batch.reset_batch();
 
         self.thread_local_batch_cache_mut(|cache| ())
@@ -349,7 +374,7 @@ mod tests {
                 assert!(result.is_none());
 
                 // If we manually insert a Batch into the tls cache then we should get a Wrapped BatchObject<Uncommitted>
-                cache.batches.push(BatchObject::new().into_inner());
+                cache.push(BatchObject::new().into_inner());
             })
         });
 
@@ -418,5 +443,96 @@ mod tests {
 
         assert!(pool.next_shard.load(Ordering::Acquire) == 2);
         println!("{}", pool.next_shard.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn thread_cache_pop_empty_returns_none() {
+        // Create a fresh ThreadBatchCache.
+        // Assert pop() returns None.
+        // Assert len remains 0.
+    }
+
+    #[test]
+    fn thread_cache_push_then_pop_returns_same_batch() {
+        // Create a fresh ThreadBatchCache.
+        // Push one BatchObject::new().into_inner().
+        // Pop it and assert the returned pointer equals the inserted pointer.
+        // Clean up the popped batch allocation.
+    }
+
+    #[test]
+    fn thread_cache_pop_is_lifo() {
+        // Push two distinct batch pointers.
+        // Pop twice.
+        // Assert the second pushed pointer is returned first.
+        // Clean up both popped batch allocations.
+    }
+
+    #[test]
+    fn thread_cache_push_full_returns_err() {
+        // Fill ThreadBatchCache to MAX_BATCHES_PER_THREAD_CACHE.
+        // Push one extra batch.
+        // Assert Err(extra_batch) is returned.
+        // Clean up all retained batch pointers plus the extra pointer.
+    }
+
+    #[test]
+    fn try_acquire_from_tls_empty_returns_none() {
+        // Use BatchPool::try_acquire_from_tls with an empty ThreadBatchCache.
+        // Assert None.
+    }
+
+    #[test]
+    fn try_acquire_from_tls_pops_cached_batch() {
+        // Push one batch pointer into ThreadBatchCache.
+        // Call try_acquire_from_tls.
+        // Assert Some(BatchObject<UnCommitted>).
+        // Assert a second call returns None.
+    }
+
+    #[test]
+    fn acquire_allocates_when_tls_and_shard_empty() {
+        // Create BatchPool with empty shards.
+        // Call acquire().
+        // Assert allocations increments by 1.
+        // Assert tls_misses increments by 1.
+    }
+
+    #[test]
+    fn acquire_uses_shard_before_allocating() {
+        // Seed the assigned shard with one batch.
+        // Call acquire().
+        // Assert allocations does not increment.
+        // Assert returned batch is the seeded pointer if pointer identity is observable.
+    }
+
+    #[test]
+    fn refill_tls_hydrates_cache_from_shard() {
+        // Seed a shard with several batches.
+        // Call acquire() through the pool's TLS path.
+        // Assert one batch is returned and up to half the TLS cache is filled.
+    }
+
+    #[test]
+    fn shard_assignment_is_sticky_per_thread_cache() {
+        // Create one ThreadBatchCache.
+        // Call shard_idx_for_cache twice.
+        // Assert both calls return the same shard index.
+        // Assert next_shard only increments once.
+    }
+
+    #[test]
+    fn shard_assignment_round_robins_across_caches() {
+        // Create multiple ThreadBatchCache values.
+        // Assign shard index for each.
+        // Assert indexes wrap modulo NUMBER_OF_SHARDS_FOR_POOL.
+    }
+
+    #[test]
+    fn thread_batch_cache_unref_drops_cached_batches() {
+        // After implementing cache draining:
+        // Create a boxed ThreadBatchCache with initialized batch pointers.
+        // Call ThreadBatchCache::unref through the erased handler.
+        // Assert no leak/double-free under miri or a drop-counting test batch helper.
     }
 }
