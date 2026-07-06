@@ -366,6 +366,9 @@ impl<B: BatchCommitState> BatchObject<B> {
         if !state.is_reset_safe() { false } else { true }
     }
 
+    // Can be called by the owner of the batch to clear and make ready for re-use, we don't explicitly shrink here because
+    // If a caller wants reuse immediately for a similar workload then we waste resources changes capacity for it return back to the same again potentially
+    // A much better approach is to provide two different API points which allow for the explicit resizing
     pub(crate) fn reset_batch(mut self) -> BatchObject<UnCommitted> {
         //
         // Check our state
@@ -376,6 +379,9 @@ impl<B: BatchCommitState> BatchObject<B> {
         // We are safe to dereference because we own exlcusive access to the BatchObject which
         // owns the NonNullBatchPtr which points to the stable batch allocation
         let batch = unsafe { &mut *self.as_ptr() };
+
+        // Now we reset the raw batch
+        batch.clear();
 
         // If no errors; we have reset and are safe to transition state and return
         self.transition()
@@ -443,6 +449,19 @@ impl BatchObject<UnCommitted> {
             inner: self.inner,
         }
     }
+
+    pub(crate) fn resize_to(&mut self, new_size: usize) {
+        // TODO: Add safety comments
+        let batch = unsafe { &mut *self.as_ptr() };
+
+        batch.data.reserve(new_size);
+    }
+
+    pub(crate) fn shrink_to(&mut self, new_size: usize) {
+        // TODO: Add safety comments
+        let batch = unsafe { &mut *self.as_ptr() };
+        batch.shrink_batch_to(new_size);
+    }
 }
 
 // ---- Sealed ---- //
@@ -455,7 +474,6 @@ impl BatchObject<Sealed> {
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct Batch {
-    // NOTE: Do we still want to use a vec?
     data: Vec<u8>,
     /// The maximum total serialized size allowed for a single atomic Batch.
     ///
@@ -476,7 +494,7 @@ pub(super) struct Batch {
     /// Memtable flush and large-batch heuristics are evaluated separately on a
     /// per-column-family basis using the batch footprint for each destination
     /// memtable.
-    // XXX: Would we not want max_batch_size to be a const on the Impl?
+    // XXX: Would we not want max_batch_size to be a const on the Impl? Unless it's runtime state...
     max_batch_size: usize,
     count: u64,
     runtime_commit_state: AtomicU8,
@@ -584,29 +602,31 @@ impl Batch {
         self.count
     }
 
-    pub(super) fn reset(&mut self) {
+    pub(super) fn shrink_batch_to(&mut self, new_size: usize) {
+        // We are not interested why we're being resized
+        self.data.shrink_to(new_size);
+    }
+
+    pub(super) fn clear(&mut self) {
         // NOTE:
         // We do NOT wait on signals here - once we reach here we should have exclusive ownership and
         // the type state batch objects should have done the runtime waiting for us
-        //
-        // Want:
-        // - We need to assess the size of the data buf and decide if we want to resize
 
         debug_assert!(
             BatchRuntimeState::from(self.runtime_commit_state.load(Ordering::Acquire))
                 .is_reset_safe()
         );
 
+        // NOTE:
+        // Do we need to clear the sync waiters
+
         self.count = 0;
         //
         self.runtime_commit_state
             .store(BatchRuntimeState::Acquired as u8, Ordering::Relaxed);
-        //
 
         // Reset the data buffer
         self.data.clear();
-
-        // TODO: Finish reset
     }
 }
 
@@ -650,7 +670,7 @@ mod tests {
             .runtime_commit_state
             .store(BatchRuntimeState::InQueue as u8, Ordering::Relaxed);
 
-        batch.reset();
+        batch.clear();
     }
 
     #[should_panic]

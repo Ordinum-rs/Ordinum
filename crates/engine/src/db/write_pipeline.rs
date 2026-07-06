@@ -417,11 +417,6 @@ where
 
     //
 
-    // XXX: We may want a commit_sync(self) where we do move ownership and do not allow NoSyncWait or commit to return whilst the batch is queued
-    // this provides greater safety and also can be more efficient with returning the batch back to cache/pool as soon as possible rather than leaving
-    // it up to the caller
-    //
-
     pub(crate) fn commit_sync(&self, batch: &BatchObject<Sealed>) -> Result<()> {
         // NOTE: Any assertions here?
         //

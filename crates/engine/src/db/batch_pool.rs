@@ -351,6 +351,9 @@ impl BatchPool {
         // This only resets the TypeState - we need to also think about resize here
         let batch = batch.reset_batch();
 
+        // TODO: Resize policy - maybe add an enum?
+        // Need to think about resize policy
+
         self.thread_local_batch_cache_mut(|cache| ())
     }
 }
