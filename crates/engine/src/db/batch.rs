@@ -494,8 +494,6 @@ pub(super) struct Batch {
     /// Memtable flush and large-batch heuristics are evaluated separately on a
     /// per-column-family basis using the batch footprint for each destination
     /// memtable.
-    // XXX: Would we not want max_batch_size to be a const on the Impl? Unless it's runtime state...
-    max_batch_size: usize,
     count: u64,
     runtime_commit_state: AtomicU8,
     //
@@ -522,7 +520,6 @@ impl Batch {
         let mut data = Vec::with_capacity(DEFAULT_BATCH_INIT_SIZE);
         Self {
             data,
-            max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(BatchRuntimeState::Pooled as u8),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
@@ -537,7 +534,6 @@ impl Batch {
         data.extend_from_slice(&[0u8; Self::HEADER_SIZE]);
         Self {
             data,
-            max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(0),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
