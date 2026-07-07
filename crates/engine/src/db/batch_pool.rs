@@ -13,11 +13,13 @@ use std::{array, mem::MaybeUninit, ptr::NonNull};
 
 use crate::{
     db::batch::{
-        Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, UnCommitted,
+        Batch, BatchCommitState, BatchObject, BatchObjectHandle, DEFAULT_BATCH_INIT_SIZE,
+        NonNullBatchPtr, UnCommitted,
     },
-    sync::atomic::AtomicUsize,
-    sync::atomic::Ordering,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread_local_storage::{
         thread_ctx, thread_db_instance_ctx,
         thread_local_ptr::{ThreadLocalObject, ThreadLocalPtr, UnrefHandler},
@@ -340,19 +342,22 @@ impl BatchPool {
     }
 
     pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B>) {
-        // Want
-        // 1. Extract the Batch
-        // 2. Reset the batch to a cachable state
-        // 3. Try to return to pool
-        // 4. Destroy if no space
         //
-
-        // TODO: Continue and finish from here
         // This only resets the TypeState - we need to also think about resize here
-        let batch = batch.reset_batch();
+        let mut batch = batch.reset_batch();
 
-        // TODO: Resize policy - maybe add an enum?
-        // Need to think about resize policy
+        // SAFETY:
+        //
+        // We have exclusive ownership of this batch and it's memory and can safely dereference as no other process or caller
+        // has any references to this batch
+        let len = unsafe { &mut *batch.as_ptr() }.get_batch_size();
+
+        // NOTE:
+        // We may want to abstract out a resize policy layer if we find that we are making decisions about resizing batches
+        // in different places and around different invariants
+        if len >= DEFAULT_BATCH_INIT_SIZE * 2 {
+            batch.shrink_to(DEFAULT_BATCH_INIT_SIZE);
+        }
 
         self.thread_local_batch_cache_mut(|cache| ())
     }

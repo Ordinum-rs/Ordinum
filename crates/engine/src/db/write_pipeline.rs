@@ -339,6 +339,8 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     // per-batch waiter records completion for one specific batch.
     sync_sem: SyncQueueSem,
 
+    // Need sync_waiter?
+
     // Env trait
     env: Arc<E>,
 
@@ -411,7 +413,7 @@ where
         self.commit_sem.try_acquire()
     }
 
-    pub(super) fn release_queue_space(&self) {
+    fn release_queue_space(&self) {
         self.commit_sem.release();
     }
 
@@ -456,9 +458,8 @@ where
     }
 
     pub(crate) fn prepare(&self, batch: NonNull<Batch>) -> Result<()> {
-        // XXX: In the future we may want to to have a SyncWal bool where we can decide if we want to fsync to WAL or not
-        // Further to that we can also decide if we want to asynchronously wait for fsync to complete
-        // But for now the commit will both wait for publish and fsync
+        //
+        // NOTE: How do we want to hand no_sync_wait?
 
         let _guard = self.q_mu.lock().unwrap();
 

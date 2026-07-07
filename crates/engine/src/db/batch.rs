@@ -598,6 +598,10 @@ impl Batch {
         self.count
     }
 
+    pub(super) fn get_batch_size(&self) -> usize {
+        self.data.len()
+    }
+
     pub(super) fn shrink_batch_to(&mut self, new_size: usize) {
         // We are not interested why we're being resized
         self.data.shrink_to(new_size);
