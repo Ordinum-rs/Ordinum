@@ -81,12 +81,30 @@ const MAX_BATCHES_PER_THREAD_CACHE: usize = 6;
 // - Thread-local caches are drained when the tls thread row drops: batches may be returned
 //   to the global shard or destroyed according to the pool's retention policy.
 
-// TODO: Move into thread_local_storage folder?
-pub(crate) struct ThreadBatchCache<const CACHE_CAP: usize = MAX_BATCHES_PER_THREAD_CACHE> {
+/// Per-thread batch cache stored in the engine TLS matrix.
+///
+/// Each thread gets at most one ThreadBatchCache for this BatchPool's
+/// ThreadLocalPtr slot. The cache is accessed only by its owning thread during
+/// normal acquire/release paths, so its len and MaybeUninit array do not need
+/// atomic synchronization.
+///
+/// The cache owns up to CACHE_CAP reusable heap-allocated batches. Entries are
+/// stored as NonNullBatchPtr inside MaybeUninit slots so push/pop can manage the
+/// initialized prefix without allocating a Vec.
+///
+/// CACHE_CAP is the hard per-thread capacity. TARGET_RETAINED is the number of
+/// batches this cache should keep after spilling excess entries back to the
+/// shared shard pool.
+///
+/// When the TLS row is reclaimed, ThreadBatchCache::unref drains the initialized
+/// entries and destroys any retained batches that were not returned to the pool.
+pub(crate) struct ThreadBatchCache<
+    const CACHE_CAP: usize = MAX_BATCHES_PER_THREAD_CACHE,
+    const TARGET_RETAINED: usize = { MAX_BATCHES_PER_THREAD_CACHE / 2 },
+> {
     pub(crate) shard_idx: Option<usize>,
     len: u8,
     pub(crate) batches: [MaybeUninit<NonNullBatchPtr>; CACHE_CAP],
-    // Do we need an index here?
 }
 
 impl ThreadBatchCache {
@@ -95,16 +113,16 @@ impl ThreadBatchCache {
     }
 }
 
-impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
-    // Consts
-    const TARGET_FILL: usize = CACHE_CAP / 2;
-
+impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
+    ThreadBatchCache<CACHE_CAP, TARGET_RETAINED>
+{
     pub(crate) fn new_with_size() -> Self {
         debug_assert!(CACHE_CAP <= MAX_BATCHES_PER_THREAD_CACHE);
+        debug_assert!(TARGET_RETAINED < CACHE_CAP);
         Self {
             shard_idx: None,
             len: 0,
-            batches: array::from_fn(|_| MaybeUninit::zeroed()),
+            batches: array::from_fn(|_| MaybeUninit::uninit()),
         }
     }
 
@@ -141,6 +159,10 @@ impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
     }
 
     // TODO: Make target spill array to return - replacing with MaybeUninit::uninit()
+
+    pub(super) fn spill_to_max_retain(&mut self) -> [Option<NonNullBatchPtr>; TARGET_RETAINED] {
+        todo!()
+    }
 }
 
 impl ThreadLocalObject for ThreadBatchCache {
