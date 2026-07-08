@@ -96,6 +96,9 @@ impl ThreadBatchCache {
 }
 
 impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
+    // Consts
+    const TARGET_FILL: usize = CACHE_CAP / 2;
+
     pub(crate) fn new_with_size() -> Self {
         debug_assert!(CACHE_CAP <= MAX_BATCHES_PER_THREAD_CACHE);
         Self {
@@ -103,6 +106,10 @@ impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
             len: 0,
             batches: array::from_fn(|_| MaybeUninit::zeroed()),
         }
+    }
+
+    pub(super) fn cache_len(&self) -> usize {
+        self.len as usize
     }
 
     pub(super) fn push(&mut self, entry: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
@@ -132,6 +139,8 @@ impl<const CACHE_CAP: usize> ThreadBatchCache<CACHE_CAP> {
 
         Some(unsafe { entry.assume_init() })
     }
+
+    // TODO: Make target spill array to return - replacing with MaybeUninit::uninit()
 }
 
 impl ThreadLocalObject for ThreadBatchCache {
@@ -174,10 +183,11 @@ impl BatchPoolShard {
 // XXX: Need to think about how we might wire this into a standardised stats module which then plugs in to a wider engine level stats collection
 struct BatchPoolStats {
     tls_misses: AtomicUsize,
-    shard_hits: AtomicUsize,
+
+    global_batches_reused: AtomicUsize,
+
     allocations: AtomicUsize,
-    // XXX: Would like to show total_allocated_bytes
-    // Can we do this over time? Or histogram this?
+    allocated_bytes: AtomicUsize,
 }
 
 impl Default for BatchPoolStats {
@@ -190,8 +200,9 @@ impl BatchPoolStats {
     fn new() -> Self {
         Self {
             tls_misses: AtomicUsize::new(0),
-            shard_hits: AtomicUsize::new(0),
+            global_batches_reused: AtomicUsize::new(0),
             allocations: AtomicUsize::new(0),
+            allocated_bytes: AtomicUsize::new(0),
         }
     }
 }
@@ -225,11 +236,6 @@ impl BatchPool {
             thread_local_ptr: ThreadLocalPtr::new(),
         }
     }
-
-    //
-    //
-    //
-    //
 
     fn assign_shard_idx(&self, cache: &mut ThreadBatchCache) -> usize {
         let id = self.next_shard.fetch_add(1, Ordering::Relaxed) % NUMBER_OF_SHARDS_FOR_POOL;
@@ -279,29 +285,49 @@ impl BatchPool {
                 panic!()
             });
 
+        let mut allocated: u8 = 0;
+        let mut reused: u8 = 0;
+
         // Grab a batch we can return straight away
-        let returnable_batch = shard.pop().unwrap_or_else(|| {
-            self.stats.allocations.fetch_add(1, Ordering::Relaxed);
-            BatchObject::new().into_inner()
-        });
+        let returnable_batch = match shard.pop() {
+            Some(batch) => {
+                reused += 1;
+                batch
+            }
+            None => {
+                allocated += 1;
+                BatchObject::new().into_inner()
+            }
+        };
 
         // While we're here we will also try to hydrate the tls cache by grabbing batches from global
         while (cache.len as usize) < cache.batches.len() / 2 {
             // We want to pop from global pool - if pool is empty then we allocate a new batch
             match shard.pop() {
                 Some(batch) => {
-                    self.stats.shard_hits.fetch_add(1, Ordering::Relaxed);
+                    reused += 1;
                     // We know we have space because of the while check
                     let _ = cache.push(batch);
                 }
                 None => {
-                    // XXX: What i'd like to do here is get warmed up as possible by allocating on empty pop and refilling tls_cache eagerly
-                    // BUT We need to understand the stats first because a cold thread could feasably over allocate and not use the cached batches
-                    // So we will go with the natural approach first. When global pool is empty we just break and return the single batch and let the
-                    // drop implementatino slowly build the cache
                     break;
                 }
             }
+        }
+
+        // Update stats
+
+        self.stats.tls_misses.fetch_add(1, Ordering::Relaxed);
+
+        if allocated != 0 {
+            self.stats
+                .allocations
+                .fetch_add(allocated as usize, Ordering::Relaxed);
+        }
+        if reused != 0 {
+            self.stats
+                .global_batches_reused
+                .fetch_add(reused as usize, Ordering::Relaxed);
         }
 
         BatchObject::from_batch_ptr(returnable_batch)
@@ -314,8 +340,6 @@ impl BatchPool {
             // 1. Try acquire from TLS cache
             //    - Return immediately on hit
             match self.try_acquire_from_tls(cache).or_else(|| {
-                self.stats.tls_misses.fetch_add(1, Ordering::Relaxed);
-
                 // 2. Try to refill from pool
                 Some(self.refill_tls_cache(cache))
             }) {
@@ -359,7 +383,12 @@ impl BatchPool {
             batch.shrink_to(DEFAULT_BATCH_INIT_SIZE);
         }
 
-        self.thread_local_batch_cache_mut(|cache| ())
+        self.thread_local_batch_cache_mut(|cache| match cache.push(batch.into_inner()) {
+            Ok(_) => return (),
+            Err(batch) => {
+                // We need to try to return to global pool
+            }
+        })
     }
 }
 
@@ -417,10 +446,10 @@ mod tests {
             });
         });
 
-        // We should have only done 1 allocation
-        assert_eq!(pool.stats.allocations.load(Ordering::Relaxed), 1);
         // We should have missed tls twice
         assert_eq!(pool.stats.tls_misses.load(Ordering::Relaxed), 2);
+        // We should have only allocated once
+        assert_eq!(pool.stats.allocations.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -443,15 +472,13 @@ mod tests {
             });
 
             let r1 = t1.join().unwrap();
-            println!("t1 index = {}", r1 % NUMBER_OF_SHARDS_FOR_POOL);
             let r2 = t2.join().unwrap();
-            println!("t2 index = {}", r2 % NUMBER_OF_SHARDS_FOR_POOL);
 
             //
         });
 
+        // We should have two shards - next shard should be idx 2
         assert!(pool.next_shard.load(Ordering::Acquire) == 2);
-        println!("{}", pool.next_shard.load(Ordering::Acquire));
     }
 
     #[test]
@@ -459,6 +486,17 @@ mod tests {
         // Create a fresh ThreadBatchCache.
         // Assert pop() returns None.
         // Assert len remains 0.
+
+        let pool = BatchPool::new();
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                pool.thread_local_batch_cache_mut(|cache| {
+                    assert!(cache.pop().is_none());
+                    assert!(cache.len == 0);
+                })
+            });
+        });
     }
 
     #[test]
