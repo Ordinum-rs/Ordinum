@@ -158,10 +158,21 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         Some(unsafe { entry.assume_init() })
     }
 
-    // TODO: Make target spill array to return - replacing with MaybeUninit::uninit()
+    pub(super) fn spill_to_max_retain(
+        &mut self,
+    ) -> Option<[Option<NonNullBatchPtr>; TARGET_RETAINED]> {
+        //
+        if self.len as usize <= TARGET_RETAINED {
+            return None;
+        }
 
-    pub(super) fn spill_to_max_retain(&mut self) -> [Option<NonNullBatchPtr>; TARGET_RETAINED] {
-        todo!()
+        Some(array::from_fn::<_, TARGET_RETAINED, _>(|_| {
+            if self.len as usize > TARGET_RETAINED {
+                self.pop()
+            } else {
+                None
+            }
+        }))
     }
 }
 
@@ -286,8 +297,6 @@ impl BatchPool {
             f,
         )
     }
-
-    // TODO: Check these methods + test
 
     fn try_acquire_from_tls(
         &self,
@@ -519,6 +528,33 @@ mod tests {
                 })
             });
         });
+    }
+
+    #[test]
+    fn spill_to_retain() {
+        //
+        let mut thread_batch = ThreadBatchCache::<4, 2>::new_with_size();
+
+        thread_batch.push(BatchObject::new().into_inner());
+        thread_batch.push(BatchObject::new().into_inner());
+        thread_batch.push(BatchObject::new().into_inner());
+        thread_batch.push(BatchObject::new().into_inner());
+
+        assert!(thread_batch.len == 4);
+
+        let array_spilled = thread_batch.spill_to_max_retain().unwrap();
+
+        let mut got = 0;
+
+        for i in array_spilled {
+            if i.is_some() {
+                got += 1
+            }
+        }
+
+        assert_eq!(got, 2);
+
+        assert_eq!(thread_batch.len, 2);
     }
 
     #[test]

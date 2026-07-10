@@ -203,9 +203,14 @@ impl<T> ThreadLocalPtr<T> {
 
         TLS_THREAD_ROW.with(|data| unsafe {
             data.with_tlp_ptr(tls_id, |cell| {
+                // We get the type erased pointer from the tls matrix cell
                 let ptr = cell.load(Ordering::Acquire);
 
                 if let Some(ptr) = NonNull::new(ptr.cast::<T>()) {
+                    // Sound because this cell belongs only to the calling
+                    // thread's row; other threads may observe or reclaim the
+                    // raw pointer only after the owner's external quiescence
+                    // protocol has stopped access to this TLP.
                     return unsafe { f(&mut *ptr.as_ptr()) };
                 }
 
@@ -244,7 +249,11 @@ impl<T> ThreadLocalPtr<T> {
     // Once these invariants hold, it is safe to walk the column, invoke each
     // thread-local object's registered unref handler, clear the entries, and
     // return the TLS ID to the free list.
-    fn drop(self) {
+    //
+    // This is an explicit lifecycle operation rather than `Drop` because the
+    // caller must first establish quiescence across every thread that could
+    // still access this column.
+    fn remove_column(&self) {
         let meta = thread_meta();
         let tls_id = self.tls_id;
 
@@ -260,7 +269,7 @@ impl<T> ThreadLocalPtr<T> {
             let current = next;
             next = unsafe { &*current }.next.get();
 
-            let entries = unsafe { &mut *next }.entries_mut();
+            let entries = unsafe { &mut *current }.entries_mut();
 
             if entries.len() <= tls_id {
                 continue;
@@ -278,6 +287,12 @@ impl<T> ThreadLocalPtr<T> {
 
         // Add tls_id to the free_list
         unsafe { &mut *meta.tls_id_free_list.get() }.push(tls_id);
+    }
+}
+
+impl<T> Drop for ThreadLocalPtr<T> {
+    fn drop(&mut self) {
+        self.remove_column();
     }
 }
 
@@ -410,7 +425,7 @@ mod tests {
             .ptr
             .init(unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(Entry { thing: 5 }))) });
 
-        base_tlp.ptr.drop();
+        base_tlp.ptr.remove_column();
 
         ready.store(true, Ordering::Release);
 

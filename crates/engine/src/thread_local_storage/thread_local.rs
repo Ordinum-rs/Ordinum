@@ -232,9 +232,8 @@ impl ThreadData {
                 unsafe { unref(ptr) }
             }
 
-            // Return tls_id to free list
-            let free_list = unsafe { &mut *meta.tls_id_free_list.get() };
-            free_list.push(idx);
+            // We don't return the tls_id back to the free list because ThreadData represents the tls row not the column, other threads may still
+            // have active sub systems on the tls_id column in the matrix
         }
     }
 
