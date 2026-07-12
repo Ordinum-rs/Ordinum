@@ -18,9 +18,6 @@ impl<T> CachePadded<T> {
     }
 }
 
-unsafe impl<T> Send for CachePadded<T> {}
-unsafe impl<T> Sync for CachePadded<T> {}
-
 impl<T> Deref for CachePadded<T> {
     type Target = T;
 

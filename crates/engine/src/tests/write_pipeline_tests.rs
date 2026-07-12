@@ -5,7 +5,7 @@ mod tests {
     use crate::{
         db::{
             batch::{BatchObject, BatchRef},
-            batch_pool::BatchPoolImpl,
+            batch_pool::BatchPool,
             write_pipeline::{WritePipeline, WriterEnv},
         },
         version::SeqNumState,
@@ -41,7 +41,7 @@ mod tests {
 
         let mut wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
 
-        let mut pool = Arc::new(BatchPoolImpl::new());
+        let mut pool = Arc::new(BatchPool::new());
 
         // ============================================
 

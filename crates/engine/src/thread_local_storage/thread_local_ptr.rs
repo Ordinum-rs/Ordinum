@@ -45,6 +45,23 @@ pub(crate) trait ThreadLocalObject: Sized {
 /// `ThreadLocalObject`. ThreadLocalPtr does not own the allocation strategy
 /// or lifetime protocol of the stored objects; it only manages their storage
 /// and reclamation within the TLS matrix.
+///
+/// Entry APIs intentionally accept `NonNull<T>` rather than `Box<T>`. Requiring
+/// a `Box<T>` would make heap allocation and `Box::from_raw` reclamation part of
+/// this type's contract, but TLS entries may instead use another ownership
+/// protocol, such as decrementing a reference count, returning an object to a
+/// pool, retiring it through a deferred-reclamation scheme, or performing no
+/// reclamation at all. The registered `ThreadLocalObject` handler defines which
+/// protocol applies to `T`.
+///
+/// `NonNull<T>` guarantees only that the pointer is non-null; it does not prove
+/// that the pointer is valid, uniquely accessible, or live for long enough.
+/// Callers inserting an entry must uphold those properties according to the
+/// selected reclamation protocol. They must also ensure that the pointer remains
+/// valid until it is removed or its handler is invoked, and that TLS access has
+/// quiesced before the row or column can reclaim the entry. Methods that create
+/// references from stored pointers therefore form an unsafe implementation
+/// boundary even when a subsystem exposes a narrower safe wrapper around them.
 pub(crate) struct ThreadLocalPtr<T> {
     tls_id: usize,
     _type: PhantomData<T>,
@@ -114,7 +131,7 @@ impl<T> ThreadLocalPtr<T> {
         })
     }
 
-    pub(crate) fn get(&self) -> Option<NonNull<T>> {
+    pub(super) fn get(&self) -> Option<NonNull<T>> {
         let tls_id = self.tls_id;
 
         TLS_THREAD_ROW.with(|data| unsafe {
@@ -130,7 +147,7 @@ impl<T> ThreadLocalPtr<T> {
         })
     }
 
-    pub(crate) fn get_or_init(&self, init: impl FnOnce() -> NonNull<T>) -> NonNull<T> {
+    pub(super) unsafe fn get_or_init(&self, init: impl FnOnce() -> NonNull<T>) -> NonNull<T> {
         let tls_id = self.tls_id;
 
         // SAFETY:
@@ -171,7 +188,23 @@ impl<T> ThreadLocalPtr<T> {
         })
     }
 
-    pub(crate) fn get_or_init_mut<F, R>(&self, init: impl FnOnce() -> NonNull<T>, f: F) -> R
+    /// Initializes the calling thread's entry if necessary and gives `f`
+    /// temporary mutable access to it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    ///
+    /// - `init` returns a valid, aligned `NonNull<T>` governed by this
+    ///   `ThreadLocalPtr`'s registered reclamation protocol.
+    /// - The stored object remains alive and is not removed or reclaimed while
+    ///   `f` executes.
+    /// - No references or accesses that conflict with the temporary `&mut T`
+    ///   exist while `f` executes.
+    /// - Access is not re-entered for this same TLS entry while `f` holds the
+    ///   mutable reference.
+    /// - All accesses are quiesced before the TLS row or column is reclaimed.
+    pub(crate) unsafe fn get_or_init_mut<F, R>(&self, init: impl FnOnce() -> NonNull<T>, f: F) -> R
     where
         F: FnOnce(&mut T) -> R,
     {

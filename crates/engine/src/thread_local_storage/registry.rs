@@ -268,7 +268,7 @@ pub(crate) struct DBInstanceCtx {
 impl DBInstanceCtx {
     pub(super) fn new() -> Self {
         Self {
-            batch_cache: UnsafeCell::new(ThreadBatchCache::new()),
+            batch_cache: UnsafeCell::new(ThreadBatchCache::new_with_const_size()),
         }
     }
 

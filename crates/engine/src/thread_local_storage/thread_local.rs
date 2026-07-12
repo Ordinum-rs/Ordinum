@@ -136,6 +136,7 @@ impl ThreadData {
     //
     // The caller must hold `thread_meta.thread_mu`, which serializes all
     // structural modifications to this thread's TLS row.
+    // NOTE: Should we take a guard to ensure this?
     pub(super) fn entries_mut(&self) -> &mut Vec<AtomicPtr<()>> {
         unsafe { &mut *self.entries.get() }
     }
@@ -147,10 +148,7 @@ impl ThreadData {
 
         let meta = thread_meta();
 
-        let _guard = meta.thread_mu.lock().unwrap_or_else(|e| {
-            // XXX: In future we may want to handle the poison lock
-            panic!("{e}")
-        });
+        let _guard = meta.thread_mu.lock().unwrap_or_else(|e| panic!("{e}"));
 
         // TODO: Add safety note
         let sentinal = unsafe { &mut *meta.head.get() } as *mut ThreadData;
@@ -265,6 +263,8 @@ impl ThreadData {
 
         let ptr = &entries[tls_id];
 
+        // We're ok to return an AtomicPtr holding a null ptr here because callers beneath this will use get_or_init() which will check null pointer
+        // and provide their own initialisers
         f(ptr)
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     column_family::cf::ColumnFamilyData,
     db::{
         batch::{Batch, BatchObject, BatchRef, Sealed},
-        batch_pool::BatchPoolImpl,
+        batch_pool::BatchPool,
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
         write_batch::WBatch,
         write_pipeline::{WritePipeline, WriterEnv},
