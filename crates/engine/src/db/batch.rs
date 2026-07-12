@@ -5,21 +5,22 @@ use std::ptr::NonNull;
 use std::thread::{self, Thread};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
-use crate::db::batch_pool::BatchPool;
 use crate::db::DEFAULT_CF_ID;
 use crate::db::{self, db_impl::DbImpl};
-use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::utils;
 use crate::utils::var_int::VarInt;
 use crate::wal::{SyncLogWaiter, SyncWaiter};
 use crate::{Error, Result};
 
+use super::batch_pool::BatchPool;
+
 // ---- Constants ---- //
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
-pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10; // NOTE: This is where we'd like to get to if we pool batches
-                                                           //
+pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10;
+//
 pub(crate) const RESET_SAFE_STATES: [BatchRuntimeState; 2] =
     [BatchRuntimeState::Acquired, BatchRuntimeState::Applied];
 
@@ -363,11 +364,7 @@ impl<B: BatchCommitState> BatchObject<B> {
 
     pub(crate) fn can_reset(&self) -> bool {
         let state = self.state(Ordering::Acquire);
-        if !state.is_reset_safe() {
-            false
-        } else {
-            true
-        }
+        if !state.is_reset_safe() { false } else { true }
     }
 
     // Can be called by the owner of the batch to clear and make ready for re-use, we don't explicitly shrink here because

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::ptr::null_mut;
 
-use crate::db::batch_pool::ThreadBatchCache;
 use crate::sync::Mutex;
 use crate::sync::atomic::AtomicPtr;
 use crate::sync::atomic::AtomicUsize;

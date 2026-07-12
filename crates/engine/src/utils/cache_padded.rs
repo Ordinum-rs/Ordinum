@@ -4,7 +4,7 @@
 //
 // For now, we will default to aligning to 64 bytes and over time consider using more alignment for different sources
 
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 #[repr(align(64))]
@@ -26,5 +26,11 @@ impl<T> Deref for CachePadded<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.value
+    }
+}
+
+impl<T> DerefMut for CachePadded<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
     }
 }
