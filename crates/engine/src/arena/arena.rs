@@ -99,10 +99,10 @@ pub struct Arena {
 
 impl Arena {
     pub fn new(policy: ArenaPolicy, allocator: Allocator) -> Self {
-        assert!(
-            policy.block_size.is_power_of_two(),
-            "Arena block size must be a power of two"
-        );
+        // assert!(
+        //     policy.block_size.is_power_of_two(),
+        //     "Arena block size must be a power of two"
+        // );
 
         // assert!(
         //     policy.block_size >= 4 * 1024,

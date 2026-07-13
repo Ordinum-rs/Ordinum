@@ -1,6 +1,6 @@
 use std::{
     array,
-    ptr::{self, NonNull, null_mut},
+    ptr::{self, null_mut, NonNull},
     sync::atomic::AtomicBool,
 };
 
@@ -12,17 +12,17 @@ use crate::{
 };
 
 use crate::{
-    Error, Result,
     db::{
         batch::{Batch, BatchObject, Sealed},
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     },
+    sync::spin_loop,
     sync::Arc,
     sync::Condvar,
     sync::Mutex,
     sync::MutexGuard,
-    sync::spin_loop,
     utils::{self, cache_padded::CachePadded},
+    Error, Result,
 };
 
 //
@@ -638,7 +638,7 @@ mod tests {
                 s,
                 0,
                 |b| {
-                    b.mark_applied(Ordering::Relaxed);
+                    b.mark_applied();
                 },
                 |ptr, q| q.try_dequeue(),
             );

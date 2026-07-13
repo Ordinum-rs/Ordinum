@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
     use crate::db::batch::BatchObjectHandle;
-    use crate::{Error, Result};
     use crate::{
         db::{
             batch::{BatchObject, BatchRef},
@@ -11,6 +10,7 @@ mod tests {
         version::SeqNumState,
         wal::SyncQueueSem,
     };
+    use crate::{Error, Result};
 
     use crate::sync::Arc;
 

@@ -7,8 +7,8 @@ use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::db::DEFAULT_CF_ID;
 use crate::db::{self, db_impl::DbImpl};
-use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::Arc;
 use crate::utils;
 use crate::utils::var_int::VarInt;
 use crate::wal::{SyncLogWaiter, SyncWaiter};
@@ -20,9 +20,6 @@ use super::batch_pool::BatchPool;
 
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10;
-//
-pub(crate) const RESET_SAFE_STATES: [BatchRuntimeState; 2] =
-    [BatchRuntimeState::Acquired, BatchRuntimeState::Applied];
 
 // ---- Module Errors ---- //
 
@@ -46,9 +43,8 @@ pub(crate) enum BatchOp {
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum BatchRuntimeState {
-    Pooled,
+    Idle,
     Acquired,
-    Committed,
     InQueue,
     WaitingSync,
     Applied,
@@ -57,9 +53,8 @@ pub(crate) enum BatchRuntimeState {
 impl Display for BatchRuntimeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BatchRuntimeState::Pooled => write!(f, "Pooled"),
+            BatchRuntimeState::Idle => write!(f, "Idle"),
             BatchRuntimeState::Acquired => write!(f, "Acquired"),
-            BatchRuntimeState::Committed => write!(f, "Committed"),
             BatchRuntimeState::InQueue => write!(f, "InQueue"),
             BatchRuntimeState::WaitingSync => write!(f, "WaitingSync"),
             BatchRuntimeState::Applied => write!(f, "Applied"),
@@ -70,23 +65,21 @@ impl Display for BatchRuntimeState {
 impl From<u8> for BatchRuntimeState {
     fn from(value: u8) -> Self {
         match value {
-            0 => BatchRuntimeState::Pooled,
+            0 => BatchRuntimeState::Idle,
             1 => BatchRuntimeState::Acquired,
-            2 => BatchRuntimeState::Committed,
-            3 => BatchRuntimeState::InQueue,
-            4 => BatchRuntimeState::WaitingSync,
-            5 => BatchRuntimeState::Applied,
+            2 => BatchRuntimeState::InQueue,
+            3 => BatchRuntimeState::WaitingSync,
+            4 => BatchRuntimeState::Applied,
             _ => unreachable!(),
         }
     }
 }
 
 impl BatchRuntimeState {
+    const RESET_SAFE_STATES: [Self; 2] = [Self::Acquired, Self::Applied];
+
     pub(super) fn is_reset_safe(self) -> bool {
-        matches!(
-            self,
-            BatchRuntimeState::Acquired | BatchRuntimeState::Applied
-        )
+        Self::RESET_SAFE_STATES.contains(&self)
     }
 }
 
@@ -364,7 +357,11 @@ impl<B: BatchCommitState> BatchObject<B> {
 
     pub(crate) fn can_reset(&self) -> bool {
         let state = self.state(Ordering::Acquire);
-        if !state.is_reset_safe() { false } else { true }
+        if !state.is_reset_safe() {
+            false
+        } else {
+            true
+        }
     }
 
     // Can be called by the owner of the batch to clear and make ready for re-use, we don't explicitly shrink here because
@@ -421,6 +418,14 @@ impl BatchObject<UnCommitted> {
 
     pub(super) fn into_inner(self) -> NonNullBatchPtr {
         self.inner
+    }
+
+    pub(super) fn set_acquired_state(&self) {
+        // SAFETY:
+        // BatchObject owns the allocation. Callers use this only after removing
+        // the pointer from idle storage, before the object is exposed outside
+        // the ownership-transfer operation.
+        unsafe { self.set_runtime_state(BatchRuntimeState::Acquired, Ordering::Release) };
     }
 
     pub(crate) fn put<K, V>(&self, key: K, value: V)
@@ -522,7 +527,7 @@ impl Batch {
         Self {
             data,
             count: 0,
-            runtime_commit_state: AtomicU8::new(BatchRuntimeState::Pooled as u8),
+            runtime_commit_state: AtomicU8::new(BatchRuntimeState::Acquired as u8),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
     }
@@ -536,7 +541,7 @@ impl Batch {
         Self {
             data,
             count: 0,
-            runtime_commit_state: AtomicU8::new(0),
+            runtime_commit_state: AtomicU8::new(BatchRuntimeState::Acquired as u8),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
     }
@@ -585,14 +590,26 @@ impl Batch {
         }
     }
 
+    /// Stores a lifecycle state after the caller has established the ownership
+    /// or pipeline boundary represented by `state`.
+    ///
+    /// The atomic store synchronizes observation of the state; it does not by
+    /// itself transfer ownership or make an otherwise invalid transition valid.
+    pub(super) fn set_runtime_state(&self, state: BatchRuntimeState, ordering: Ordering) {
+        self.runtime_commit_state.store(state as u8, ordering);
+    }
+
     pub(super) fn is_applied(&self, ordering: Ordering) -> bool {
         BatchRuntimeState::from(self.runtime_commit_state.load(ordering))
             == BatchRuntimeState::Applied
     }
 
-    pub(super) fn mark_applied(&self, ordering: Ordering) {
+    pub(super) fn mark_applied(&self) {
+        // The write pipeline calls this only after it has finished every access
+        // that must precede reuse. Publishing Applied allows the owner waiting
+        // with an Acquire load to proceed to reset.
         self.runtime_commit_state
-            .store(BatchRuntimeState::Applied as u8, ordering)
+            .store(BatchRuntimeState::Applied as u8, Ordering::Release)
     }
 
     pub(super) fn get_batch_count(&self) -> u64 {
@@ -622,7 +639,10 @@ impl Batch {
         // Do we need to clear the sync waiters
 
         self.count = 0;
-        //
+
+        // `clear` has exclusive access and accepts only a reset-safe state.
+        // Once the contents are reset, the same owning BatchObject becomes the
+        // acquired mutable batch for its next use.
         self.runtime_commit_state
             .store(BatchRuntimeState::Acquired as u8, Ordering::Relaxed);
 

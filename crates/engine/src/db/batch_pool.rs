@@ -13,13 +13,13 @@ use std::{array, mem::MaybeUninit, ptr::NonNull};
 
 use crate::{
     db::batch::{
-        Batch, BatchCommitState, BatchObject, BatchObjectHandle, DEFAULT_BATCH_INIT_SIZE,
-        NonNullBatchPtr, UnCommitted,
+        Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, UnCommitted,
+        DEFAULT_BATCH_INIT_SIZE,
     },
     sync::{
-        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         cell::UnsafeCell,
+        Arc, Mutex,
     },
     thread_local_storage::{
         thread_ctx, thread_db_instance_ctx,
@@ -43,46 +43,9 @@ const DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_C
 // the storage layout is known at compile time and does not require a Vec for the
 // hot per-thread cache.
 //
-// Production code uses type aliases with conservative defaults:
-//
-//   ThreadBatchCache = ThreadBatchCacheArray<8, 4>
-//   BatchPool = BatchPoolImpl<4, 16>
-//
-// This keeps normal call sites simple while still allowing tests or specialized
-// internal builds to instantiate different layouts explicitly, for example:
-//
-//   ThreadBatchCacheArray<4, 2>
-//   BatchPoolImpl<8, 32>
-//
-// BatchPool deliberately uses the ThreadBatchCache alias rather than carrying
-// TLS cache sizing as additional const parameters. Shard sizing belongs to the
-// pool type; TLS cache sizing remains local to the cache type.
-//
-// If these defaults need to become build-time configuration later, prefer
-// changing the alias constants at one boundary rather than threading numeric
-// settings through runtime options. For example, a future crate feature or
-// generated build config could select:
-//
-//   const DEFAULT_THREAD_BATCH_CACHE_CAPACITY: usize = 16;
-//   const DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED: usize = 8;
-//   type ThreadBatchCache = ThreadBatchCacheArray<16, 8>;
-//
-// or:
-//
-//   type BatchPool = BatchPoolImpl<8, 32>;
-//
-// Another option is target-specific cfgs for known deployment profiles:
-//
-//   #[cfg(feature = "large-batch-pool")]
-//   type BatchPool = BatchPoolImpl<8, 32>;
-//
-//   #[cfg(not(feature = "large-batch-pool"))]
-//   type BatchPool = BatchPoolImpl<4, 16>;
-//
-// The important constraint is that these remain compile-time choices. The
-// array sizes are part of the concrete types, so changing them creates a
-// different ThreadBatchCacheArray or BatchPoolImpl type rather than mutating
-// runtime state.
+// BatchPool is the production alias with conservative defaults. Tests can use
+// BatchPoolImpl directly to exercise shard and TLS spill boundaries with small
+// deterministic capacities, for example BatchPoolImpl<1, 2, 2, 1>.
 
 // ----------------------------------------------------------
 
@@ -182,6 +145,13 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
             return Err(entry);
         }
 
+        // The capacity check happens before the transition, so an Err returns
+        // the pointer with its previous state unchanged. On success, this cache
+        // takes exclusive ownership and marks the live allocation idle before
+        // publishing it in the initialized cache prefix.
+        unsafe { &*entry.as_ptr() }
+            .set_runtime_state(super::batch::BatchRuntimeState::Idle, Ordering::Release);
+
         self.batches[self.len as usize].write(entry);
         self.len += 1;
 
@@ -244,6 +214,7 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
         }
     }
 
+    // Must hold Mutex befor calling
     fn pop(&mut self) -> Option<NonNullBatchPtr> {
         debug_assert!(self.len as usize <= CAP);
 
@@ -259,12 +230,21 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
         Some(unsafe { entry.assume_init() })
     }
 
+    // Must hold Mutex before calling
     fn push(&mut self, batch: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
         debug_assert!(self.len as usize <= CAP);
 
         if self.len as usize == CAP {
             return Err(batch);
         }
+
+        // SAFETY:
+        // The capacity check happens before the transition, so an Err returns
+        // the pointer with its previous state unchanged. On success, this shard
+        // takes exclusive ownership while its mutex is held and marks the live
+        // allocation idle before publishing it in the shard array.
+        unsafe { &*batch.as_ptr() }
+            .set_runtime_state(crate::db::batch::BatchRuntimeState::Idle, Ordering::Release);
 
         let idx = self.len as usize;
 
@@ -330,9 +310,11 @@ impl BatchPoolStats {
 }
 
 // DOCS: Need docs
-pub(crate) struct BatchPool<
+pub(crate) struct BatchPoolImpl<
     const SHARDS_PER_POOL: usize = DEFAULT_SHARDS_PER_POOL,
     const MAX_BATCH_PER_SHARD: usize = DEFAULT_MAX_BATCHES_PER_SHARD,
+    const TLS_CAP: usize = DEFAULT_THREAD_BATCH_CACHE_CAPACITY,
+    const TLS_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
 > {
     //
     pool: [CachePadded<BatchPoolShard<MAX_BATCH_PER_SHARD>>; SHARDS_PER_POOL],
@@ -341,7 +323,7 @@ pub(crate) struct BatchPool<
     //
     stats: BatchPoolStats,
     //
-    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache>,
+    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>>,
 }
 
 // SAFETY:
@@ -360,19 +342,27 @@ pub(crate) struct BatchPool<
 // - Cross-thread TLS teardown and column reclamation are serialized by the
 //   TLS registry mutex. The owner must ensure all pool and TLS accesses have
 //   quiesced before `BatchPool` and its TLS column are destroyed.
-unsafe impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize> Sync
-    for BatchPool<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD>
+unsafe impl<
+        const SHARDS_PER_POOL: usize,
+        const MAX_BATCH_PER_SHARD: usize,
+        const TLS_CAP: usize,
+        const TLS_TARGET_RETAINED: usize,
+    > Sync for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
 {
 }
 
-impl BatchPool {
+impl BatchPoolImpl {
     pub(crate) fn new() -> Self {
         Self::new_with_const_size()
     }
 }
 
-impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
-    BatchPool<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD>
+impl<
+        const SHARDS_PER_POOL: usize,
+        const MAX_BATCH_PER_SHARD: usize,
+        const TLS_CAP: usize,
+        const TLS_TARGET_RETAINED: usize,
+    > BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
 {
     pub(crate) fn new_with_const_size() -> Self {
         Self {
@@ -384,25 +374,37 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
         }
     }
 
-    fn assign_shard_idx(&self, cache: &mut ThreadBatchCache) -> usize {
+    fn assign_shard_idx(
+        &self,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
+    ) -> usize {
         let id = self.next_shard.fetch_add(1, Ordering::Relaxed) % SHARDS_PER_POOL;
         cache.shard_idx = Some(id);
         id
     }
 
-    fn shard_idx_for_cache(&self, cache: &mut ThreadBatchCache) -> usize {
+    fn shard_idx_for_cache(
+        &self,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
+    ) -> usize {
         cache
             .shard_idx
             .unwrap_or_else(|| self.assign_shard_idx(cache))
     }
 
-    fn push_to_global(&self, batch_ptr: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
-        todo!()
+    fn push_to_global(
+        &self,
+        shard_idx: usize,
+        batch_ptr: NonNullBatchPtr,
+    ) -> Result<(), NonNullBatchPtr> {
+        //
+        self.pool[shard_idx].push(batch_ptr)
+        //
     }
 
     fn thread_local_batch_cache_mut<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut ThreadBatchCache) -> R,
+        F: FnOnce(&mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>) -> R,
     {
         // SAFETY:
         // The initializer transfers a valid boxed cache into this TLP's
@@ -413,7 +415,12 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
         unsafe {
             self.thread_local_ptr.get_or_init_mut(
                 // We pass in an initaliser for thread local to use to init() if we don't yet have an initialised cache entry
-                || NonNull::new_unchecked(Box::into_raw(Box::new(ThreadBatchCache::new()))),
+                || {
+                    let cache = Box::new(
+                        ThreadBatchCache::<TLS_CAP, TLS_TARGET_RETAINED>::new_with_const_size(),
+                    );
+                    NonNull::new_unchecked(Box::into_raw(cache))
+                },
                 //
                 //
                 f,
@@ -423,13 +430,23 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
 
     fn try_acquire_from_tls(
         &self,
-        cache: &mut ThreadBatchCache,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
     ) -> Option<BatchObject<UnCommitted>> {
-        cache.pop().map(|ptr| BatchObject::from_batch_ptr(ptr))
+        cache.pop().map(|ptr| {
+            // Removing the pointer from the calling thread's cache transfers
+            // exclusive ownership to the returned BatchObject. Transition it
+            // before the object can escape to caller code.
+            let batch = BatchObject::from_batch_ptr(ptr);
+            batch.set_acquired_state();
+            batch
+        })
         //
     }
 
-    fn refill_tls_cache(&self, cache: &mut ThreadBatchCache) -> BatchObject<UnCommitted> {
+    fn refill_tls_cache(
+        &self,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
+    ) -> BatchObject<UnCommitted> {
         // First get the batches from the shard
         let shard = &self.pool[self.shard_idx_for_cache(cache)];
 
@@ -478,7 +495,12 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
                 .fetch_add(reused as usize, Ordering::Relaxed);
         }
 
-        BatchObject::from_batch_ptr(returnable_batch)
+        // `returnable_batch` is now owned only by this stack frame, whether it
+        // came from the locked shard or a fresh allocation. Mark it acquired
+        // before exposing the owning BatchObject to the caller.
+        let b = BatchObject::from_batch_ptr(returnable_batch);
+        b.set_acquired_state();
+        b
     }
 
     pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
@@ -491,7 +513,9 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
                 // 2. Try to refill from pool
                 Some(self.refill_tls_cache(cache))
             }) {
-                Some(batch) => return batch,
+                Some(batch) => {
+                    return batch;
+                }
                 None => {
                     panic!("Could not acquire from TLS or Pool and could not Allocate")
                 }
@@ -504,7 +528,7 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
     fn try_return_to_cache(
         &self,
         batch: BatchObject<UnCommitted>,
-        cache: &mut ThreadBatchCache,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
     ) -> Result<(), BatchObject<UnCommitted>> {
         //
         cache
@@ -539,11 +563,10 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
                 Err(batch) => {
                     // Want a method on global which will take the batch and cache spill
 
-                    // NOTE: Get the global lock
+                    let shard_idx = self.shard_idx_for_cache(cache);
 
                     cache.spill_cache_to_target_retained(|b| {
-                        // TODO: Finish
-                        if let Err(b) = self.push_to_global(b) {
+                        if let Err(b) = self.push_to_global(shard_idx, b) {
                             drop(b)
                         }
                     });
@@ -560,9 +583,17 @@ impl<const SHARDS_PER_POOL: usize, const MAX_BATCH_PER_SHARD: usize>
     }
 }
 
+/// Batch pool configuration used by the engine.
+pub(crate) type BatchPool = BatchPoolImpl<
+    DEFAULT_SHARDS_PER_POOL,
+    DEFAULT_MAX_BATCHES_PER_SHARD,
+    DEFAULT_THREAD_BATCH_CACHE_CAPACITY,
+    DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
+>;
+
 #[cfg(test)]
 mod tests {
-    use crate::sync::atomic::Ordering;
+    use crate::{db::batch::BatchRuntimeState, sync::atomic::Ordering};
     use std::{sync::Barrier, thread};
 
     use super::*;
@@ -689,6 +720,60 @@ mod tests {
 
         // This stack-local cache is not reclaimed through its TLS handler.
         drop(thread_batch.pop());
+    }
+
+    #[test]
+    fn release_to_full_tls_back_to_global() {
+        // Want small tls and small global
+
+        // Even though we have 2 batches per global pool we set the cache retained to 2 and cap to 2 so there is no spill
+        // Therefore if we fill up cache and then try to release one more batch it should be put in the global pool and nothing should spill or be destroyed
+        let mut bp = BatchPoolImpl::<2, 2, 2, 2>::new_with_const_size();
+
+        // Fill up the tls cache so we have to spill to global
+        bp.thread_local_batch_cache_mut(|cache| {
+            let _ = cache.push(BatchObject::new().into_inner());
+            let _ = cache.push(BatchObject::new().into_inner());
+        });
+
+        let caller_owned_batch = BatchObject::new();
+
+        bp.release(caller_owned_batch);
+
+        assert_eq!(bp.pool[0].inner.lock().unwrap().len, 1);
+    }
+
+    #[test]
+    fn state_lifecycle() {
+        // New batch
+        // Acquire = Idle -> Acquired
+        // Release = Acquired -> Idle
+
+        let pool = BatchPoolImpl::<1, 1, 1, 1>::new_with_const_size();
+
+        let batch = pool.acquire();
+        assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
+
+        pool.release(batch);
+
+        pool.thread_local_batch_cache_mut(|cache| {
+            let batch = BatchObject::<UnCommitted>::from_batch_ptr(cache.pop().unwrap());
+            assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Idle);
+            cache.push(batch.into_inner())
+        });
+
+        let batch = pool.acquire();
+        assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
+        pool.release(batch);
+
+        // TLS is full, so releasing another acquired batch spills one idle batch to global.
+
+        let b = BatchObject::new();
+        assert_eq!(b.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
+
+        pool.release(b);
+        let b = BatchObject::<UnCommitted>::from_batch_ptr(pool.pool[0].pop().unwrap());
+        assert_eq!(b.state(Ordering::Relaxed), BatchRuntimeState::Idle);
     }
 
     #[test]
