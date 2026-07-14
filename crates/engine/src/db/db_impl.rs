@@ -19,10 +19,10 @@ use std::{marker::PhantomData, sync::Weak};
 pub(crate) struct DbImpl {
     _p: PhantomData<()>,
     //
-    version_set: VersionSet,
+    pub(super) version_set: VersionSet,
     //
     // Batch pool
-    // batch_pool: BatchPool,
+    pub(super) batch_pool: BatchPool,
 }
 
 impl DbImpl {
@@ -30,6 +30,7 @@ impl DbImpl {
         Self {
             _p: PhantomData,
             version_set: VersionSet::new(),
+            batch_pool: BatchPool::new(),
         }
     }
 

@@ -1,25 +1,14 @@
-// Global batch pool for heap allocated batches
-//
-//
-
-// 1. A batch in the pool is not visible to the write pipeline.
-// 2. A batch in the write pipeline is not visible to the pool.
-// 3. pool_next is only read/written by BatchPool.
-// 4. reset_for_reuse happens before push publishes the batch.
-// 5. acquire must clear/detach pool_next before returning the batch.
-// 6. shutdown must drain the pool and free retained batches.
-
 use std::{array, mem::MaybeUninit, ptr::NonNull};
 
 use crate::{
     db::batch::{
-        Batch, BatchCommitState, BatchObject, BatchObjectHandle, NonNullBatchPtr, UnCommitted,
-        DEFAULT_BATCH_INIT_SIZE,
+        Batch, BatchCommitState, BatchObject, BatchObjectHandle, DEFAULT_BATCH_INIT_SIZE,
+        NonNullBatchPtr, UnCommitted,
     },
     sync::{
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         cell::UnsafeCell,
-        Arc, Mutex,
     },
     thread_local_storage::{
         thread_ctx, thread_db_instance_ctx,
@@ -343,11 +332,11 @@ pub(crate) struct BatchPoolImpl<
 //   TLS registry mutex. The owner must ensure all pool and TLS accesses have
 //   quiesced before `BatchPool` and its TLS column are destroyed.
 unsafe impl<
-        const SHARDS_PER_POOL: usize,
-        const MAX_BATCH_PER_SHARD: usize,
-        const TLS_CAP: usize,
-        const TLS_TARGET_RETAINED: usize,
-    > Sync for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
+    const SHARDS_PER_POOL: usize,
+    const MAX_BATCH_PER_SHARD: usize,
+    const TLS_CAP: usize,
+    const TLS_TARGET_RETAINED: usize,
+> Sync for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
 {
 }
 
@@ -358,11 +347,11 @@ impl BatchPoolImpl {
 }
 
 impl<
-        const SHARDS_PER_POOL: usize,
-        const MAX_BATCH_PER_SHARD: usize,
-        const TLS_CAP: usize,
-        const TLS_TARGET_RETAINED: usize,
-    > BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
+    const SHARDS_PER_POOL: usize,
+    const MAX_BATCH_PER_SHARD: usize,
+    const TLS_CAP: usize,
+    const TLS_TARGET_RETAINED: usize,
+> BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
 {
     pub(crate) fn new_with_const_size() -> Self {
         Self {

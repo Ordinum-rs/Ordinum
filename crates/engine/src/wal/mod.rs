@@ -39,6 +39,9 @@ impl Default for SyncSem {
     }
 }
 
+// TODO: Finish the SyncSem
+// NOTE: I wonder if we can write a util for a sem which we can wrap in our own type?
+
 // ---- Sync Log Waiter ---- //
 //
 

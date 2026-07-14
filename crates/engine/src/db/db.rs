@@ -59,4 +59,8 @@ impl DB {
             )),
         }
     }
+
+    pub(crate) fn write(&self) {
+        //
+    }
 }

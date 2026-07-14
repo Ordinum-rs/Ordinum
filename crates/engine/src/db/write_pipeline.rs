@@ -1,6 +1,6 @@
 use std::{
     array,
-    ptr::{self, null_mut, NonNull},
+    ptr::{self, NonNull, null_mut},
     sync::atomic::AtomicBool,
 };
 
@@ -12,17 +12,17 @@ use crate::{
 };
 
 use crate::{
+    Error, Result,
     db::{
         batch::{Batch, BatchObject, Sealed},
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     },
-    sync::spin_loop,
     sync::Arc,
     sync::Condvar,
     sync::Mutex,
     sync::MutexGuard,
+    sync::spin_loop,
     utils::{self, cache_padded::CachePadded},
-    Error, Result,
 };
 
 //
@@ -121,13 +121,12 @@ impl HeadTail {
 #[derive(Debug)]
 struct BatchQueue<const N: usize> {
     head_tail: CachePadded<AtomicU64>,
+    // NOTE: We could probably make a BatchSlot newtype which provides enclosed use of AtomicPtr for the BatchQueue
     slots: [AtomicPtr<Batch>; N],
 }
 
 impl<const N: usize> BatchQueue<N> {
     //
-    pub(crate) const SIZE: usize = N;
-
     pub(crate) const fn size(&self) -> usize {
         N
     }
@@ -226,14 +225,18 @@ impl<const N: usize> BatchQueue<N> {
 // 5. WritePipeline publishes completed batches in sequence order
 //
 // This separation keeps the WritePipeline focused on ordering semantics
-// while allowing the DB layer to retain ownership of storage policy and
+// while allowing the DBImpl layer to retain ownership of storage policy and
 // lifecycle management.
+//
+// We pass a &'env Batch reference because the trait is called within the pipeline and the batch reference cannot escape outisde of it
+// the WriteEnv is not called anywhere else and so we can pass in a Batch reference here and be confident that the reference will not be
+// held on to
 pub(crate) trait WriterEnv: Send + Sync {
     //
-    // NOTE: Happens under Mutex lock
+    // Happens under Mutex lock
     fn prepare_commit<'env>(&self, batch: &'env BatchRef) -> Result<()>;
     //
-    // NOTE: No Lock - concurrent application to memtables
+    // No Lock - concurrent application to memtables
     fn apply_commit<'env>(&self, batch: &'env BatchRef) -> Result<()>;
 }
 
@@ -255,8 +258,7 @@ impl<const COUNTING_SEM_LIMIT: usize> PipelineAdmission<COUNTING_SEM_LIMIT> {
         }
     }
 
-    // This is the fast CAS path for the Semaphore without mutex locking
-    pub(super) fn try_acquire(&self) -> bool {
+    fn try_acquire(&self) -> bool {
         let mut cur = self.count.load(Ordering::Acquire);
 
         loop {
@@ -274,12 +276,13 @@ impl<const COUNTING_SEM_LIMIT: usize> PipelineAdmission<COUNTING_SEM_LIMIT> {
         }
     }
 
-    // Slow path where we wait on Mutex and CondVar for space to become available
-    pub(super) fn acquire(&self) {
+    fn acquire(&self) {
+        // This is the fast CAS path for the Semaphore without mutex locking
         if self.try_acquire() {
             return;
         }
 
+        // Slow path where we wait on Mutex and CondVar for space to become available
         let mut guard = self.sem_mu.lock().unwrap();
 
         loop {
@@ -293,7 +296,7 @@ impl<const COUNTING_SEM_LIMIT: usize> PipelineAdmission<COUNTING_SEM_LIMIT> {
         }
     }
 
-    pub(super) fn release(&self) {
+    fn release(&self) {
         let _guard = self.sem_mu.lock().unwrap();
         let prev = self.count.fetch_add(1, Ordering::AcqRel);
 
@@ -306,7 +309,7 @@ impl<const COUNTING_SEM_LIMIT: usize> PipelineAdmission<COUNTING_SEM_LIMIT> {
     }
 
     #[cfg(test)]
-    pub(super) fn available_permits(&self, ordering: Ordering) -> usize {
+    fn available_permits(&self, ordering: Ordering) -> usize {
         self.count.load(ordering) as usize
     }
 }
@@ -338,8 +341,6 @@ pub(crate) struct WritePipeline<const N: usize, E: WriterEnv> {
     // WAL sync work may be outstanding across the whole pipeline; the
     // per-batch waiter records completion for one specific batch.
     sync_sem: SyncQueueSem,
-
-    // Need sync_waiter?
 
     // Env trait
     env: Arc<E>,
@@ -388,7 +389,7 @@ where
         }
     }
 
-    pub(super) fn reserve_space(&self) {
+    fn reserve_space(&self) {
         //
         //
         // 1. loop 200 times using a "pause" for 1 micro sec
@@ -419,6 +420,18 @@ where
 
     //
 
+    /// Commits `batch` and waits until its WAL record is durable.
+    ///
+    /// This call does not return until the batch has been written to the WAL,
+    /// applied to the memtables, removed from the commit queue, and its fsync
+    /// waiter has completed. The pipeline therefore retains only a non-owning
+    /// pointer to the stable batch allocation for the duration of this call.
+    ///
+    /// The batch is borrowed rather than moved because the caller remains its
+    /// allocation owner and may reset or return it to the batch pool after this
+    /// method succeeds. Keeping ownership with the caller also keeps the
+    /// embedded sync waiter available without allocating a separate completion
+    /// handle.
     pub(crate) fn commit_sync(&self, batch: &BatchObject<Sealed>) -> Result<()> {
         // NOTE: Any assertions here?
         //
@@ -437,15 +450,28 @@ where
         todo!()
     }
 
-    pub(crate) fn commit(
-        // TODO: Commit should take a (mutable?) reference to the BatchObject so the Caller retains ownership of the underlying NonNullBatchPtr
-        // and can call Close() / Return() after commit()
-        &self,
-        batch: &BatchObject<Sealed>,
-    ) -> Result<()> {
+    /// Commits `batch` without waiting for its WAL fsync to complete.
+    ///
+    /// Before returning, the batch has been submitted to the WAL, applied to
+    /// the memtables, marked applied, and removed from the commit queue. No
+    /// pipeline component may retain a pointer into the batch allocation after
+    /// this method returns; only the WAL durability operation and its cloned
+    /// completion state may remain outstanding.
+    ///
+    /// The caller retains ownership through `BatchObject`. Borrowing is safe
+    /// because every pipeline access finishes within this call, while the
+    /// embedded sync waiter lets the caller observe the outstanding fsync later.
+    /// The batch must not be reset or returned to the pool until that waiter has
+    /// completed.
+    pub(crate) fn commit(&self, batch: &BatchObject<Sealed>) -> Result<()> {
         // NOTE: Any assertions here?
         //
         // NOTE: When we commit we do not need the type state anymore and can convert into inner heap allocated batch object
+
+        let b = batch.as_non_null();
+
+        // Need a queue and WAL token
+        self.reserve_space();
 
         // Need to try_acquire a token - if not we wait()
 
@@ -457,7 +483,8 @@ where
         Ok(())
     }
 
-    pub(crate) fn prepare(&self, batch: NonNull<Batch>) -> Result<()> {
+    // NOTE: May need a different type for Batch to pass in
+    fn prepare(&self, batch: NonNull<Batch>) -> Result<()> {
         //
         // NOTE: How do we want to hand no_sync_wait?
 
