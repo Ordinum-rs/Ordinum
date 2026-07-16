@@ -473,13 +473,21 @@ where
         // Need a queue and WAL token
         self.reserve_space();
 
-        // Need to try_acquire a token - if not we wait()
-
         // Hand off to DB which will carry out the write
 
+        // First we need to call prepare() which will:
         //
+        // - XXX: Future: Handle special cases for large batches where we might want to flush them straight away
+        // - try to optimistically reserve space in the current memtable
+        // - rotate memtable if needed
+        // - write the batch representation to the WAL
+
+        // Next we call appl() which will:
         //
-        //
+        // - XXX: How should range deletions and range keys be handled here?
+        // - call into the memtable to insert batch's operations
+        // - handle ref counts for writers on the memtable
+
         Ok(())
     }
 

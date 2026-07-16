@@ -1,14 +1,17 @@
 use std::fmt::Display;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::ptr;
 use std::ptr::NonNull;
 use std::thread::{self, Thread};
+use std::{array, ptr};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
+use crate::column_family::cf::ColumnFamilyHandle;
 use crate::db::DEFAULT_CF_ID;
 use crate::db::{self, db_impl::DbImpl};
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::memtable::memtable::{Memtable, Mutable};
 use crate::sync::Arc;
+use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::utils;
 use crate::utils::var_int::VarInt;
 use crate::wal::{SyncLogWaiter, SyncWaiter};
@@ -21,11 +24,56 @@ use super::batch_pool::BatchPool;
 pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10;
 
+const DEFAULT_INLINE_CF_ARRAY: usize = 4;
+
 // ---- Module Errors ---- //
 
-//
-//
-//
+// ---- Batch Meta ---- //
+
+struct BatchMeta {
+    first_seen_cf_id: u64,
+    multiple_cf_ids: bool,
+}
+
+// ---- Batch CF Table ---- //
+
+// TODO: Finish from here
+
+/* NOTE:
+ * It's ok to use Memtable<Mutable> here and not MemInner because the CF of that memtable will try to reserve space and rotate if it needs to
+ * meaning we agree that there will be some stranded space in that frozen memtable
+ * Other CF's will do the same to their repspective memtables
+ * Future batches will not go back to old memtables to fill the space they will continue on the current memtable
+ *
+ * XXX: Future optimisation being flushable batches to avoid wasting current memtable space
+*/
+struct CFTableEntry((u64, NonNull<Memtable<Mutable>>));
+
+struct CFTable<const INLINE_CF_ARRAY: usize = DEFAULT_INLINE_CF_ARRAY> {
+    len: usize,
+    array: [MaybeUninit<CFTableEntry>; INLINE_CF_ARRAY],
+    vec: Vec<CFTableEntry>,
+}
+
+impl<const INLINE_CF_ARRAY: usize> CFTable<INLINE_CF_ARRAY> {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            array: array::from_fn(|_| MaybeUninit::uninit()),
+            vec: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn is_inlined(&self) -> bool {
+        if self.len > INLINE_CF_ARRAY {
+            false
+        } else {
+            true
+        }
+    }
+}
+
 //
 // ---- Batch Operations Enum ---- //
 
@@ -160,16 +208,6 @@ impl Drop for NonNullBatchPtr {
         drop(unsafe { Box::from_raw(self.ptr.as_ptr()) })
     }
 }
-
-// https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
-//
-// Batch:
-// | --------- 12 byte header ----------|--------- Operations ---------|
-// | Seq No (8 bytes) | Count (4 bytes) | Operation 1 ... Operation 2...
-//
-//
-// Operation:
-// | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
 
 // ---- BatchObjectHandle ---- //
 
@@ -357,11 +395,7 @@ impl<B: BatchCommitState> BatchObject<B> {
 
     pub(crate) fn can_reset(&self) -> bool {
         let state = self.state(Ordering::Acquire);
-        if !state.is_reset_safe() {
-            false
-        } else {
-            true
-        }
+        if !state.is_reset_safe() { false } else { true }
     }
 
     // Can be called by the owner of the batch to clear and make ready for re-use, we don't explicitly shrink here because
@@ -479,7 +513,20 @@ impl BatchObject<Sealed> {
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
+//
+// Batch:
+// | --------- 12 byte header ----------|--------- Operations ---------|
+// | Seq No (8 bytes) | Count (4 bytes) | Operation 1 ... Operation 2...
+//
+//
+// Operation:
+// | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
+
+// https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 pub(super) struct Batch {
+    // ----
+    // Operaton Data
+    //
     data: Vec<u8>,
     /// The maximum total serialized size allowed for a single atomic Batch.
     ///
@@ -507,6 +554,9 @@ pub(super) struct Batch {
     //
     //
     //
+
+    // ----
+    // Commit Pipeline State
 
     // Per-batch WAL fsync completion.
     //
