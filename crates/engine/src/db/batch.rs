@@ -35,6 +35,13 @@ struct BatchMeta {
     multiple_cf_ids: bool,
 }
 
+impl BatchMeta {
+    fn clear(&mut self) {
+        self.first_seen_cf_id = 0;
+        self.multiple_cf_ids = false;
+    }
+}
+
 // ---- Batch CF Table ---- //
 
 // TODO: Finish from here
@@ -49,28 +56,22 @@ struct BatchMeta {
 */
 struct CFTableEntry((u64, NonNull<Memtable<Mutable>>));
 
-struct CFTable<const INLINE_CF_ARRAY: usize = DEFAULT_INLINE_CF_ARRAY> {
+struct CFTable {
     len: usize,
-    array: [MaybeUninit<CFTableEntry>; INLINE_CF_ARRAY],
     vec: Vec<CFTableEntry>,
 }
 
-impl<const INLINE_CF_ARRAY: usize> CFTable<INLINE_CF_ARRAY> {
+impl CFTable {
     fn new() -> Self {
         Self {
             len: 0,
-            array: array::from_fn(|_| MaybeUninit::uninit()),
             vec: Vec::new(),
         }
     }
 
-    #[inline(always)]
-    fn is_inlined(&self) -> bool {
-        if self.len > INLINE_CF_ARRAY {
-            false
-        } else {
-            true
-        }
+    fn clear(&mut self) {
+        self.len = 0;
+        self.vec.clear();
     }
 }
 
@@ -510,6 +511,10 @@ impl BatchObject<Sealed> {
     //
 }
 
+// ------------------------------------------------------------------------------------------
+
+//
+
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
@@ -548,15 +553,23 @@ pub(super) struct Batch {
     /// per-column-family basis using the batch footprint for each destination
     /// memtable.
     count: u64,
-    runtime_commit_state: AtomicU8,
     //
-    /* NOTE: Need inline array for touched column families in this batch */
     //
     //
     //
 
     // ----
+    //
+    // XXX: Indexing
+    // index: Option<NonNull<SkipList>>,
+
+    // ----
     // Commit Pipeline State
+    //
+    runtime_commit_state: AtomicU8,
+
+    batch_meta: BatchMeta,
+    cf_table: CFTable,
 
     // Per-batch WAL fsync completion.
     //
@@ -578,6 +591,11 @@ impl Batch {
             data,
             count: 0,
             runtime_commit_state: AtomicU8::new(BatchRuntimeState::Acquired as u8),
+            batch_meta: BatchMeta {
+                first_seen_cf_id: 0,
+                multiple_cf_ids: false,
+            },
+            cf_table: CFTable::new(),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
     }
@@ -592,6 +610,11 @@ impl Batch {
             data,
             count: 0,
             runtime_commit_state: AtomicU8::new(BatchRuntimeState::Acquired as u8),
+            batch_meta: BatchMeta {
+                first_seen_cf_id: 0,
+                multiple_cf_ids: false,
+            },
+            cf_table: CFTable::new(),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
     }
@@ -675,6 +698,12 @@ impl Batch {
         self.data.shrink_to(new_size);
     }
 
+    // ---- Writing ---- //
+
+    // TODO: Make prepare_with_key_value
+    // TODO: Make prepare_with_key_value_impl
+    // TODO: Make put
+
     pub(super) fn clear(&mut self) {
         // NOTE:
         // We do NOT wait on signals here - once we reach here we should have exclusive ownership and
@@ -698,6 +727,12 @@ impl Batch {
 
         // Reset the data buffer
         self.data.clear();
+
+        // Clear the batch meta and cf table
+        self.batch_meta.clear();
+        self.cf_table.clear();
+
+        //
     }
 }
 
