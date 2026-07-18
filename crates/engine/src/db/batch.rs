@@ -84,6 +84,7 @@ pub(crate) enum BatchOp {
     Put,
     Delete,
     Merge,
+    RangeDel,
     // XXX: More operations in later updates
 }
 
@@ -552,6 +553,8 @@ pub(super) struct Batch {
     /// Memtable flush and large-batch heuristics are evaluated separately on a
     /// per-column-family basis using the batch footprint for each destination
     /// memtable.
+    max_batch_size: usize,
+    //
     count: u64,
     //
     //
@@ -562,6 +565,7 @@ pub(super) struct Batch {
     //
     // XXX: Indexing
     // index: Option<NonNull<SkipList>>,
+    // range_del_index: Option<NonNull<SkipList>>,
 
     // ----
     // Commit Pipeline State
@@ -589,6 +593,7 @@ impl Batch {
         let mut data = Vec::with_capacity(DEFAULT_BATCH_INIT_SIZE);
         Self {
             data,
+            max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(BatchRuntimeState::Acquired as u8),
             batch_meta: BatchMeta {
@@ -608,6 +613,7 @@ impl Batch {
         data.extend_from_slice(&[0u8; Self::HEADER_SIZE]);
         Self {
             data,
+            max_batch_size: MAX_BATCH_SIZE,
             count: 0,
             runtime_commit_state: AtomicU8::new(BatchRuntimeState::Acquired as u8),
             batch_meta: BatchMeta {
@@ -617,6 +623,20 @@ impl Batch {
             cf_table: CFTable::new(),
             sync_waiter: Arc::new(SyncLogWaiter::default()),
         }
+    }
+
+    fn init_buffer(&mut self, capacity_hint: usize) {
+        debug_assert!(self.data.len() == 0);
+
+        let size = Self::HEADER_SIZE + capacity_hint;
+
+        // NOTE: Do we want to assert! and panic! on this? or return Error?
+        assert!(size <= MAX_BATCH_SIZE);
+
+        self.data.reserve(size);
+
+        // We've validated that we have the capacity - now we want len to start after the header so we can write operations to the region
+        self.data.resize(Self::HEADER_SIZE, 0);
     }
 
     fn seq_num(&self) -> u64 {
@@ -698,11 +718,45 @@ impl Batch {
         self.data.shrink_to(new_size);
     }
 
+    fn estimate_entry_size(&self, key_len: usize, value: usize) -> usize {
+        0
+    }
+
     // ---- Writing ---- //
 
     // TODO: Make prepare_with_key_value
-    // TODO: Make prepare_with_key_value_impl
     // TODO: Make put
+
+    fn prepare_with_key_value_impl(
+        &mut self,
+        cf_id: u64,
+        key_len: usize,
+        value_len: usize,
+        kind: BatchOp,
+    ) {
+        debug_assert!(
+            self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
+        );
+
+        // We need to make sure the batch is initialised and ready to recieve an operation if the current batch is empty
+        if self.data.len() == 0 {
+            //
+            self.init_buffer(key_len + value_len + 2 * VarInt::MAX_VARINT);
+        }
+
+        // Increment the count of operations
+        self.count += 1;
+
+        // Resolve the cf_table entry or init it
+
+        // TODO: Finish from here
+
+        // Estimte the memtable size for the cf_table entry
+
+        //
+    }
+
+    fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
 
     pub(super) fn clear(&mut self) {
         // NOTE:

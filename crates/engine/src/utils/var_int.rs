@@ -17,6 +17,8 @@ pub(crate) enum VarInt {
 }
 
 impl VarInt {
+    pub(crate) const MAX_VARINT: usize = 4;
+
     pub(crate) fn new(value: u32) -> Self {
         let mut buf = [0u8; 4];
         let mut v = value;
