@@ -1,15 +1,16 @@
+pub(crate) mod manager;
 pub(crate) mod writer;
 
 // --------------------------------------
 
-use crate::sync::atomic::AtomicBool;
-use crate::sync::atomic::AtomicU64;
-use crate::sync::atomic::AtomicU8;
-use crate::sync::atomic::Ordering;
-use crate::sync::spin_loop;
 use crate::sync::Arc;
 use crate::sync::Condvar;
 use crate::sync::Mutex;
+use crate::sync::atomic::AtomicBool;
+use crate::sync::atomic::AtomicU8;
+use crate::sync::atomic::AtomicU64;
+use crate::sync::atomic::Ordering;
+use crate::sync::spin_loop;
 use crate::{Error, Result};
 
 // TODO: Need to make SyncQueue
