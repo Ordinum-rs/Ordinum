@@ -14,7 +14,7 @@ use crate::db::write_batch::WBatch;
 use crate::iterator::internal_iterator::InternalIterator;
 use crate::key::comparator::Comparator;
 use crate::key::internal_key::{InternalKeyRef, OperationType, encode_trailer};
-use crate::memtable::skip_list::{Iter, Node, SkipList};
+use crate::utils::skiplists::mem_skip_list::{Node, SkipList};
 
 pub(crate) type MemID = u64;
 

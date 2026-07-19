@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    db::batch::{BatchRef, NonNullBatchPtr},
+    db::batch::{BatchCommitState, BatchRef, OwnedBatchPtr, SealedBatch},
     sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering},
     version::SeqNumState,
     wal::SyncQueueSem,
@@ -432,7 +432,10 @@ where
     /// method succeeds. Keeping ownership with the caller also keeps the
     /// embedded sync waiter available without allocating a separate completion
     /// handle.
-    pub(crate) fn commit_sync(&self, batch: &BatchObject<Sealed>) -> Result<()> {
+    pub(crate) fn commit_sync(
+        &self,
+        batch: /* TODO: Need to change this to take just BatchCommit<Sealed>? */ &impl SealedBatch,
+    ) -> Result<()> {
         // NOTE: Any assertions here?
         //
         // NOTE: When we commit we do not need the type state anymore and can convert into inner heap allocated batch object
@@ -463,12 +466,12 @@ where
     /// embedded sync waiter lets the caller observe the outstanding fsync later.
     /// The batch must not be reset or returned to the pool until that waiter has
     /// completed.
-    pub(crate) fn commit(&self, batch: &BatchObject<Sealed>) -> Result<()> {
+    pub(crate) fn commit(&self, batch: &impl SealedBatch) -> Result<()> {
         // NOTE: Any assertions here?
         //
         // NOTE: When we commit we do not need the type state anymore and can convert into inner heap allocated batch object
 
-        let b = batch.as_non_null();
+        let b = batch.batch_ptr();
 
         // Need a queue and WAL token
         self.reserve_space();
@@ -543,7 +546,7 @@ mod tests {
         };
 
         use crate::{
-            db::batch::{Batch, NonNullBatchPtr},
+            db::batch::{Batch, OwnedBatchPtr},
             sync::{Condvar, Mutex},
         };
 

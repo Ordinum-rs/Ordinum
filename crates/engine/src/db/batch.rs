@@ -6,6 +6,7 @@ use std::thread::{self, Thread};
 use std::{array, ptr};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
+use crate::arena::arena::Arena;
 use crate::column_family::cf::ColumnFamilyHandle;
 use crate::db::DEFAULT_CF_ID;
 use crate::db::{self, db_impl::DbImpl};
@@ -13,6 +14,7 @@ use crate::memtable::memtable::{Memtable, Mutable};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::utils;
+use crate::utils::skiplists::batch_index::BatchSkipList;
 use crate::utils::var_int::VarInt;
 use crate::wal::{SyncLogWaiter, SyncWaiter};
 use crate::{Error, Result};
@@ -144,6 +146,17 @@ impl BatchCommitState for UnCommitted {}
 pub(crate) struct Sealed {}
 impl BatchCommitState for Sealed {}
 
+pub(crate) trait SealedBatch {
+    /// Returns the stable address of the encoded Batch consumed by the pipeline.
+    fn batch_ptr(&self) -> NonNull<Batch>;
+}
+
+impl SealedBatch for BatchObject<Sealed> {
+    fn batch_ptr(&self) -> NonNull<Batch> {
+        self.as_non_null()
+    }
+}
+
 /// Owning pointer to a heap-allocated batch object.
 ///
 /// `NonNullBatchPtr` is the stable allocation identity used by the batch pool and
@@ -167,11 +180,11 @@ impl BatchCommitState for Sealed {}
 /// - Cross-thread state changes after publication must use atomics or other
 ///   synchronization.
 #[derive(Debug)]
-pub(super) struct NonNullBatchPtr {
+pub(super) struct OwnedBatchPtr {
     ptr: NonNull<Batch>,
 }
 
-impl NonNullBatchPtr {
+impl OwnedBatchPtr {
     pub(super) fn as_ptr(&self) -> *mut Batch {
         self.ptr.as_ptr()
     }
@@ -190,9 +203,9 @@ impl NonNullBatchPtr {
     }
 }
 
-impl From<NonNull<Batch>> for NonNullBatchPtr {
+impl From<NonNull<Batch>> for OwnedBatchPtr {
     fn from(ptr: NonNull<Batch>) -> Self {
-        NonNullBatchPtr { ptr }
+        OwnedBatchPtr { ptr }
     }
 }
 
@@ -202,13 +215,19 @@ impl From<NonNull<Batch>> for NonNullBatchPtr {
 // The pointer itself does not permit shared mutation. Safe APIs must preserve
 // the phase invariant: only one owner may mutate non-atomic batch state, and a
 // batch visible to the write pipeline may not be reused or destroyed.
-unsafe impl Send for NonNullBatchPtr {}
+unsafe impl Send for OwnedBatchPtr {}
 
 // NOTE: This is important - so we must carefully maintain that we are not creating UB when doing this
-impl Drop for NonNullBatchPtr {
+impl Drop for OwnedBatchPtr {
     fn drop(&mut self) {
         drop(unsafe { Box::from_raw(self.ptr.as_ptr()) })
     }
+}
+
+// NOTE To do integrate
+#[derive(Debug)]
+pub(super) struct OwnedIndexedBatchPtr {
+    ptr: NonNull<IndexedBatch>,
 }
 
 // ---- BatchObjectHandle ---- //
@@ -308,7 +327,7 @@ impl BatchObjectHandle<UnCommitted> {
 #[derive(Debug)]
 pub(crate) struct BatchObject<B: BatchCommitState> {
     _state: PhantomData<B>,
-    inner: NonNullBatchPtr,
+    inner: OwnedBatchPtr,
 }
 
 // ---- Generic Impl ---- //
@@ -330,7 +349,7 @@ impl<B: BatchCommitState> BatchObject<B> {
         self.inner.as_non_null()
     }
 
-    pub(super) fn from_batch_ptr(ptr: NonNullBatchPtr) -> Self {
+    pub(super) fn from_batch_ptr(ptr: OwnedBatchPtr) -> Self {
         Self {
             _state: PhantomData,
             inner: ptr,
@@ -435,7 +454,7 @@ impl BatchObject<UnCommitted> {
 
         Self {
             // XXX: Is there a safer way to do this - unwrap() is scary
-            inner: NonNullBatchPtr::from(NonNull::new(Box::into_raw(inner)).unwrap()),
+            inner: OwnedBatchPtr::from(NonNull::new(Box::into_raw(inner)).unwrap()),
             _state: PhantomData,
         }
     }
@@ -448,11 +467,11 @@ impl BatchObject<UnCommitted> {
         Self {
             _state: PhantomData,
             // XXX: Is there a safer way to do this - unwrap() is scary
-            inner: NonNullBatchPtr::from(NonNull::new(Box::into_raw(batch)).unwrap()),
+            inner: OwnedBatchPtr::from(NonNull::new(Box::into_raw(batch)).unwrap()),
         }
     }
 
-    pub(super) fn into_inner(self) -> NonNullBatchPtr {
+    pub(super) fn into_inner(self) -> OwnedBatchPtr {
         self.inner
     }
 
@@ -798,6 +817,20 @@ impl<'env> BatchRef<'env> {
     pub(crate) fn from_batch(batch: &'env Batch) -> Self {
         Self { batch }
     }
+}
+
+// ---- Indexed Batch ---- //
+
+// Index Batch Objects
+
+// TODO: Make the Objects
+
+pub(super) struct IndexedBatch {
+    batch: Batch,
+    arena: Arena,
+    index: BatchSkipList,
+    range_del_index: BatchSkipList,
+    //
 }
 
 #[cfg(test)]

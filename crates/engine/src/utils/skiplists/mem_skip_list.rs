@@ -81,17 +81,16 @@ pub(super) struct Header {
 }
 
 impl Header {
-    fn new(memory: *mut u8) -> Self {
-        // SAFETY: Initializes the header with a sentinel node at the given memory location
-        unsafe {
-            let header = NonNull::new_unchecked(Node::init_node(
-                NonNull::new_unchecked(memory),
-                MAX_HEAD_HEIGHT as u16,
-                0,
-                0,
-            ));
-            Self { sentinel: header }
-        }
+    fn new(arena: &Arena) -> Self {
+        // SAFETY:
+        //
+        // Node::alloc reserves and initializes a full-height sentinel
+        // node in `arena`. The arena outlives the SkipList that owns this
+        // header, so the sentinel remains valid for the list's lifetime.
+        let sentinel =
+            unsafe { NonNull::new_unchecked(Node::alloc(arena, MAX_HEAD_HEIGHT as u16, 0, 0)) };
+
+        Self { sentinel }
     }
 }
 
@@ -205,7 +204,7 @@ impl Node {
     }
 
     #[inline(always)]
-    pub(super) unsafe fn key_ptr(node: *mut Node) -> *mut u8 {
+    pub(crate) unsafe fn key_ptr(node: *mut Node) -> *mut u8 {
         let key_ptr = unsafe {
             (Self::tower_ptr(node) as *mut u8)
                 .add((*node).height as usize * std::mem::size_of::<AtomicPtr<Node>>())
@@ -234,15 +233,15 @@ impl Node {
         }
     }
 
-    pub(super) fn get_key_bytes<'a>(node: *mut Node) -> &'a [u8] {
+    pub(crate) fn get_key_bytes<'a>(node: *mut Node) -> &'a [u8] {
         unsafe { slice::from_raw_parts(Node::key_ptr(node), (*node).key_len as usize) }
     }
 
-    pub(super) fn get_value_bytes<'a>(node: *mut Node) -> &'a [u8] {
+    pub(crate) fn get_value_bytes<'a>(node: *mut Node) -> &'a [u8] {
         unsafe { slice::from_raw_parts(Node::value_ptr(node), (*node).value_len as usize) }
     }
 
-    pub(super) fn load_next(node: *mut Node, level: usize, ordering: Ordering) -> *mut Node {
+    pub(crate) fn load_next(node: *mut Node, level: usize, ordering: Ordering) -> *mut Node {
         debug_assert!(level < MAX_HEAD_HEIGHT);
         unsafe { (*Self::next(node, level)).load(ordering) }
     }
@@ -298,14 +297,14 @@ impl Default for Data {
     }
 }
 
-pub(super) struct TraversalCtx {
+pub(crate) struct TraversalCtx {
     // Searched node is Some when we find the node we're searching for - useful for insertions where we can detect duplicates
     pub(super) searched_node: Option<NonNull<Node>>,
     // Predecessors need to be *mut Node because we need to access the node and modify it's next pointers - it's ok to have *mut Node and not AtomicPtr<Node>
     // because we are not changing the node only it's tower pointers
     pub(super) predecessors: [*mut Node; MAX_HEAD_HEIGHT],
     // Successors only need to be *const Node because we only need to modify our own next pointers
-    pub(super) successors: [*const Node; MAX_HEAD_HEIGHT],
+    pub(crate) successors: [*const Node; MAX_HEAD_HEIGHT],
 }
 
 impl TraversalCtx {
@@ -328,7 +327,7 @@ impl Default for TraversalCtx {
 // TODO: describe and use diagram
 
 // SkipList
-pub(super) struct SkipList {
+pub(crate) struct SkipList {
     pub(super) head: Header,
     data: CachePadded<Data>,
     // We use Arc here because the Comparator is global law for ordering and must be shared across memtables and ssTables
@@ -363,7 +362,7 @@ pub(super) struct SkipList {
 /// Level 1 :             A        B -----> C   (found)
 
 impl SkipList {
-    pub(super) fn new(comparator: Arc<dyn Comparator>, arena: &Arena) -> Self {
+    pub(crate) fn new(comparator: Arc<dyn Comparator>, arena: &Arena) -> Self {
         let data = CachePadded {
             value: Data {
                 seed: AtomicUsize::new(Self::seed_generator(1)),
@@ -372,17 +371,14 @@ impl SkipList {
             },
         };
 
-        let head =
-            unsafe { NonNull::new_unchecked(Node::alloc(arena, MAX_HEAD_HEIGHT as u16, 0, 0)) };
-
         Self {
-            head: Header { sentinel: head },
+            head: Header::new(arena),
             data,
             comparator,
         }
     }
 
-    pub(super) fn head(&self) -> *mut Node {
+    pub(crate) fn head(&self) -> *mut Node {
         self.head.sentinel.as_ptr()
     }
 
@@ -439,7 +435,7 @@ impl SkipList {
         height
     }
 
-    pub(super) fn search(&self, key: &[u8]) -> TraversalCtx {
+    pub(crate) fn search(&self, key: &[u8]) -> TraversalCtx {
         //
 
         let mut t = TraversalCtx::default();
@@ -501,7 +497,7 @@ impl SkipList {
 
     /// Search node returns a raw pointer to the node if found, or null if not found.
     /// It is the caller's responsibility to ensure that the pointer is used correctly and not leaked.
-    pub(super) fn search_node(&self, key: &[u8]) -> *mut Node {
+    pub(crate) fn search_node(&self, key: &[u8]) -> *mut Node {
         self.search(key).successors[0] as *mut Node
     }
 
@@ -516,7 +512,7 @@ impl SkipList {
     /// Inserts a key-value pair into the skip list.
     /// This function is unsafe because it returns a raw pointer to the inserted node and it is the caller's responsibility to ensure that the pointer
     /// is used correctly and not leaked.
-    pub(super) unsafe fn insert(&self, key: &[u8], value: &[u8], arena: &Arena) -> *mut Node {
+    pub(crate) unsafe fn insert(&self, key: &[u8], value: &[u8], arena: &Arena) -> *mut Node {
         let mut traversal_ctx = self.search(key);
 
         if let Some(node) = traversal_ctx.searched_node {

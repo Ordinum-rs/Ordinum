@@ -4,6 +4,8 @@
 pub(crate) trait WALManager {
     //
     //
+    fn init(/* */);
     //
+    fn create(/* */);
     //
 }

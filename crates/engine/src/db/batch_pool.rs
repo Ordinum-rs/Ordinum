@@ -3,7 +3,7 @@ use std::{array, mem::MaybeUninit, ptr::NonNull};
 use crate::{
     db::batch::{
         Batch, BatchCommitState, BatchObject, BatchObjectHandle, DEFAULT_BATCH_INIT_SIZE,
-        NonNullBatchPtr, UnCommitted,
+        OwnedBatchPtr, UnCommitted,
     },
     sync::{
         Arc, Mutex,
@@ -98,7 +98,7 @@ pub(crate) struct ThreadBatchCache<
 > {
     pub(crate) shard_idx: Option<usize>,
     len: u8,
-    pub(crate) batches: [MaybeUninit<NonNullBatchPtr>; CACHE_CAP],
+    pub(crate) batches: [MaybeUninit<OwnedBatchPtr>; CACHE_CAP],
 }
 
 impl ThreadBatchCache {
@@ -127,7 +127,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         self.len as usize
     }
 
-    pub(super) fn push(&mut self, entry: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
+    pub(super) fn push(&mut self, entry: OwnedBatchPtr) -> Result<(), OwnedBatchPtr> {
         debug_assert!(self.len as usize <= CACHE_CAP);
 
         if self.len as usize == CACHE_CAP {
@@ -147,7 +147,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         Ok(())
     }
 
-    pub(super) fn pop(&mut self) -> Option<NonNullBatchPtr> {
+    pub(super) fn pop(&mut self) -> Option<OwnedBatchPtr> {
         debug_assert!(self.len as usize <= CACHE_CAP);
 
         if self.len == 0 {
@@ -162,7 +162,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         Some(unsafe { entry.assume_init() })
     }
 
-    fn spill_cache_to_target_retained(&mut self, mut handle: impl FnMut(NonNullBatchPtr)) {
+    fn spill_cache_to_target_retained(&mut self, mut handle: impl FnMut(OwnedBatchPtr)) {
         // Leave one slot within the target for the newly released hot batch.
         while (self.len as usize) >= TARGET_RETAINED {
             handle(self.pop().expect("cache length was above target retained"))
@@ -190,9 +190,12 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize> ThreadLocalObject
     }
 }
 
+// TODO: Need a ThreadIndexedBatchCache
+
+// TODO: Needs to be generic on either Indexed vs NonIndexed - maybe we can implement a batch ptr trait
 struct BatchPoolShardInner<const CAP: usize> {
     len: u8,
-    batches: [MaybeUninit<NonNullBatchPtr>; CAP],
+    batches: [MaybeUninit<OwnedBatchPtr>; CAP],
 }
 
 impl<const CAP: usize> BatchPoolShardInner<CAP> {
@@ -204,7 +207,7 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
     }
 
     // Must hold Mutex befor calling
-    fn pop(&mut self) -> Option<NonNullBatchPtr> {
+    fn pop(&mut self) -> Option<OwnedBatchPtr> {
         debug_assert!(self.len as usize <= CAP);
 
         if self.len == 0 {
@@ -220,7 +223,7 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
     }
 
     // Must hold Mutex before calling
-    fn push(&mut self, batch: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
+    fn push(&mut self, batch: OwnedBatchPtr) -> Result<(), OwnedBatchPtr> {
         debug_assert!(self.len as usize <= CAP);
 
         if self.len as usize == CAP {
@@ -260,12 +263,12 @@ impl<const CAP: usize> BatchPoolShard<CAP> {
         }
     }
 
-    fn pop(&self) -> Option<NonNullBatchPtr> {
+    fn pop(&self) -> Option<OwnedBatchPtr> {
         let mut inner = self.inner.lock().unwrap();
         inner.pop()
     }
 
-    fn push(&self, batch: NonNullBatchPtr) -> Result<(), NonNullBatchPtr> {
+    fn push(&self, batch: OwnedBatchPtr) -> Result<(), OwnedBatchPtr> {
         let mut inner = self.inner.lock().unwrap();
         inner.push(batch)
     }
@@ -298,6 +301,7 @@ impl BatchPoolStats {
     }
 }
 
+// TODO: Need to be generic on indexed vs non-indexed batch ptr for thread_local_ptr
 // DOCS: Need docs
 pub(crate) struct BatchPoolImpl<
     const SHARDS_PER_POOL: usize = DEFAULT_SHARDS_PER_POOL,
@@ -384,8 +388,8 @@ impl<
     fn push_to_global(
         &self,
         shard_idx: usize,
-        batch_ptr: NonNullBatchPtr,
-    ) -> Result<(), NonNullBatchPtr> {
+        batch_ptr: OwnedBatchPtr,
+    ) -> Result<(), OwnedBatchPtr> {
         //
         self.pool[shard_idx].push(batch_ptr)
         //

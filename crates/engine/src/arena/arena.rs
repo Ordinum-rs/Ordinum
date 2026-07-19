@@ -17,18 +17,20 @@
 //
 
 use std::alloc::Layout;
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::ptr::*;
+use std::slice;
 use std::sync::{
-    Mutex,
     atomic::{AtomicPtr, AtomicUsize, Ordering},
+    Mutex,
 };
 
 use crate::arena::allocator::Allocator;
 
 // Constants
 const KB: usize = 1024;
-const MB: usize = KB;
+const MB: usize = KB * 1024;
 
 //
 #[derive(Debug)]
@@ -47,14 +49,20 @@ pub enum ArenaError {
 
 #[derive(Debug)]
 struct Chunk {
-    mem: Box<[u8]>,
+    mem: UnsafeCell<Box<[u8]>>,
     bump: AtomicUsize,
 }
+
+// SAFETY:
+// Chunk memory is mutated only through ranges uniquely reserved by the atomic
+// bump counter. Published allocations never overlap, and the backing Box is
+// neither replaced nor resized while the chunk is shared.
+unsafe impl Sync for Chunk {}
 
 impl Chunk {
     fn new(mem: Box<[u8]>) -> Self {
         Self {
-            mem,
+            mem: UnsafeCell::new(mem),
             bump: AtomicUsize::new(0),
         }
     }
@@ -63,12 +71,20 @@ impl Chunk {
         self.bump.load(Ordering::Relaxed)
     }
 
-    fn get_mem(&self) -> &[u8] {
-        self.mem.as_ref()
+    fn len(&self) -> usize {
+        // SAFETY: The backing Box is never replaced or resized while shared.
+        unsafe { (&*self.mem.get()).len() }
     }
 
-    fn get_mem_ptr(&self) -> *const u8 {
-        self.mem.as_ptr()
+    fn as_mut_ptr(&self) -> *mut u8 {
+        // SAFETY: Callers write only to a range reserved by the bump counter.
+        unsafe { (&*self.mem.get()).as_ptr().cast_mut() }
+    }
+
+    unsafe fn initialized_slice(&self, len: usize) -> &[u8] {
+        // SAFETY: The caller guarantees the prefix is initialized and cannot
+        // be mutated for the lifetime of the returned slice.
+        unsafe { slice::from_raw_parts(self.as_mut_ptr().cast_const(), len) }
     }
 }
 
@@ -81,12 +97,14 @@ impl Chunk {
  */
 
 /// Arena is responsible for holding blocks of memory and managing memory allocation into those blocks. It will handle alignment and block allocation.
-/// Only Memtables will hold an arena.
+/// Long-lived owners such as memtables and indexed batches may hold an arena.
 ///
 /// Arena makes no attempt ensure pointers are not leaked or that memory being written is correclty aligned.
 /// It is the responsibility of the caller to maintain that the data written is the same as the layout provided which arena used to reserve memory for.
 ///
-/// For this reason, no specific Drop implementation is needed. Instead, we rely on memtables to implement Drop to know when an arena can be deallocated.
+/// No specific `Drop` implementation is needed: the arena owns its chunks and
+/// their boxed memory, which are released automatically when the arena is
+/// dropped.
 pub struct Arena {
     current_chunk: AtomicPtr<Chunk>,
     chunks: Mutex<Vec<Box<Chunk>>>,
@@ -144,8 +162,12 @@ impl Arena {
         }
     }
 
-    fn get_chunk(&self) -> &mut Chunk {
-        unsafe { &mut *self.current_chunk.load(Ordering::Acquire) }
+    fn get_chunk(&self) -> &Chunk {
+        // SAFETY:
+        // Every pointer stored in `current_chunk` points to a boxed Chunk owned
+        // by `chunks`. Moving the Box within the Vec does not move the Chunk,
+        // and chunks remain owned by the arena for its entire lifetime.
+        unsafe { &*self.current_chunk.load(Ordering::Acquire) }
     }
 
     #[inline(always)]
@@ -158,7 +180,7 @@ impl Arena {
             .checked_add(layout.size())
             .ok_or(ArenaError::Overflow)?;
 
-        if next > self.get_chunk().mem.len() {
+        if next > self.get_chunk().len() {
             return Err(ArenaError::Overflow);
         }
 
@@ -200,7 +222,7 @@ impl Arena {
                         // If we are ok then we can write to the arena heap by passing the aligned pointer into closure
                         //
 
-                        let base = chunk.mem.as_mut_ptr();
+                        let base = chunk.as_mut_ptr();
 
                         let ptr = unsafe { NonNull::new_unchecked(base.add(aligned)) };
 
@@ -247,7 +269,7 @@ impl Arena {
                         // If we are ok then we can write to the arena heap by passing the aligned pointer into closure
                         //
 
-                        let base = chunk.mem.as_mut_ptr();
+                        let base = chunk.as_mut_ptr();
 
                         let ptr = unsafe { NonNull::new_unchecked(base.add(aligned)) };
 
@@ -323,13 +345,48 @@ impl Arena {
         used
     }
 
+    /// Resets the arena for reuse while retaining all allocated chunks.
+    ///
+    /// The exclusive borrow ensures allocation cannot proceed concurrently
+    /// through safe code. Every pointer previously returned by this arena must
+    /// be treated as invalid after this call because subsequent allocations may
+    /// overwrite its storage. Owners must clear all pointer-based structures
+    /// backed by the arena before resetting it.
+    pub fn reset(&mut self) {
+        let chunks = self
+            .chunks
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        debug_assert!(!chunks.is_empty());
+
+        for chunk in chunks.iter_mut() {
+            *chunk.bump.get_mut() = 0;
+        }
+
+        let first_chunk = chunks
+            .first_mut()
+            .expect("an arena must retain its initial chunk")
+            .as_mut() as *mut Chunk;
+
+        *self.current_chunk.get_mut() = first_chunk;
+        *self.memory_used.get_mut() = 0;
+    }
+
+    /// Returns the initialized prefix of the current chunk.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no allocation can mutate the current chunk while
+    /// the returned slice is alive, and that every byte below the bump offset
+    /// has been initialized.
     #[inline]
-    pub fn get_current_init_slice(&self) -> &[u8] {
+    pub unsafe fn get_current_init_slice(&self) -> &[u8] {
         let chunk = self.get_chunk();
 
         let bump = chunk.get_bump();
 
-        unsafe { &*slice_from_raw_parts(chunk.mem.as_ptr(), bump) }
+        unsafe { chunk.initialized_slice(bump) }
     }
 
     pub fn print_address(&self) {
@@ -382,7 +439,7 @@ mod tests {
 
         for chunk in chunks.iter() {
             let bump = chunk.bump.load(Ordering::Relaxed);
-            assert!(bump <= chunk.mem.len());
+            assert!(bump <= chunk.len());
         }
 
         // 3. Cap respected
@@ -408,11 +465,10 @@ mod tests {
         }
 
         let chunk = arena.get_chunk();
-        let mem = chunk.get_mem();
         let bump = chunk.get_bump();
 
         assert_eq!(arena.memory_used(), 8);
-        assert!(bump <= mem.len());
+        assert!(bump <= chunk.len());
         assert!(arena.max_bytes() == 20);
         assert!(arena.number_of_blocks() == 2);
     }
@@ -487,6 +543,48 @@ mod tests {
         assert!(arena.chunks.lock().unwrap().len() == 2);
     }
 
+    #[test]
+    fn reset_reuses_retained_chunks() {
+        let mut arena = Arena::new(
+            ArenaPolicy {
+                block_size: 16,
+                cap: 32,
+            },
+            Allocator::System(SystemAllocator::new()),
+        );
+
+        let layout = Layout::from_size_align(12, 4).unwrap();
+        let first = unsafe { arena.alloc_raw(layout) };
+
+        // The second allocation cannot fit in the first chunk.
+        let _second = unsafe { arena.alloc_raw(layout) };
+
+        assert_eq!(arena.blocks_used(), 2);
+        assert_eq!(arena.memory_used(), 24);
+
+        let allocated_bytes = arena.allocated_bytes.load(Ordering::Relaxed);
+
+        arena.reset();
+
+        assert_eq!(arena.memory_used(), 0);
+        assert_eq!(
+            arena.allocated_bytes.load(Ordering::Relaxed),
+            allocated_bytes
+        );
+        assert_eq!(arena.chunks.get_mut().unwrap().len(), 2);
+        assert!(arena
+            .chunks
+            .get_mut()
+            .unwrap()
+            .iter_mut()
+            .all(|chunk| *chunk.bump.get_mut() == 0));
+
+        // Reset selects the initial chunk and reuses its first allocation.
+        let reused = unsafe { arena.alloc_raw(layout) };
+        assert_eq!(reused, first);
+        assert_eq!(arena.memory_used(), 12);
+    }
+
     // TODO: Need to write assertions for this
     #[test]
     fn tower_and_bytes() {
@@ -527,7 +625,9 @@ mod tests {
             let _ = arena.alloc_raw(Layout::new::<u8>());
         }
 
-        println!("current chunk {:?}", arena.get_current_init_slice());
+        println!("current chunk {:?}", unsafe {
+            arena.get_current_init_slice()
+        });
         println!("memory used {:?}", arena.memory_used());
     }
 }
