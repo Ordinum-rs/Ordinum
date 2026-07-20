@@ -450,7 +450,7 @@ where
         //
         //
         //
-        todo!()
+        Ok(())
     }
 
     /// Commits `batch` without waiting for its WAL fsync to complete.

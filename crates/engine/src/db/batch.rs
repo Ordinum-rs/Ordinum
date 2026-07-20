@@ -3,7 +3,7 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::thread::{self, Thread};
-use std::{array, ptr};
+use std::{array, ptr, todo};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::arena::arena::Arena;
@@ -151,10 +151,16 @@ pub(crate) trait SealedBatch {
     fn batch_ptr(&self) -> NonNull<Batch>;
 }
 
-impl SealedBatch for BatchObject<Sealed> {
+impl<P: BatchAllocation> SealedBatch for BatchObject<Sealed, P> {
     fn batch_ptr(&self) -> NonNull<Batch> {
         self.as_non_null()
     }
+}
+
+// ---- Batch Allocation Trait ---- //
+
+pub(crate) unsafe trait BatchAllocation: Send + Sized {
+    fn batch_ptr(&self) -> NonNull<Batch>;
 }
 
 /// Owning pointer to a heap-allocated batch object.
@@ -203,9 +209,24 @@ impl OwnedBatchPtr {
     }
 }
 
-impl From<NonNull<Batch>> for OwnedBatchPtr {
-    fn from(ptr: NonNull<Batch>) -> Self {
-        OwnedBatchPtr { ptr }
+impl From<Box<Batch>> for OwnedBatchPtr {
+    fn from(batch: Box<Batch>) -> Self {
+        let ptr = Box::into_raw(batch);
+
+        // SAFETY: Box::into_raw never returns a null pointer.
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+        }
+    }
+}
+
+// SAFETY:
+//
+// OwnedBatchPtr uniquely owns a Box<Batch>. The returned pointer is non-null,
+// correctly aligned, and remains valid and stable until this owner is dropped.
+unsafe impl BatchAllocation for OwnedBatchPtr {
+    fn batch_ptr(&self) -> NonNull<Batch> {
+        self.ptr
     }
 }
 
@@ -224,29 +245,101 @@ impl Drop for OwnedBatchPtr {
     }
 }
 
-// NOTE To do integrate
+// TODO: Integrate indexed batches with their caller-facing object and pool.
 #[derive(Debug)]
 pub(super) struct OwnedIndexedBatchPtr {
     ptr: NonNull<IndexedBatch>,
 }
 
-// ---- BatchObjectHandle ---- //
+impl OwnedIndexedBatchPtr {
+    pub(super) fn as_ptr(&self) -> *mut IndexedBatch {
+        self.ptr.as_ptr()
+    }
 
-pub(crate) struct BatchObjectHandle<B: BatchCommitState> {
-    pool: Arc<BatchPool>,
-    batch: BatchObject<B>,
+    pub(super) fn as_non_null(&self) -> NonNull<IndexedBatch> {
+        self.ptr
+    }
+
+    pub(super) fn batch_ptr(&self) -> NonNull<Batch> {
+        // SAFETY:
+        //
+        // `self.ptr` owns a live IndexedBatch allocation. &raw mut
+        // projects the embedded Batch field without creating an intermediate
+        // reference, and that field remains stable for the allocation's life.
+        let ptr = unsafe { &raw mut (*self.ptr.as_ptr()).batch };
+        unsafe { NonNull::new_unchecked(ptr) }
+    }
+
+    // # Safety
+    //
+    // The caller must ensure that no references or non-owning pointers to the
+    // IndexedBatch or its embedded Batch remain.
+    pub(super) unsafe fn destroy(self) {
+        drop(self);
+    }
 }
 
-impl<B: BatchCommitState> BatchObjectHandle<B> {
-    pub(crate) fn new(pool: Arc<BatchPool>, batch: BatchObject<B>) -> Self {
+impl From<Box<IndexedBatch>> for OwnedIndexedBatchPtr {
+    fn from(batch: Box<IndexedBatch>) -> Self {
+        let ptr = Box::into_raw(batch);
+
+        // SAFETY:
+        //
+        // Box::into_raw never returns a null pointer.
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+        }
+    }
+}
+
+// SAFETY:
+//
+// OwnedIndexedBatchPtr uniquely owns a Box<IndexedBatch>. `batch` is embedded
+// within that stable heap allocation and therefore remains valid until the
+// owning IndexedBatch is dropped.
+unsafe impl BatchAllocation for OwnedIndexedBatchPtr {
+    fn batch_ptr(&self) -> NonNull<Batch> {
+        unsafe { NonNull::new_unchecked(&raw mut (*self.as_ptr()).batch) }
+    }
+}
+
+// SAFETY:
+//
+// OwnedIndexedBatchPtr uniquely owns a stable IndexedBatch allocation. Moving
+// the owning pointer to another thread does not itself permit aliased access.
+unsafe impl Send for OwnedIndexedBatchPtr {}
+
+impl Drop for OwnedIndexedBatchPtr {
+    fn drop(&mut self) {
+        // TODO:
+        // If BatchSkipList gains teardown that dereferences arena-backed
+        // nodes, destroy the indexes before allowing IndexedBatch::arena to drop.
+        //
+        // SAFETY:
+        //
+        // `ptr` came from Box::into_raw in the Box conversion, and this
+        // owning wrapper is responsible for reconstructing that Box exactly once.
+        drop(unsafe { Box::from_raw(self.ptr.as_ptr()) })
+    }
+}
+
+// ---- BatchObjectHandle ---- //
+
+pub(crate) struct BatchObjectHandle<B: BatchCommitState, P: BatchAllocation = OwnedBatchPtr> {
+    pool: Arc<BatchPool>,
+    batch: BatchObject<B, P>,
+}
+
+impl<B: BatchCommitState, P: BatchAllocation> BatchObjectHandle<B, P> {
+    pub(crate) fn new(pool: Arc<BatchPool>, batch: BatchObject<B, P>) -> Self {
         Self { pool, batch }
     }
 
-    pub(crate) fn inner(&self) -> &BatchObject<B> {
+    pub(crate) fn inner(&self) -> &BatchObject<B, P> {
         &self.batch
     }
 
-    pub(crate) fn reset(mut self) -> BatchObjectHandle<UnCommitted> {
+    pub(crate) fn reset(mut self) -> BatchObjectHandle<UnCommitted, P> {
         //
         self.wait().expect("batch wait failed before reset");
 
@@ -262,7 +355,7 @@ impl<B: BatchCommitState> BatchObjectHandle<B> {
     }
 }
 
-impl BatchObjectHandle<UnCommitted> {
+impl<P: BatchAllocation> BatchObjectHandle<UnCommitted, P> {
     pub(crate) fn put<K, V>(&self, key: K, value: V)
     where
         K: AsRef<[u8]>,
@@ -271,7 +364,7 @@ impl BatchObjectHandle<UnCommitted> {
         self.batch.put(key, value);
     }
 
-    pub(crate) fn seal(self) -> BatchObjectHandle<Sealed> {
+    pub(crate) fn seal(self) -> BatchObjectHandle<Sealed, P> {
         BatchObjectHandle {
             pool: self.pool,
             batch: self.batch.seal(),
@@ -325,16 +418,16 @@ impl BatchObjectHandle<UnCommitted> {
 /// A batch allocation must remain alive and must not return to the pool while it
 /// is visible to the WritePipeline or while another thread may still access it.
 #[derive(Debug)]
-pub(crate) struct BatchObject<B: BatchCommitState> {
+pub(crate) struct BatchObject<B: BatchCommitState, P: BatchAllocation = OwnedBatchPtr> {
     _state: PhantomData<B>,
-    inner: OwnedBatchPtr,
+    inner: P,
 }
 
 // ---- Generic Impl ---- //
 
-impl<B: BatchCommitState> BatchObject<B> {
+impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
     //
-    fn transition<S: BatchCommitState>(self) -> BatchObject<S> {
+    fn transition<S: BatchCommitState>(self) -> BatchObject<S, P> {
         BatchObject {
             _state: PhantomData,
             inner: self.inner,
@@ -342,18 +435,11 @@ impl<B: BatchCommitState> BatchObject<B> {
     }
 
     pub(super) fn as_ptr(&self) -> *mut Batch {
-        self.inner.as_ptr()
+        self.inner.batch_ptr().as_ptr()
     }
 
     pub(super) fn as_non_null(&self) -> NonNull<Batch> {
-        self.inner.as_non_null()
-    }
-
-    pub(super) fn from_batch_ptr(ptr: OwnedBatchPtr) -> Self {
-        Self {
-            _state: PhantomData,
-            inner: ptr,
-        }
+        self.inner.batch_ptr()
     }
 
     /// Atomically sets the runtime state on the heap-allocated batch.
@@ -422,7 +508,7 @@ impl<B: BatchCommitState> BatchObject<B> {
     // Can be called by the owner of the batch to clear and make ready for re-use, we don't explicitly shrink here because
     // If a caller wants reuse immediately for a similar workload then we waste resources changes capacity for it return back to the same again potentially
     // A much better approach is to provide two different API points which allow for the explicit resizing
-    pub(crate) fn reset_batch(mut self) -> BatchObject<UnCommitted> {
+    pub(crate) fn reset_batch(mut self) -> BatchObject<UnCommitted, P> {
         //
         // Check our state
         debug_assert!(self.state(Ordering::Acquire).is_reset_safe());
@@ -444,34 +530,62 @@ impl<B: BatchCommitState> BatchObject<B> {
 //
 // ---- Uncommitted ---- //
 
-impl BatchObject<UnCommitted> {
-    fn default_cf() -> VarInt {
-        VarInt::new(DEFAULT_CF_ID)
-    }
-
+impl BatchObject<UnCommitted, OwnedBatchPtr> {
     pub(super) fn new() -> Self {
         let inner = Box::new(Batch::new());
 
         Self {
-            // XXX: Is there a safer way to do this - unwrap() is scary
-            inner: OwnedBatchPtr::from(NonNull::new(Box::into_raw(inner)).unwrap()),
             _state: PhantomData,
+            inner: OwnedBatchPtr::from(inner),
         }
     }
 
     pub(super) fn new_with_capacity(cap: usize) -> Self {
-        let batch = Box::new(Batch::new_with_capacity(cap));
+        let inner = Box::new(Batch::new_with_capacity(cap));
+        Self {
+            _state: PhantomData,
+            inner: OwnedBatchPtr::from(inner),
+        }
+    }
+}
 
-        //
+impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
+    pub(super) fn new() -> Self {
+        let inner = Box::new(IndexedBatch::new());
 
         Self {
             _state: PhantomData,
-            // XXX: Is there a safer way to do this - unwrap() is scary
-            inner: OwnedBatchPtr::from(NonNull::new(Box::into_raw(batch)).unwrap()),
+            inner: OwnedIndexedBatchPtr::from(inner),
         }
     }
 
-    pub(super) fn into_inner(self) -> OwnedBatchPtr {
+    pub(super) fn new_with_capacity() -> Self {
+        // NOTE: How does changing the capacity effect the index and arena?
+        let inner = Box::new(IndexedBatch::new());
+
+        Self {
+            _state: PhantomData,
+            inner: OwnedIndexedBatchPtr::from(inner),
+        }
+    }
+}
+
+impl<P: BatchAllocation> BatchObject<UnCommitted, P> {
+    fn default_cf() -> VarInt {
+        VarInt::new(DEFAULT_CF_ID)
+    }
+
+    pub(super) fn acquire(inner: P) -> Self {
+        let object = Self {
+            inner,
+            _state: PhantomData,
+        };
+
+        unsafe { object.set_runtime_state(BatchRuntimeState::Acquired, Ordering::Release) };
+        object
+    }
+
+    pub(super) fn into_inner(self) -> P {
         self.inner
     }
 
@@ -504,7 +618,7 @@ impl BatchObject<UnCommitted> {
         // TODO: Finish this when we have column families and can use a resolver
     }
 
-    pub(crate) fn seal(self) -> BatchObject<Sealed> {
+    pub(crate) fn seal(self) -> BatchObject<Sealed, P> {
         BatchObject {
             _state: PhantomData,
             inner: self.inner,
@@ -527,7 +641,7 @@ impl BatchObject<UnCommitted> {
 
 // ---- Sealed ---- //
 
-impl BatchObject<Sealed> {
+impl<P: BatchAllocation> BatchObject<Sealed, P> {
     //
 }
 
@@ -833,13 +947,19 @@ pub(super) struct IndexedBatch {
     //
 }
 
+impl IndexedBatch {
+    fn new() -> Self {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn batch_ptr_drop() {
-        let b = BatchObject::new();
+        let b = BatchObject::<UnCommitted, OwnedBatchPtr>::new();
 
         let b_ptr = b.as_non_null();
         let b_ptr2 = b.as_non_null();
@@ -849,7 +969,7 @@ mod tests {
 
     #[test]
     fn batch_new() {
-        let mut batch = BatchObject::new();
+        let mut batch = BatchObject::<UnCommitted, OwnedBatchPtr>::new();
         let b_ref = unsafe { &*batch.as_ptr() };
         assert!(b_ref.count == 0);
     }
@@ -869,7 +989,7 @@ mod tests {
     #[should_panic]
     #[test]
     fn batch_object_reset_error() {
-        let batch = BatchObject::new();
+        let batch = BatchObject::<UnCommitted, OwnedBatchPtr>::new();
 
         unsafe { batch.set_runtime_state(BatchRuntimeState::InQueue, Ordering::Relaxed) };
 
@@ -880,7 +1000,7 @@ mod tests {
 
     #[test]
     fn assign_seq_num() {
-        let mut batch = BatchObject::new_with_capacity(10);
+        let mut batch = BatchObject::<UnCommitted, OwnedBatchPtr>::new_with_capacity(10);
 
         let b_ref = unsafe { &*batch.as_ptr() };
 

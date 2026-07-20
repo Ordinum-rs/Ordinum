@@ -497,22 +497,9 @@ impl<
     }
 
     pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
-        // 0. Assertions
-
         self.thread_local_batch_cache_mut(|cache| {
-            // 1. Try acquire from TLS cache
-            //    - Return immediately on hit
-            match self.try_acquire_from_tls(cache).or_else(|| {
-                // 2. Try to refill from pool
-                Some(self.refill_tls_cache(cache))
-            }) {
-                Some(batch) => {
-                    return batch;
-                }
-                None => {
-                    panic!("Could not acquire from TLS or Pool and could not Allocate")
-                }
-            }
+            self.try_acquire_from_tls(cache)
+                .unwrap_or_else(|| self.refill_tls_cache(cache))
         })
     }
 
