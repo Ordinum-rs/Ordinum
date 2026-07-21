@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::db::batch::BatchObjectHandle;
+    use crate::db::batch::Batch;
     use crate::{Error, Result};
     use crate::{
         db::{
@@ -46,7 +46,7 @@ mod tests {
         // ============================================
 
         let batch = pool.acquire();
-        let b = BatchObjectHandle::new(Arc::clone(&pool), batch);
+        let b = Batch::new(Arc::clone(&pool), batch);
 
         b.put(b"Hello", b"There");
 

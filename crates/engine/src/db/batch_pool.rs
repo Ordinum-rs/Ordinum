@@ -1,8 +1,9 @@
-use std::{array, mem::MaybeUninit, ptr::NonNull};
+use std::{array, mem::MaybeUninit, ptr::NonNull, todo};
 
 use crate::{
     db::batch::{
-        Batch, BatchCommitState, BatchObject, BatchObjectHandle, DEFAULT_BATCH_INIT_SIZE,
+        Batch, BatchAllocation, BatchCommitState, BatchFactory, BatchInner, BatchObject,
+        DEFAULT_BATCH_INIT_SIZE, IndexedBatch, IndexedBatchFactory, OwnedBatchFactory,
         OwnedBatchPtr, UnCommitted,
     },
     sync::{
@@ -46,14 +47,14 @@ const DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_C
 // - no diving (lol)
 //
 // Acquire:
-// - Try to pop one Batch from the thread-local cache.
+// - Try to pop one allocation from the thread-local cache.
 // - If TLS is empty, refill TLS from this thread's assigned shard.
-// - If the shard is empty, allocate a new Box<Batch>.
-// - Return one exclusively-owned Batch to the caller.
+// - If the shard is empty, ask the pool's BatchFactory for a new allocation.
+// - Return one exclusively-owned BatchObject to the caller.
 //
 // Release:
-// - The Batch must already be in a terminal completion state.
-// - Sanitise/reset the Batch.
+// - The batch must already be in a reset-safe completion state.
+// - Clear the batch and apply the pool's retention policy.
 // - If its retained buffers exceed the retention limit, destroy it.
 // - Otherwise push it into TLS.
 // - If TLS exceeds its cap, spill approximately half into the assigned shard
@@ -61,16 +62,15 @@ const DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_C
 // - If the shard exceeds its cap, destroy the overflow.
 //
 // Invariants:
-// - Batches are allocated with Box::new and converted with Box::into_raw.
-// - TLS and shard pools store only NonNull<Batch>; they track availability, not active use.
-// - An acquired Batch is exclusively owned by the caller/pipeline.
-// - A Batch may not be returned while it is queued, WAL-pending, memtable-pending,
+// - TLS and shard pools own `F::Allocation` values; they track availability,
+//   not active use.
+// - An acquired allocation is exclusively owned by the caller/pipeline.
+// - An allocation may not be returned while it is queued, WAL-pending, memtable-pending,
 //   publish-pending, signal-pending, or externally observable through a live handle.
-// - Returning a Batch requires that no thread can still wait on it, inspect it,
+// - Returning an allocation requires that no thread can still wait on it, inspect it,
 //   reset it, or dereference any pointer/reference into it.
-// - After return, the pool owns the Batch and may hand it to another writer immediately.
-// - The pool may destroy returned batches using Box::from_raw when retention limits
-//   are exceeded.
+// - After return, the pool may hand the allocation to another writer immediately
+//   or destroy it by dropping its owning allocation wrapper.
 // - Thread-local caches are drained when the tls thread row drops: batches may be returned
 //   to the global shard or destroyed according to the pool's retention policy.
 
@@ -82,8 +82,8 @@ const DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_C
 /// cache, so len and the MaybeUninit array do not need atomic synchronization.
 ///
 /// The cache owns up to CACHE_CAP reusable heap-allocated batches. Entries are
-/// stored as NonNullBatchPtr inside MaybeUninit slots so push/pop can manage the
-/// initialized prefix without allocating a Vec.
+/// stored as owning `BatchAllocation` values inside `MaybeUninit` slots so
+/// push/pop can manage the initialized prefix without allocating a `Vec`.
 ///
 /// CACHE_CAP is the hard per-thread capacity. TARGET_RETAINED is the number of
 /// batches this cache should keep after spilling excess entries back to the
@@ -95,10 +95,11 @@ const DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_C
 pub(crate) struct ThreadBatchCache<
     const CACHE_CAP: usize = DEFAULT_THREAD_BATCH_CACHE_CAPACITY,
     const TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
+    P: BatchAllocation = OwnedBatchPtr,
 > {
     pub(crate) shard_idx: Option<usize>,
     len: u8,
-    pub(crate) batches: [MaybeUninit<OwnedBatchPtr>; CACHE_CAP],
+    pub(crate) batches: [MaybeUninit<P>; CACHE_CAP],
 }
 
 impl ThreadBatchCache {
@@ -107,8 +108,8 @@ impl ThreadBatchCache {
     }
 }
 
-impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
-    ThreadBatchCache<CACHE_CAP, TARGET_RETAINED>
+impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize, P: BatchAllocation>
+    ThreadBatchCache<CACHE_CAP, TARGET_RETAINED, P>
 {
     pub(crate) fn new_with_const_size() -> Self {
         debug_assert!(CACHE_CAP > 0);
@@ -127,7 +128,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         self.len as usize
     }
 
-    pub(super) fn push(&mut self, entry: OwnedBatchPtr) -> Result<(), OwnedBatchPtr> {
+    pub(super) fn push(&mut self, entry: P) -> Result<(), P> {
         debug_assert!(self.len as usize <= CACHE_CAP);
 
         if self.len as usize == CACHE_CAP {
@@ -138,7 +139,8 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         // the pointer with its previous state unchanged. On success, this cache
         // takes exclusive ownership and marks the live allocation idle before
         // publishing it in the initialized cache prefix.
-        unsafe { &*entry.as_ptr() }
+
+        unsafe { &*entry.batch_ptr().as_ptr() }
             .set_runtime_state(super::batch::BatchRuntimeState::Idle, Ordering::Release);
 
         self.batches[self.len as usize].write(entry);
@@ -147,7 +149,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         Ok(())
     }
 
-    pub(super) fn pop(&mut self) -> Option<OwnedBatchPtr> {
+    pub(super) fn pop(&mut self) -> Option<P> {
         debug_assert!(self.len as usize <= CACHE_CAP);
 
         if self.len == 0 {
@@ -162,7 +164,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
         Some(unsafe { entry.assume_init() })
     }
 
-    fn spill_cache_to_target_retained(&mut self, mut handle: impl FnMut(OwnedBatchPtr)) {
+    fn spill_cache_to_target_retained(&mut self, mut handle: impl FnMut(P)) {
         // Leave one slot within the target for the newly released hot batch.
         while (self.len as usize) >= TARGET_RETAINED {
             handle(self.pop().expect("cache length was above target retained"))
@@ -170,35 +172,29 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize>
     }
 }
 
-impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize> ThreadLocalObject
-    for ThreadBatchCache<CACHE_CAP, TARGET_RETAINED>
+impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize, P: BatchAllocation> ThreadLocalObject
+    for ThreadBatchCache<CACHE_CAP, TARGET_RETAINED, P>
 {
     fn handler() -> Option<UnrefHandler> {
         Some(Self::unref_erased)
     }
 
     unsafe fn unref(ptr: *mut Self) {
-        // Need to drop the entries in the batch cache first before dropping the
-        // batch container
+        // Drain the initialized prefix before dropping the cache container.
         let mut entry = unsafe { Box::from_raw(ptr) };
 
         for i in 0..entry.len as usize {
-            // Each entry is a NonNullBatchPtr which is a NonNull<Batch> to Batch Memory
-            // It has a drop implementation which safely destroys the NonNullBatchPtr
             unsafe { entry.batches[i].assume_init_read() };
         }
     }
 }
 
-// TODO: Need a ThreadIndexedBatchCache
-
-// TODO: Needs to be generic on either Indexed vs NonIndexed - maybe we can implement a batch ptr trait
-struct BatchPoolShardInner<const CAP: usize> {
+struct BatchPoolShardInner<const CAP: usize, P: BatchAllocation = OwnedBatchPtr> {
     len: u8,
-    batches: [MaybeUninit<OwnedBatchPtr>; CAP],
+    batches: [MaybeUninit<P>; CAP],
 }
 
-impl<const CAP: usize> BatchPoolShardInner<CAP> {
+impl<const CAP: usize, P: BatchAllocation> BatchPoolShardInner<CAP, P> {
     fn new() -> Self {
         Self {
             len: 0,
@@ -207,7 +203,7 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
     }
 
     // Must hold Mutex befor calling
-    fn pop(&mut self) -> Option<OwnedBatchPtr> {
+    fn pop(&mut self) -> Option<P> {
         debug_assert!(self.len as usize <= CAP);
 
         if self.len == 0 {
@@ -223,7 +219,7 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
     }
 
     // Must hold Mutex before calling
-    fn push(&mut self, batch: OwnedBatchPtr) -> Result<(), OwnedBatchPtr> {
+    fn push(&mut self, batch: P) -> Result<(), P> {
         debug_assert!(self.len as usize <= CAP);
 
         if self.len as usize == CAP {
@@ -235,7 +231,7 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
         // the pointer with its previous state unchanged. On success, this shard
         // takes exclusive ownership while its mutex is held and marks the live
         // allocation idle before publishing it in the shard array.
-        unsafe { &*batch.as_ptr() }
+        unsafe { &*batch.batch_ptr().as_ptr() }
             .set_runtime_state(crate::db::batch::BatchRuntimeState::Idle, Ordering::Release);
 
         let idx = self.len as usize;
@@ -247,11 +243,11 @@ impl<const CAP: usize> BatchPoolShardInner<CAP> {
     }
 }
 
-struct BatchPoolShard<const CAP: usize> {
-    inner: Mutex<BatchPoolShardInner<CAP>>,
+struct BatchPoolShard<const CAP: usize, P: BatchAllocation = OwnedBatchPtr> {
+    inner: Mutex<BatchPoolShardInner<CAP, P>>,
 }
 
-impl<const CAP: usize> BatchPoolShard<CAP> {
+impl<const CAP: usize, P: BatchAllocation> BatchPoolShard<CAP, P> {
     fn new() -> Self {
         debug_assert!(CAP > 0);
         debug_assert!(CAP <= u8::MAX as usize);
@@ -263,12 +259,12 @@ impl<const CAP: usize> BatchPoolShard<CAP> {
         }
     }
 
-    fn pop(&self) -> Option<OwnedBatchPtr> {
+    fn pop(&self) -> Option<P> {
         let mut inner = self.inner.lock().unwrap();
         inner.pop()
     }
 
-    fn push(&self, batch: OwnedBatchPtr) -> Result<(), OwnedBatchPtr> {
+    fn push(&self, batch: P) -> Result<(), P> {
         let mut inner = self.inner.lock().unwrap();
         inner.push(batch)
     }
@@ -301,31 +297,33 @@ impl BatchPoolStats {
     }
 }
 
-// TODO: Need to be generic on indexed vs non-indexed batch ptr for thread_local_ptr
 // DOCS: Need docs
 pub(crate) struct BatchPoolImpl<
     const SHARDS_PER_POOL: usize = DEFAULT_SHARDS_PER_POOL,
     const MAX_BATCH_PER_SHARD: usize = DEFAULT_MAX_BATCHES_PER_SHARD,
     const TLS_CAP: usize = DEFAULT_THREAD_BATCH_CACHE_CAPACITY,
     const TLS_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
+    F: BatchFactory = OwnedBatchFactory,
 > {
     //
-    pool: [CachePadded<BatchPoolShard<MAX_BATCH_PER_SHARD>>; SHARDS_PER_POOL],
+    pool: [CachePadded<BatchPoolShard<MAX_BATCH_PER_SHARD, F::Allocation>>; SHARDS_PER_POOL],
+
+    factory: F,
     //
     next_shard: AtomicUsize,
     //
     stats: BatchPoolStats,
     //
-    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>>,
+    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>>,
 }
 
 // SAFETY:
 //
 // All mutable state shared through `BatchPool` is synchronized:
 //
-// - Each global shard protects its length and pointer array with a mutex.
-//   A shard operation only transfers ownership of a `NonNullBatchPtr`; the
-//   mutex does not synchronize access to the pointed-to `Batch`.
+// - Each global shard protects its length and allocation array with a mutex.
+//   A shard operation only transfers allocation ownership; the mutex does not
+//   synchronize access to the pointed-to `BatchInner`.
 // - The batch ownership protocol guarantees that a batch retained by a shard
 //   or TLS cache has no active owner or outstanding references.
 // - `next_shard` and pool statistics are accessed atomically.
@@ -340,14 +338,9 @@ unsafe impl<
     const MAX_BATCH_PER_SHARD: usize,
     const TLS_CAP: usize,
     const TLS_TARGET_RETAINED: usize,
-> Sync for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
+    F: BatchFactory,
+> Sync for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
 {
-}
-
-impl BatchPoolImpl {
-    pub(crate) fn new() -> Self {
-        Self::new_with_const_size()
-    }
 }
 
 impl<
@@ -355,11 +348,13 @@ impl<
     const MAX_BATCH_PER_SHARD: usize,
     const TLS_CAP: usize,
     const TLS_TARGET_RETAINED: usize,
-> BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED>
+    F: BatchFactory,
+> BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
 {
-    pub(crate) fn new_with_const_size() -> Self {
+    pub(crate) fn new_with_const_size(factory: F) -> Self {
         Self {
             pool: array::from_fn(|_| CachePadded::new(BatchPoolShard::new())),
+            factory,
             next_shard: AtomicUsize::new(0),
             stats: BatchPoolStats::default(),
 
@@ -369,7 +364,7 @@ impl<
 
     fn assign_shard_idx(
         &self,
-        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>,
     ) -> usize {
         let id = self.next_shard.fetch_add(1, Ordering::Relaxed) % SHARDS_PER_POOL;
         cache.shard_idx = Some(id);
@@ -378,7 +373,7 @@ impl<
 
     fn shard_idx_for_cache(
         &self,
-        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>,
     ) -> usize {
         cache
             .shard_idx
@@ -388,16 +383,16 @@ impl<
     fn push_to_global(
         &self,
         shard_idx: usize,
-        batch_ptr: OwnedBatchPtr,
-    ) -> Result<(), OwnedBatchPtr> {
+        batch_ptr: F::Allocation,
+    ) -> Result<(), F::Allocation> {
         //
         self.pool[shard_idx].push(batch_ptr)
         //
     }
 
-    fn thread_local_batch_cache_mut<F, R>(&self, f: F) -> R
+    fn thread_local_batch_cache_mut<C, R>(&self, f: C) -> R
     where
-        F: FnOnce(&mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>) -> R,
+        C: FnOnce(&mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>) -> R,
     {
         // SAFETY:
         // The initializer transfers a valid boxed cache into this TLP's
@@ -409,9 +404,11 @@ impl<
             self.thread_local_ptr.get_or_init_mut(
                 // We pass in an initaliser for thread local to use to init() if we don't yet have an initialised cache entry
                 || {
-                    let cache = Box::new(
-                        ThreadBatchCache::<TLS_CAP, TLS_TARGET_RETAINED>::new_with_const_size(),
-                    );
+                    let cache = Box::new(ThreadBatchCache::<
+                        TLS_CAP,
+                        TLS_TARGET_RETAINED,
+                        F::Allocation,
+                    >::new_with_const_size());
                     NonNull::new_unchecked(Box::into_raw(cache))
                 },
                 //
@@ -423,14 +420,13 @@ impl<
 
     fn try_acquire_from_tls(
         &self,
-        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
-    ) -> Option<BatchObject<UnCommitted>> {
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>,
+    ) -> Option<BatchObject<UnCommitted, F::Allocation>> {
         cache.pop().map(|ptr| {
             // Removing the pointer from the calling thread's cache transfers
             // exclusive ownership to the returned BatchObject. Transition it
             // before the object can escape to caller code.
-            let batch = BatchObject::from_batch_ptr(ptr);
-            batch.set_acquired_state();
+            let batch = BatchObject::acquire(ptr);
             batch
         })
         //
@@ -438,8 +434,8 @@ impl<
 
     fn refill_tls_cache(
         &self,
-        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
-    ) -> BatchObject<UnCommitted> {
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>,
+    ) -> BatchObject<UnCommitted, F::Allocation> {
         // First get the batches from the shard
         let shard = &self.pool[self.shard_idx_for_cache(cache)];
 
@@ -454,7 +450,7 @@ impl<
             }
             None => {
                 allocated += 1;
-                BatchObject::new().into_inner()
+                self.factory.allocate()
             }
         };
 
@@ -491,12 +487,10 @@ impl<
         // `returnable_batch` is now owned only by this stack frame, whether it
         // came from the locked shard or a fresh allocation. Mark it acquired
         // before exposing the owning BatchObject to the caller.
-        let b = BatchObject::from_batch_ptr(returnable_batch);
-        b.set_acquired_state();
-        b
+        BatchObject::acquire(returnable_batch)
     }
 
-    pub(crate) fn acquire(&self) -> BatchObject<UnCommitted> {
+    pub(crate) fn acquire(&self) -> BatchObject<UnCommitted, F::Allocation> {
         self.thread_local_batch_cache_mut(|cache| {
             self.try_acquire_from_tls(cache)
                 .unwrap_or_else(|| self.refill_tls_cache(cache))
@@ -507,17 +501,17 @@ impl<
 
     fn try_return_to_cache(
         &self,
-        batch: BatchObject<UnCommitted>,
-        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED>,
-    ) -> Result<(), BatchObject<UnCommitted>> {
+        batch: BatchObject<UnCommitted, F::Allocation>,
+        cache: &mut ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>,
+    ) -> Result<(), BatchObject<UnCommitted, F::Allocation>> {
         //
         cache
             .push(batch.into_inner())
-            .map_err(|b_ptr| BatchObject::from_batch_ptr(b_ptr))
+            .map_err(|b_ptr| BatchObject::acquire(b_ptr))
         //
     }
 
-    pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B>) {
+    pub(crate) fn release<B: BatchCommitState>(&self, batch: BatchObject<B, F::Allocation>) {
         //
         // This only resets the TypeState - we need to also think about resize here
         let mut batch = batch.reset_batch();
@@ -552,9 +546,10 @@ impl<
                     });
 
                     // Once we are done we should push the hot batch back into the cache
-                    cache
-                        .push(batch)
-                        .expect("spilling TLS cache must leave room for released batch");
+                    if let Err(batch) = cache.push(batch) {
+                        drop(batch);
+                        unreachable!("spilling TLS cache must leave room for released batch");
+                    }
 
                     return ();
                 }
@@ -569,7 +564,39 @@ pub(crate) type BatchPool = BatchPoolImpl<
     DEFAULT_MAX_BATCHES_PER_SHARD,
     DEFAULT_THREAD_BATCH_CACHE_CAPACITY,
     DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
+    OwnedBatchFactory,
 >;
+
+impl BatchPoolImpl {
+    pub(crate) fn new() -> Self {
+        Self::new_with_const_size(OwnedBatchFactory)
+    }
+
+    // TODO: Add comments as to why we can only do this here
+    pub(crate) fn acquire_batch(self: &Arc<Self>) -> Batch<UnCommitted> {
+        Batch::new(Arc::clone(self), self.acquire())
+    }
+}
+
+/// Indexed Batch pool configuration used by the engine.
+pub(crate) type IndexedBatchPool = BatchPoolImpl<
+    DEFAULT_SHARDS_PER_POOL,
+    DEFAULT_MAX_BATCHES_PER_SHARD,
+    DEFAULT_THREAD_BATCH_CACHE_CAPACITY,
+    DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
+    IndexedBatchFactory,
+>;
+
+impl IndexedBatchPool {
+    pub(crate) fn new() -> Self {
+        Self::new_with_const_size(IndexedBatchFactory)
+    }
+
+    // TODO: Add comments as to why we can only do this here
+    pub(crate) fn acquire_batch(self: &Arc<Self>) -> IndexedBatch<UnCommitted> {
+        IndexedBatch::new(Arc::clone(self), self.acquire())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -590,8 +617,8 @@ mod tests {
 
                 assert!(result.is_none());
 
-                // If we manually insert a Batch into the tls cache then we should get a Wrapped BatchObject<Uncommitted>
-                cache.push(BatchObject::new().into_inner());
+                // A cached allocation is returned as an acquired BatchObject.
+                cache.push(BatchObject::<UnCommitted>::new().into_inner());
             })
         });
 
@@ -611,7 +638,9 @@ mod tests {
 
         let mut pool = BatchPool::new();
 
-        pool.pool[0].push(BatchObject::new().into_inner()).unwrap();
+        pool.pool[0]
+            .push(BatchObject::<UnCommitted>::new().into_inner())
+            .unwrap();
 
         thread::scope(|s| {
             let batch = pool.acquire();
@@ -679,12 +708,14 @@ mod tests {
         let mut thread_batch = ThreadBatchCache::<4, 2>::new_with_const_size();
 
         for _ in 0..4 {
-            thread_batch.push(BatchObject::new().into_inner()).unwrap();
+            thread_batch
+                .push(BatchObject::<UnCommitted>::new().into_inner())
+                .unwrap();
         }
 
         assert_eq!(thread_batch.cache_len(), 4);
 
-        let hot_batch = BatchObject::new().into_inner();
+        let hot_batch = BatchObject::<UnCommitted>::new().into_inner();
         let hot_ptr = hot_batch.as_ptr();
         let mut spilled = Vec::new();
 
@@ -708,15 +739,15 @@ mod tests {
 
         // Even though we have 2 batches per global pool we set the cache retained to 2 and cap to 2 so there is no spill
         // Therefore if we fill up cache and then try to release one more batch it should be put in the global pool and nothing should spill or be destroyed
-        let mut bp = BatchPoolImpl::<2, 2, 2, 2>::new_with_const_size();
+        let mut bp = BatchPoolImpl::<2, 2, 2, 2>::new_with_const_size(OwnedBatchFactory);
 
         // Fill up the tls cache so we have to spill to global
         bp.thread_local_batch_cache_mut(|cache| {
-            let _ = cache.push(BatchObject::new().into_inner());
-            let _ = cache.push(BatchObject::new().into_inner());
+            let _ = cache.push(BatchObject::<UnCommitted>::new().into_inner());
+            let _ = cache.push(BatchObject::<UnCommitted>::new().into_inner());
         });
 
-        let caller_owned_batch = BatchObject::new();
+        let caller_owned_batch = BatchObject::<UnCommitted>::new();
 
         bp.release(caller_owned_batch);
 
@@ -729,7 +760,7 @@ mod tests {
         // Acquire = Idle -> Acquired
         // Release = Acquired -> Idle
 
-        let pool = BatchPoolImpl::<1, 1, 1, 1>::new_with_const_size();
+        let pool = BatchPoolImpl::<1, 1, 1, 1>::new_with_const_size(OwnedBatchFactory);
 
         let batch = pool.acquire();
         assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
@@ -737,8 +768,8 @@ mod tests {
         pool.release(batch);
 
         pool.thread_local_batch_cache_mut(|cache| {
-            let batch = BatchObject::<UnCommitted>::from_batch_ptr(cache.pop().unwrap());
-            assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Idle);
+            let batch = BatchObject::<UnCommitted>::acquire(cache.pop().unwrap());
+            assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
             cache.push(batch.into_inner())
         });
 
@@ -748,12 +779,12 @@ mod tests {
 
         // TLS is full, so releasing another acquired batch spills one idle batch to global.
 
-        let b = BatchObject::new();
+        let b = BatchObject::<UnCommitted>::new();
         assert_eq!(b.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
 
         pool.release(b);
-        let b = BatchObject::<UnCommitted>::from_batch_ptr(pool.pool[0].pop().unwrap());
-        assert_eq!(b.state(Ordering::Relaxed), BatchRuntimeState::Idle);
+        let b = BatchObject::<UnCommitted>::acquire(pool.pool[0].pop().unwrap());
+        assert_eq!(b.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
     }
 
     #[test]

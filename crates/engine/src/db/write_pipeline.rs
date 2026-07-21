@@ -14,7 +14,7 @@ use crate::{
 use crate::{
     Error, Result,
     db::{
-        batch::{Batch, BatchObject, Sealed},
+        batch::{BatchInner, BatchObject, Sealed},
         options::DEFAULT_WRITE_PIPELINE_CAPACITY_SIZE,
     },
     sync::Arc,
@@ -122,7 +122,7 @@ impl HeadTail {
 struct BatchQueue<const N: usize> {
     head_tail: CachePadded<AtomicU64>,
     // NOTE: We could probably make a BatchSlot newtype which provides enclosed use of AtomicPtr for the BatchQueue
-    slots: [AtomicPtr<Batch>; N],
+    slots: [AtomicPtr<BatchInner>; N],
 }
 
 impl<const N: usize> BatchQueue<N> {
@@ -141,7 +141,7 @@ impl<const N: usize> BatchQueue<N> {
     }
 
     // Enqueueing into the BatchQueue should be done under a Mutex lock
-    pub(crate) fn enqueue(&self, batch: NonNull<Batch>) {
+    pub(crate) fn enqueue(&self, batch: NonNull<BatchInner>) {
         let (head, tail) = HeadTail::unpack_unchecked(self.head_tail.load(Ordering::Relaxed));
 
         // Queue should not be full as we should have reserved space already - if it is we need to panic
@@ -169,7 +169,7 @@ impl<const N: usize> BatchQueue<N> {
     // try_dequeue attempts to remove the oldest batch in the queue and advance the tail if the batch is applied
     //
     // If an earlier batch is not yet applied or the queue is empty then we return nil
-    pub(crate) fn try_dequeue(&self) -> Option<NonNull<Batch>> {
+    pub(crate) fn try_dequeue(&self) -> Option<NonNull<BatchInner>> {
         //
         let mut ht = HeadTail::from_raw(self.head_tail.load(Ordering::Acquire)).raw();
 
@@ -495,7 +495,7 @@ where
     }
 
     // NOTE: May need a different type for Batch to pass in
-    fn prepare(&self, batch: NonNull<Batch>) -> Result<()> {
+    fn prepare(&self, batch: NonNull<BatchInner>) -> Result<()> {
         //
         // NOTE: How do we want to hand no_sync_wait?
 
@@ -535,7 +535,10 @@ mod tests {
     use crate::sync::atomic::{AtomicBool, AtomicUsize};
     use std::{ptr, sync::Barrier, thread, time::Duration};
 
-    use crate::db::{batch::Batch, write_pipeline::tests::queue_harness::Harness};
+    use crate::db::{
+        batch::{BatchInner, UnCommitted},
+        write_pipeline::tests::queue_harness::Harness,
+    };
 
     use super::*;
 
@@ -546,7 +549,7 @@ mod tests {
         };
 
         use crate::{
-            db::batch::{Batch, OwnedBatchPtr},
+            db::batch::{BatchInner, OwnedBatchPtr, UnCommitted},
             sync::{Condvar, Mutex},
         };
 
@@ -630,11 +633,13 @@ mod tests {
                 f: F,
             ) -> ScopedJoinHandle<'scope, ConsumerCtx>
             where
-                F: FnOnce(&Batch, &BatchQueue<N>) -> Option<NonNull<Batch>> + Send + 'scope,
-                C: FnOnce(&Batch) + Send + 'scope,
+                F: FnOnce(&BatchInner, &BatchQueue<N>) -> Option<NonNull<BatchInner>>
+                    + Send
+                    + 'scope,
+                C: FnOnce(&BatchInner) + Send + 'scope,
             {
                 scope.spawn(move || {
-                    let mut sealed = BatchObject::new().seal();
+                    let mut sealed = BatchObject::<UnCommitted>::new().seal();
                     let b_non_null = sealed.as_non_null();
                     let b_ptr = b_non_null.as_ptr();
                     let b_ref = unsafe { &*b_non_null.as_ptr() };
@@ -665,6 +670,23 @@ mod tests {
     }
 
     mod pipeline_harness {}
+
+    #[test]
+    fn want_api() {
+        /*
+         * let pool = Arc::new(BatchPool::new());
+         * let mut batch = Batch::new(Arc::clone(&pool), pool.acquire());
+         *
+         * batch.put(key1, value1);
+         * batch.put(key2, value2);
+         *
+         * let batch = batch.seal();
+         * pipeline.commit_sync(batch.inner())?;
+         *
+         * let batch = batch.reset();
+         * batch.close();
+         */
+    }
 
     #[test]
     fn two_consumers_race_dequeue() {
@@ -718,7 +740,7 @@ mod tests {
         let batch_q = BatchQueue::<4>::new();
         batch_q.head_tail.store(ht.raw(), Ordering::Release);
 
-        let mut batch = BatchObject::new().seal();
+        let mut batch = BatchObject::<UnCommitted>::new().seal();
         let b_ptr = batch.as_non_null();
 
         batch_q.enqueue(b_ptr);
@@ -726,7 +748,7 @@ mod tests {
 
     #[test]
     fn enqueue_batch() {
-        let mut batch = BatchObject::new().seal();
+        let mut batch = BatchObject::<UnCommitted>::new().seal();
         let b_ptr = batch.as_non_null();
 
         let batch_q = BatchQueue::<4>::new();
