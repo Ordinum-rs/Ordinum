@@ -206,7 +206,7 @@ impl BatchFactory for IndexedBatchFactory {
 pub(crate) unsafe trait BatchAllocation: Send + Sized {
     fn batch_ptr(&self) -> NonNull<BatchInner>;
     // TODO: Add a reset for reuse so when BatchObject::clear() is called we can handle both Indexed+Non-Indexed
-    // fn reset_for_resuse(&mut self);
+    fn reset_for_reuse(&mut self);
 }
 
 /// Owning pointer to a heap-allocated `BatchInner`.
@@ -273,6 +273,11 @@ impl From<Box<BatchInner>> for OwnedBatchPtr {
 unsafe impl BatchAllocation for OwnedBatchPtr {
     fn batch_ptr(&self) -> NonNull<BatchInner> {
         self.ptr
+    }
+
+    fn reset_for_reuse(&mut self) {
+        let batch = unsafe { &mut *self.as_ptr() };
+        batch.clear();
     }
 }
 
@@ -345,6 +350,15 @@ impl From<Box<IndexedBatchInner>> for OwnedIndexedBatchPtr {
 unsafe impl BatchAllocation for OwnedIndexedBatchPtr {
     fn batch_ptr(&self) -> NonNull<BatchInner> {
         unsafe { NonNull::new_unchecked(&raw mut (*self.as_ptr()).batch) }
+    }
+
+    fn reset_for_reuse(&mut self) {
+        let batch = unsafe { &mut *self.as_ptr() };
+
+        // TODO: Clear the skiplist
+        // TODO: Clear range-del skiplist
+        batch.arena.reset();
+        batch.batch.clear();
     }
 }
 
@@ -430,6 +444,8 @@ impl SealedBatch for Batch<Sealed> {
     }
 }
 
+// ---- Index Batch ---- //
+
 pub(crate) struct IndexedBatch<B: BatchCommitState> {
     pool: Arc<IndexedBatchPool>,
     batch: BatchObject<B, OwnedIndexedBatchPtr>,
@@ -443,6 +459,35 @@ impl<B: BatchCommitState> IndexedBatch<B> {
         batch: BatchObject<B, OwnedIndexedBatchPtr>,
     ) -> Self {
         Self { pool, batch }
+    }
+
+    pub(crate) fn inner(&self) -> &BatchObject<B, OwnedIndexedBatchPtr> {
+        &self.batch
+    }
+
+    fn wait(&self) -> Result<()> {
+        self.batch.wait_until_reusable()?;
+        Ok(())
+    }
+
+    // TODO: Needs looking at
+    pub(crate) fn close(self) -> Result<()> {
+        self.wait()?;
+        self.pool.release(self.batch);
+        // NOTE: Does drops for arena etc kick in here
+        Ok(())
+    }
+
+    pub(crate) fn reset(mut self) -> IndexedBatch<UnCommitted> {
+        self.wait().expect("batch wait failed before reset");
+
+        // Must reset the arena?
+        unsafe { &mut *self.batch.inner.as_ptr() }.arena.reset();
+
+        IndexedBatch {
+            pool: self.pool,
+            batch: self.batch.reset_batch(),
+        }
     }
 }
 
@@ -499,7 +544,7 @@ pub(crate) struct BatchObject<B: BatchCommitState, P: BatchAllocation = OwnedBat
     inner: P,
 }
 
-// ---- Generic Impl ---- //
+// ---- Generic Batch Object Impl ---- //
 
 impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
     //
@@ -510,7 +555,7 @@ impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
         }
     }
 
-    pub(super) fn as_ptr(&self) -> *mut BatchInner {
+    pub(super) fn as_inner_ptr(&self) -> *mut BatchInner {
         self.inner.batch_ptr().as_ptr()
     }
 
@@ -542,14 +587,14 @@ impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
         // SAFETY:
         // The caller guarantees that the batch pointer is live and not currently
         // retained by the pool. We only access the atomic runtime state field.
-        unsafe { &*self.as_ptr() }
+        unsafe { &*self.as_inner_ptr() }
             .runtime_commit_state
             .store(state as u8, ordering)
     }
 
     pub(crate) fn state(&self, ordering: Ordering) -> BatchRuntimeState {
         BatchRuntimeState::from(
-            unsafe { &*self.as_ptr() }
+            unsafe { &*self.as_inner_ptr() }
                 .runtime_commit_state
                 .load(ordering),
         )
@@ -560,14 +605,14 @@ impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
         //
         // We are safe to dereference here because the BatchObject ensures the underlying batch heap allocation is alive and we are
         // accessing an atomic field only
-        unsafe { &*self.as_ptr() }
+        unsafe { &*self.as_inner_ptr() }
             .runtime_commit_state
             .load(Ordering::Relaxed)
             == state as u8
     }
 
     pub(super) fn wait_until_reusable(&self) -> Result<()> {
-        let batch = unsafe { &*self.as_ptr() };
+        let batch = unsafe { &*self.as_inner_ptr() };
 
         // TODO: Need to wait on the sync signal - do we need a timeout?
 
@@ -584,19 +629,17 @@ impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
     /// Clears the batch for immediate reuse while retaining its current buffer
     /// capacity. Pool release applies its own retention and shrinking policy.
     pub(crate) fn reset_batch(mut self) -> BatchObject<UnCommitted, P> {
-        debug_assert!(self.state(Ordering::Acquire).is_reset_safe());
+        //
+        assert!(self.state(Ordering::Acquire).is_reset_safe());
+        self.inner.reset_for_reuse();
 
-        // SAFETY: this BatchObject exclusively owns the stable allocation, and
-        // the reset-safe runtime state guarantees that the pipeline no longer
-        // accesses its non-atomic fields.
-        let batch = unsafe { &mut *self.as_ptr() };
-        batch.clear();
+        unsafe { self.set_runtime_state(BatchRuntimeState::Acquired, Ordering::Release) };
         self.transition()
     }
 }
 
 //
-// ---- Uncommitted ---- //
+// ---- Uncommitted Non-Indexed ---- //
 
 impl BatchObject<UnCommitted, OwnedBatchPtr> {
     pub(super) fn new() -> Self {
@@ -615,7 +658,30 @@ impl BatchObject<UnCommitted, OwnedBatchPtr> {
             inner: OwnedBatchPtr::from(inner),
         }
     }
+
+    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    // XXX: Do we want this to return a Result with an Error?
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        // Any assertions
+        self.put_cf(Self::default_cf(), key, value);
+    }
+
+    // XXX: May want to change the cf_id to a column family handle OR we allow the layers above to resolve the handle and we only deal with the id
+    pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
+    // XXX: Result?
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        //
+        // TODO: Finish this when we have column families and can use a resolver
+    }
 }
+
+// ---- Uncommitted Indexed ---- //
 
 impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
     pub(super) fn new() -> Self {
@@ -626,7 +692,30 @@ impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
             inner: OwnedIndexedBatchPtr::from(inner),
         }
     }
+
+    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    // XXX: Do we want this to return a Result with an Error?
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        // Any assertions
+        self.put_cf(Self::default_cf(), key, value);
+    }
+
+    // XXX: May want to change the cf_id to a column family handle OR we allow the layers above to resolve the handle and we only deal with the id
+    pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
+    // XXX: Result?
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        //
+        // TODO: Finish this when we have column families and can use a resolver
+    }
 }
+
+// ---- Uncommitted Generic ---- //
 
 impl<P: BatchAllocation> BatchObject<UnCommitted, P> {
     fn default_cf() -> VarInt {
@@ -655,27 +744,6 @@ impl<P: BatchAllocation> BatchObject<UnCommitted, P> {
         unsafe { self.set_runtime_state(BatchRuntimeState::Acquired, Ordering::Release) };
     }
 
-    pub(crate) fn put<K, V>(&self, key: K, value: V)
-    // XXX: Do we want this to return a Result with an Error?
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        // Any assertions
-        self.put_cf(Self::default_cf(), key, value);
-    }
-
-    // XXX: May want to change the cf_id to a column family handle OR we allow the layers above to resolve the handle and we only deal with the id
-    pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
-    // XXX: Result?
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-    {
-        //
-        // TODO: Finish this when we have column families and can use a resolver
-    }
-
     pub(crate) fn seal(self) -> BatchObject<Sealed, P> {
         BatchObject {
             _state: PhantomData,
@@ -685,22 +753,49 @@ impl<P: BatchAllocation> BatchObject<UnCommitted, P> {
 
     pub(crate) fn resize_to(&mut self, new_size: usize) {
         // TODO: Add safety comments
-        let batch = unsafe { &mut *self.as_ptr() };
+        let batch = unsafe { &mut *self.as_inner_ptr() };
 
         batch.data.reserve(new_size);
     }
 
     pub(crate) fn shrink_to(&mut self, new_size: usize) {
         // TODO: Add safety comments
-        let batch = unsafe { &mut *self.as_ptr() };
+        let batch = unsafe { &mut *self.as_inner_ptr() };
         batch.shrink_batch_to(new_size);
     }
 }
 
-// ---- Sealed ---- //
+// ---- Sealed Non-Indexed ---- //
 
-impl<P: BatchAllocation> BatchObject<Sealed, P> {
+impl BatchObject<Sealed, OwnedBatchPtr> {
     //
+}
+
+// ---- Sealed Indexed ---- //
+
+impl BatchObject<Sealed, OwnedIndexedBatchPtr> {
+    //
+}
+
+// ---- IndexedBatchInner ---- //
+
+// Index Batch Objects
+
+// TODO: Make the Objects
+
+pub(super) struct IndexedBatchInner {
+    batch: BatchInner,
+    arena: Arena,
+    index: BatchSkipList,
+    range_del_index: BatchSkipList,
+    //
+}
+
+impl IndexedBatchInner {
+    fn new() -> Self {
+        // TODO: Finish indexed batch inner
+        todo!()
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -964,12 +1059,6 @@ impl BatchInner {
 
         self.count = 0;
 
-        // `clear` has exclusive access and accepts only a reset-safe state.
-        // Once the contents are reset, the same owning BatchObject becomes the
-        // acquired mutable batch for its next use.
-        self.runtime_commit_state
-            .store(BatchRuntimeState::Acquired as u8, Ordering::Relaxed);
-
         // Reset the data buffer
         self.data.clear();
 
@@ -991,27 +1080,6 @@ impl<'env> BatchRef<'env> {
     }
 }
 
-// ---- Indexed Batch ---- //
-
-// Index Batch Objects
-
-// TODO: Make the Objects
-
-pub(super) struct IndexedBatchInner {
-    batch: BatchInner,
-    arena: Arena,
-    index: BatchSkipList,
-    range_del_index: BatchSkipList,
-    //
-}
-
-impl IndexedBatchInner {
-    fn new() -> Self {
-        // TODO: Finish indexed batch inner
-        todo!()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,7 +1097,7 @@ mod tests {
     #[test]
     fn batch_new() {
         let mut batch = BatchObject::<UnCommitted, OwnedBatchPtr>::new();
-        let b_ref = unsafe { &*batch.as_ptr() };
+        let b_ref = unsafe { &*batch.as_inner_ptr() };
         assert!(b_ref.count == 0);
     }
 
@@ -1061,7 +1129,7 @@ mod tests {
     fn assign_seq_num() {
         let mut batch = BatchObject::<UnCommitted, OwnedBatchPtr>::new_with_capacity(10);
 
-        let b_ref = unsafe { &*batch.as_ptr() };
+        let b_ref = unsafe { &*batch.as_inner_ptr() };
 
         assert_eq!(b_ref.seq_num(), 0);
 

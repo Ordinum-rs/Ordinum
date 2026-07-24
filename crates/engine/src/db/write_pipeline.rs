@@ -506,6 +506,8 @@ where
 
         self.batch_queue.enqueue(batch);
 
+        b.set_runtime_state(super::batch::BatchRuntimeState::InQueue, Ordering::Release);
+
         // TODO: Need to check this and test
         // Assign the seq_no to the batch
         unsafe {
@@ -755,7 +757,7 @@ mod tests {
 
         batch_q.enqueue(b_ptr);
 
-        assert!(batch_q.slots[0].load(Ordering::Relaxed) == batch.as_ptr());
+        assert!(batch_q.slots[0].load(Ordering::Relaxed) == batch.as_inner_ptr());
         let (h, _) = HeadTail::unpack_unchecked(batch_q.head_tail.load(Ordering::Relaxed));
         assert!(h == 1);
     }

@@ -520,7 +520,7 @@ impl<
         //
         // We have exclusive ownership of this batch and it's memory and can safely dereference as no other process or caller
         // has any references to this batch
-        let len = unsafe { &mut *batch.as_ptr() }.get_batch_size();
+        let len = unsafe { &mut *batch.as_inner_ptr() }.get_batch_size();
 
         // NOTE:
         // We may want to abstract out a resize policy layer if we find that we are making decisions about resizing batches
