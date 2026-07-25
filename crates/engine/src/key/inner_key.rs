@@ -7,7 +7,7 @@
 
 use std::ptr::NonNull;
 
-use crate::key::{encode_into, internal_key::OperationType};
+use crate::key::{encode_into, internal_key::InternalKeyKind};
 
 // Const INLINE sizes
 #[cfg(target_pointer_width = "64")]
@@ -55,7 +55,7 @@ impl<const N: usize> InnerKey<N> {
         self.external = Some(NonNull::new(ptr).unwrap());
     }
 
-    pub(super) fn encode_inline(&mut self, user_key: &[u8], seq_no: u64, op: OperationType) {
+    pub(super) fn encode_inline(&mut self, user_key: &[u8], seq_no: u64, op: InternalKeyKind) {
         let total = user_key.len() + 8;
         debug_assert!(total <= N);
 

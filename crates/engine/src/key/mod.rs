@@ -1,4 +1,4 @@
-use crate::key::internal_key::{OperationType, encode_trailer};
+use crate::key::internal_key::{InternalKeyKind, encode_trailer};
 
 pub(crate) mod comparator;
 pub(crate) mod inner_key;
@@ -20,7 +20,7 @@ pub(crate) const MAX_BUFFER_RETAINED: usize = 4096;
 pub(crate) const SEEK_OP_SENTINEL: u8 = 255;
 
 #[inline(always)]
-pub(super) fn encode_into(dst: &mut [u8], user_key: &[u8], seq_no: u64, op_type: OperationType) {
+pub(super) fn encode_into(dst: &mut [u8], user_key: &[u8], seq_no: u64, op_type: InternalKeyKind) {
     let user_len = user_key.len();
 
     debug_assert!(user_len + 8 <= dst.len());

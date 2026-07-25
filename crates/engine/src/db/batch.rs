@@ -81,13 +81,13 @@ impl CFTable {
 //
 // ---- Batch Operations Enum ---- //
 
-#[repr(align(8))]
-#[derive(Debug)]
-pub(crate) enum BatchOp {
-    Put,
-    Delete,
-    Merge,
-    RangeDel,
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchRecordKind {
+    Put = 1,
+    Delete = 2,
+    Merge = 3,
+    RangeDel = 4,
     // XXX: More operations in later updates
 }
 
@@ -491,7 +491,11 @@ impl<B: BatchCommitState> IndexedBatch<B> {
     }
 }
 
-// TODO: Implement SealedBatch for IndexedBatch
+impl SealedBatch for IndexedBatch<Sealed> {
+    fn batch_ptr(&self) -> NonNull<BatchInner> {
+        self.batch.batch_ptr()
+    }
+}
 
 /// Batches use a compact binary representation where all operations are encoded sequentially into a byte slice
 /// the binary representation is so that batches can form the records of the WAL without any additional changes
@@ -660,7 +664,6 @@ impl BatchObject<UnCommitted, OwnedBatchPtr> {
     }
 
     pub(crate) fn put<K, V>(&self, key: K, value: V)
-    // XXX: Do we want this to return a Result with an Error?
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -669,9 +672,7 @@ impl BatchObject<UnCommitted, OwnedBatchPtr> {
         self.put_cf(Self::default_cf(), key, value);
     }
 
-    // XXX: May want to change the cf_id to a column family handle OR we allow the layers above to resolve the handle and we only deal with the id
     pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
-    // XXX: Result?
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -694,7 +695,6 @@ impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
     }
 
     pub(crate) fn put<K, V>(&self, key: K, value: V)
-    // XXX: Do we want this to return a Result with an Error?
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -703,9 +703,7 @@ impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
         self.put_cf(Self::default_cf(), key, value);
     }
 
-    // XXX: May want to change the cf_id to a column family handle OR we allow the layers above to resolve the handle and we only deal with the id
     pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
-    // XXX: Result?
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -815,6 +813,9 @@ impl IndexedBatchInner {
 // | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
+//
+//
+//
 pub(super) struct BatchInner {
     // ----
     // Operaton Data
@@ -846,12 +847,6 @@ pub(super) struct BatchInner {
     //
     //
     //
-
-    // ----
-    //
-    // XXX: Indexing
-    // index: Option<NonNull<SkipList>>,
-    // range_del_index: Option<NonNull<SkipList>>,
 
     // ----
     // Commit Pipeline State
@@ -1018,7 +1013,7 @@ impl BatchInner {
         cf_id: u64,
         key_len: usize,
         value_len: usize,
-        kind: BatchOp,
+        kind: BatchRecordKind,
     ) {
         debug_assert!(
             self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8

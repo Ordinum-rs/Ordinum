@@ -1,5 +1,5 @@
 use super::MAX_KEY_SIZE;
-use super::OperationType;
+use super::InternalKeyKind;
 use super::inner_key::InnerKey;
 use super::internal_key::INLINE_IK_SIZE;
 use super::internal_key::encode_trailer;
@@ -17,7 +17,7 @@ pub(crate) struct LookUpKey<const N: usize> {
 
 impl<const N: usize> LookUpKey<N> {
     //
-    pub(crate) fn new(user_key: &[u8], seq_no: u64, op: OperationType) -> Self {
+    pub(crate) fn new(user_key: &[u8], seq_no: u64, op: InternalKeyKind) -> Self {
         //
         let total = user_key.len() + 8;
         debug_assert!(total <= MAX_KEY_SIZE);
@@ -62,7 +62,7 @@ mod tests {
     fn lookup_key_size() {
         let user_key = "User".to_string().into_bytes();
         let seq_no = 12345 as u64;
-        let op_type = OperationType::Put;
+        let op_type = InternalKeyKind::Put;
 
         let lookup_key: LookUpInternalKey = LookUpKey::new(&user_key, seq_no, op_type);
         assert_eq!(std::mem::size_of::<LookUpKey<INLINE_IK_SIZE>>(), 56);
@@ -74,7 +74,7 @@ mod tests {
         let user_key = "ReallyLongKeyWhichShouldActuallyHeapAllocateBecauseItIsLongerThan200BytesIHopeThatNobodyAbsolutelyAnihiliatesMyDatabaseWithTheseBecauseThatsNotVeryNiceAndItMakesMeHaveToWorkHardOnMemoryAndMyBrainStrugglesWithMemoryAlready".to_string().into_bytes();
         let inline_key = "User".to_string().into_bytes();
         let seq_no = 12345 as u64;
-        let op_type = OperationType::Put;
+        let op_type = InternalKeyKind::Put;
 
         let lk: LookUpInternalKey = LookUpKey::new(&user_key, seq_no, op_type);
         let lk_inline: LookUpInternalKey = LookUpKey::new(&inline_key, seq_no, op_type);

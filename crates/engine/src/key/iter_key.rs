@@ -1,6 +1,6 @@
 use super::INITIAL_KEY_BUFFER_CAP;
 use super::MAX_KEY_SIZE;
-use super::OperationType;
+use super::InternalKeyKind;
 use super::encode_into;
 use super::inner_key::ITER_INLINE;
 use super::inner_key::InnerKey;
@@ -22,7 +22,7 @@ impl<const N: usize> IterKey<N> {
         }
     }
 
-    pub(crate) fn set(&mut self, user_key: &[u8], seq_no: u64, op: OperationType) {
+    pub(crate) fn set(&mut self, user_key: &[u8], seq_no: u64, op: InternalKeyKind) {
         let total = user_key.len() + 8;
         debug_assert!(total <= MAX_KEY_SIZE);
 
@@ -94,7 +94,7 @@ mod tests {
 
         let user_key = b"User";
         let seq_no = 1;
-        let op = OperationType::Put;
+        let op = InternalKeyKind::Put;
 
         iter_key.set(user_key, seq_no, op);
 
@@ -114,11 +114,11 @@ mod tests {
 
         //
 
-        iter_key.set(user_key, 1, OperationType::Put);
+        iter_key.set(user_key, 1, InternalKeyKind::Put);
 
         let ptr = iter_key.as_slice().as_ptr();
 
-        iter_key.set(user_key_2, 2, OperationType::Put);
+        iter_key.set(user_key_2, 2, InternalKeyKind::Put);
 
         let ptr_2 = iter_key.as_slice().as_ptr();
 

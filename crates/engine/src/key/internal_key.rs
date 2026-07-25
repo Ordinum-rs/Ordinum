@@ -19,56 +19,99 @@
 
 use std::fmt::Display;
 
+use crate::db::batch::BatchRecordKind;
+
 pub(super) const INLINE_IK_SIZE: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
-pub(crate) enum OperationType {
+pub(crate) enum InternalKeyKind {
     Put = 1,
     Delete = 2,
     Merge = 3, // TODO: Implement Merge Operation into the system
     Max = 255,
 }
 
-impl From<OperationType> for u64 {
-    fn from(op: OperationType) -> Self {
+/// Error returned when a trailer contains a kind byte that is not part of the
+/// internal-key encoding.
+///
+/// Internal keys can be decoded from persisted WAL or table data, so an
+/// unknown byte must be treated as malformed input rather than as an
+/// unreachable program state. The original byte is retained for diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidInternalKeyKind {
+    raw: u8,
+}
+
+impl InvalidInternalKeyKind {
+    pub(crate) fn raw(self) -> u8 {
+        self.raw
+    }
+}
+
+impl Display for InvalidInternalKeyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid internal-key kind: {}", self.raw)?;
+        Ok(())
+    }
+}
+
+impl std::error::Error for InvalidInternalKeyKind {}
+
+impl From<InternalKeyKind> for u64 {
+    fn from(op: InternalKeyKind) -> Self {
         u64::from(op as u8)
     }
 }
 
-impl From<u8> for OperationType {
-    fn from(op: u8) -> Self {
-        match op {
-            1 => OperationType::Put,
-            2 => OperationType::Delete,
-            3 => OperationType::Merge,
-            255 => OperationType::Max,
-            _ => unreachable!(),
+impl TryFrom<u8> for InternalKeyKind {
+    type Error = InvalidInternalKeyKind;
+
+    fn try_from(raw: u8) -> std::result::Result<Self, Self::Error> {
+        match raw {
+            1 => Ok(InternalKeyKind::Put),
+            2 => Ok(InternalKeyKind::Delete),
+            3 => Ok(InternalKeyKind::Merge),
+            255 => Ok(InternalKeyKind::Max),
+            raw => Err(InvalidInternalKeyKind { raw }),
         }
     }
 }
 
-impl Display for OperationType {
+impl Display for InternalKeyKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OperationType::Put => write!(f, "Put"),
-            OperationType::Delete => write!(f, "Delete"),
-            OperationType::Merge => write!(f, "Merge"),
-            OperationType::Max => write!(f, "Max"),
+            InternalKeyKind::Put => write!(f, "Put"),
+            InternalKeyKind::Delete => write!(f, "Delete"),
+            InternalKeyKind::Merge => write!(f, "Merge"),
+            InternalKeyKind::Max => write!(f, "Max"),
+        }
+    }
+}
+
+impl TryFrom<BatchRecordKind> for InternalKeyKind {
+    type Error = BatchRecordKind;
+
+    fn try_from(kind: BatchRecordKind) -> std::result::Result<Self, Self::Error> {
+        match kind {
+            BatchRecordKind::Put => Ok(Self::Put),
+            BatchRecordKind::Delete => Ok(Self::Delete),
+            BatchRecordKind::Merge => Ok(Self::Merge),
+            BatchRecordKind::RangeDel => Err(BatchRecordKind::RangeDel),
         }
     }
 }
 
 // A Pack function to take the seq_no and operation type and pack them into a trailer u64
 #[inline(always)]
-fn pack_trailer(seq_no: u64, op: OperationType) -> u64 {
+fn pack_trailer(seq_no: u64, op: InternalKeyKind) -> u64 {
     debug_assert!(seq_no < (1 << 56)); // Enforce that seq_no is less than 2^56
     (seq_no << 8) | u64::from(op)
 }
 
 #[inline(always)]
 #[must_use = "trailer bytes should be big endian in order to be compared correctly"]
-pub(crate) fn encode_trailer(seq_no: u64, op: OperationType) -> [u8; 8] {
+pub(crate) fn encode_trailer(seq_no: u64, op: InternalKeyKind) -> [u8; 8] {
     pack_trailer(seq_no, op).to_be_bytes()
 }
 
@@ -78,9 +121,11 @@ fn unpack_trailer_raw(trailer: u64) -> (u64, u8) {
 }
 
 #[inline(always)]
-fn unpack_trailer(trailer: u64) -> (u64, OperationType) {
+fn unpack_trailer(
+    trailer: u64,
+) -> std::result::Result<(u64, InternalKeyKind), InvalidInternalKeyKind> {
     let (seq_no, op) = unpack_trailer_raw(trailer);
-    (seq_no, OperationType::from(op))
+    Ok((seq_no, InternalKeyKind::try_from(op)?))
 }
 
 #[inline(always)]
@@ -89,8 +134,8 @@ fn extract_seq_no(trailer: u64) -> u64 {
 }
 
 #[inline(always)]
-fn extract_op(trailer: u64) -> OperationType {
-    OperationType::from((trailer & 0xff) as u8)
+fn extract_op(trailer: u64) -> std::result::Result<InternalKeyKind, InvalidInternalKeyKind> {
+    InternalKeyKind::try_from((trailer & 0xff) as u8)
 }
 
 #[inline(always)]
@@ -127,13 +172,11 @@ impl<'a> From<&'a [u8]> for InternalKeyRef<'a> {
 impl<'a> Display for InternalKeyRef<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key = String::from_utf8_lossy(self.user_key);
-        write!(
-            f,
-            "{}-{}-{}",
-            key,
-            self.seq_no,
-            OperationType::from(self.op)
-        )
+
+        match InternalKeyKind::try_from(self.op) {
+            Ok(kind) => write!(f, "{}-{}-{}", key, self.seq_no, kind),
+            Err(error) => write!(f, "{}-{}-Invalid({})", key, self.seq_no, error.raw()),
+        }
     }
 }
 
@@ -144,12 +187,55 @@ mod tests {
 
     #[test]
     fn encode_trailer_works() {
-        let trailer_1 = encode_trailer(12345 as u64, OperationType::Put);
-        let trailer_2 = encode_trailer(12346 as u64, OperationType::Put);
+        let trailer_1 = encode_trailer(12345 as u64, InternalKeyKind::Put);
+        let trailer_2 = encode_trailer(12346 as u64, InternalKeyKind::Put);
 
         assert!(
             trailer_2 > trailer_1,
             "trailer_2 should be greater than trailer_1"
         );
+    }
+
+    #[test]
+    fn point_batch_record_kinds_map_to_internal_key_kinds() {
+        assert_eq!(
+            InternalKeyKind::try_from(BatchRecordKind::Put),
+            Ok(InternalKeyKind::Put)
+        );
+        assert_eq!(
+            InternalKeyKind::try_from(BatchRecordKind::Delete),
+            Ok(InternalKeyKind::Delete)
+        );
+        assert_eq!(
+            InternalKeyKind::try_from(BatchRecordKind::Merge),
+            Ok(InternalKeyKind::Merge)
+        );
+    }
+
+    #[test]
+    fn range_delete_does_not_map_to_point_internal_key_kind() {
+        assert_eq!(
+            InternalKeyKind::try_from(BatchRecordKind::RangeDel),
+            Err(BatchRecordKind::RangeDel)
+        );
+    }
+
+    #[test]
+    fn invalid_internal_key_kind_preserves_raw_byte() {
+        let error = InternalKeyKind::try_from(42).unwrap_err();
+
+        assert_eq!(error.raw(), 42);
+        assert_eq!(error.to_string(), "invalid internal-key kind: 42");
+    }
+
+    #[test]
+    fn internal_key_display_reports_invalid_kind() {
+        let key = InternalKeyRef {
+            user_key: b"key",
+            seq_no: 7,
+            op: 42,
+        };
+
+        assert_eq!(key.to_string(), "key-7-Invalid(42)");
     }
 }

@@ -13,7 +13,7 @@ use crate::arena::arena::{Arena, ArenaPolicy};
 use crate::db::write_batch::WBatch;
 use crate::iterator::internal_iterator::InternalIterator;
 use crate::key::comparator::Comparator;
-use crate::key::internal_key::{InternalKeyRef, OperationType, encode_trailer};
+use crate::key::internal_key::{InternalKeyKind, InternalKeyRef, encode_trailer};
 use crate::utils::skiplists::mem_skip_list::{Node, SkipList};
 
 pub(crate) type MemID = u64;
@@ -84,7 +84,8 @@ impl MemtableState for Flushed {
 
 impl Display for Flushed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Flushed")
+        write!(f, "Flushed")?;
+        Ok(())
     }
 }
 
@@ -96,7 +97,8 @@ pub(crate) struct Memtable<S: MemtableState> {
 
 impl<S: MemtableState> Display for Memtable<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Memtable<{}> {{ {} }} ", S::NAME, self.inner)
+        write!(f, "Memtable<{}> {{ {} }} ", S::NAME, self.inner)?;
+        Ok(())
     }
 }
 
@@ -165,10 +167,13 @@ impl Memtable<Mutable> {
                 return MemReturn::NotFound;
             }
 
-            match sk.op.into() {
-                OperationType::Put => MemReturn::Value(v),
-                OperationType::Delete => MemReturn::Deleted,
-                OperationType::Merge => MemReturn::Merge,
+            let kind = InternalKeyKind::try_from(sk.op)
+                .expect("memtable entry contains an invalid internal-key kind");
+
+            match kind {
+                InternalKeyKind::Put => MemReturn::Value(v),
+                InternalKeyKind::Delete => MemReturn::Deleted,
+                InternalKeyKind::Merge => MemReturn::Merge,
                 _ => unreachable!(),
             }
         } else {
@@ -209,7 +214,8 @@ impl Display for MemtableInner {
             f,
             "{{ lifecycle: {} }}",
             Into::<MemLifeCycle>::into(self.lifecycle.load(Ordering::Relaxed)),
-        )
+        )?;
+        Ok(())
     }
 }
 
@@ -251,7 +257,7 @@ impl MemtableInner {
     // NOTE: If we insert direct we have to make sure that the internal key seq no is greater than the highest seq no so we don't fail on insert and alloc
     // A dead node
     // TODO: We could create a fallback where if we need to we can use the TLS Ephemeral buffer to allocate the internal key and insert
-    fn insert_direct(&self, user_key: &[u8], seq_no: u64, op_type: OperationType, value: &[u8]) {
+    fn insert_direct(&self, user_key: &[u8], seq_no: u64, op_type: InternalKeyKind, value: &[u8]) {
         let user_key_len = user_key.len();
 
         unsafe {
@@ -263,12 +269,10 @@ impl MemtableInner {
                         Node::key_ptr(node_ptr),
                         user_key_len,
                     );
+
+                    let trailer = encode_trailer(seq_no, op_type).as_ptr();
                     // Insert the trailer
-                    ptr::copy_nonoverlapping(
-                        encode_trailer(seq_no, op_type).as_ptr(),
-                        Node::key_ptr(node_ptr).add(user_key_len),
-                        8,
-                    );
+                    ptr::copy_nonoverlapping(trailer, Node::key_ptr(node_ptr).add(user_key_len), 8);
                 });
         }
     }

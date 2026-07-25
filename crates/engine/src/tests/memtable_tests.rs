@@ -3,7 +3,7 @@ mod tests {
 
     use crate::iterator::internal_iterator::InternalIterator;
     use crate::key::comparator::InternalKeyComparator;
-    use crate::key::internal_key::OperationType;
+    use crate::key::internal_key::InternalKeyKind;
     use crate::key::lookup_key::{LookUpInternalKey, LookUpKey};
 
     use crate::arena::allocator::*;
@@ -24,11 +24,11 @@ mod tests {
 
         // Put a few keys in the memtable
 
-        let k_1: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 1, OperationType::Put);
-        let k_2: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 2, OperationType::Put);
-        let k_3: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 3, OperationType::Put);
-        let k_4: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 4, OperationType::Delete);
-        let k_wrong: LookUpInternalKey = LookUpKey::new(b"51.1.User1002", 5, OperationType::Put);
+        let k_1: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 1, InternalKeyKind::Put);
+        let k_2: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 2, InternalKeyKind::Put);
+        let k_3: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 3, InternalKeyKind::Put);
+        let k_4: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 4, InternalKeyKind::Delete);
+        let k_wrong: LookUpInternalKey = LookUpKey::new(b"51.1.User1002", 5, InternalKeyKind::Put);
 
         mem.insert(k_1.as_ref(), b"value_1");
         mem.insert(k_2.as_ref(), b"value_2");
@@ -37,12 +37,14 @@ mod tests {
         mem.insert(k_wrong.as_ref(), b"value_4");
 
         // Get the value for most recent seq no of 5
-        let search_key: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 8, OperationType::Max);
+        let search_key: LookUpInternalKey =
+            LookUpKey::new(b"51.1.User1001", 8, InternalKeyKind::Max);
         let result = mem.get(search_key.as_ref());
         assert!(matches!(result, MemReturn::Deleted));
 
         // Get the value for snapshot seq no of 3
-        let search_key: LookUpInternalKey = LookUpKey::new(b"51.1.User1001", 3, OperationType::Max);
+        let search_key: LookUpInternalKey =
+            LookUpKey::new(b"51.1.User1001", 3, InternalKeyKind::Max);
         let result = mem.get(search_key.as_ref());
         assert!(matches!(result, MemReturn::Value(b"value_3")));
     }
@@ -74,7 +76,8 @@ mod tests {
                     for i in 0..OPS_PER_THREAD {
                         let seq = (t * OPS_PER_THREAD) + i + 1;
 
-                        let key = LookUpInternalKey::new(b"51.1.User1001", seq, OperationType::Put);
+                        let key =
+                            LookUpInternalKey::new(b"51.1.User1001", seq, InternalKeyKind::Put);
 
                         let value = format!("value_{seq}");
 
@@ -120,7 +123,7 @@ mod tests {
         //
         // 2. Latest version must be highest sequence.
         //
-        let search_key = LookUpInternalKey::new(b"51.1.User1001", MAX_SEQ, OperationType::Max);
+        let search_key = LookUpInternalKey::new(b"51.1.User1001", MAX_SEQ, InternalKeyKind::Max);
 
         let result = mem.get(search_key.as_ref());
 
@@ -139,7 +142,8 @@ mod tests {
         //
         let snapshot_seq = 250;
 
-        let search_key = LookUpInternalKey::new(b"51.1.User1001", snapshot_seq, OperationType::Max);
+        let search_key =
+            LookUpInternalKey::new(b"51.1.User1001", snapshot_seq, InternalKeyKind::Max);
 
         let result = mem.get(search_key.as_ref());
 
