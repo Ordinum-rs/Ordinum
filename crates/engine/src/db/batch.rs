@@ -3,7 +3,7 @@ use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::thread::{self, Thread};
-use std::{array, ptr, todo};
+use std::{array, panic, ptr, todo};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
 
 use crate::arena::arena::Arena;
@@ -785,7 +785,8 @@ pub(super) struct IndexedBatchInner {
     batch: BatchInner,
     arena: Arena,
     index: BatchSkipList,
-    range_del_index: BatchSkipList,
+    // XXX: range-del skiplist indexes are allocated lazily on first operation
+    range_del_index: Option<BatchSkipList>,
     //
 }
 
@@ -797,6 +798,16 @@ impl IndexedBatchInner {
 }
 
 // ------------------------------------------------------------------------------------------
+
+// TODO: Finish the deferred op - will need methods on this for slice exposure and also closure??
+pub(crate) struct DeferredOp<'batch> {
+    batch: Option<&'batch mut BatchInner>,
+    reservation_offset: usize,
+    key_offset: usize,
+    key_len: usize,
+    value_offset: usize,
+    value_len: usize,
+}
 
 //
 
@@ -1005,36 +1016,75 @@ impl BatchInner {
 
     // ---- Writing ---- //
 
-    // TODO: Make prepare_with_key_value
-    // TODO: Make put
+    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) {
+        // Copy from slice
+    }
 
-    fn prepare_with_key_value_impl(
+    pub(crate) fn put_deferred<'batch>(
+        &'batch mut self,
+        cf_id: u64,
+        key_len: usize,
+        value_len: usize,
+        kind: BatchRecordKind,
+    ) -> Result<DeferredOp<'batch>> {
+        //
+        // Call prepare_with_key_value_impl
+
+        todo!()
+    }
+
+    pub(crate) fn put_with<F>(
         &mut self,
         cf_id: u64,
         key_len: usize,
         value_len: usize,
         kind: BatchRecordKind,
-    ) {
-        debug_assert!(
-            self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
-        );
+        f: F,
+    ) where
+        F: FnOnce(DeferredOp),
+    {
+        // Deferred op inside the closure
+        todo!()
+    }
+
+    fn reserve_operation(&mut self, record_size: usize) -> Result<usize> {
+        //
+
+        let old_len = self.data.len();
+
+        assert!(old_len + record_size <= MAX_BATCH_SIZE);
 
         // We need to make sure the batch is initialised and ready to recieve an operation if the current batch is empty
         if self.data.len() == 0 {
             //
-            self.init_buffer(key_len + value_len + 2 * VarInt::MAX_VARINT);
+            self.init_buffer(record_size);
         }
 
-        // Increment the count of operations
-        self.count += 1;
+        self.data.resize(old_len + record_size, 0);
 
-        // Resolve the cf_table entry or init it
+        Ok(old_len)
+    }
 
-        // TODO: Finish from here
+    fn prepare_with_key_value_impl<'batch>(
+        &'batch mut self,
+        cf_id: u64,
+        key_len: usize,
+        value_len: usize,
+        kind: BatchRecordKind,
+    ) -> Result<DeferredOp<'batch>> {
+        debug_assert!(
+            self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
+        );
 
-        // Estimte the memtable size for the cf_table entry
+        let record_size = key_len + value_len + 2 * VarInt::MAX_VARINT;
+
+        if let Ok(reservation_offset) = self.reserve_operation(record_size) {
+            //
+            ()
+        }
 
         //
+        todo!()
     }
 
     fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
