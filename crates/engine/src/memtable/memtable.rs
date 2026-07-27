@@ -23,7 +23,7 @@ pub(crate) enum MemReturn<'a> {
     NotFound,
     Merge,
     Deleted,
-    Value(&'a [u8]),
+    Value(&'a [u8]), // Do we need to return a valut pointer or type which can determine inline/pointer?
 }
 
 #[repr(u8)]

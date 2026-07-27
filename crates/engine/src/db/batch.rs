@@ -14,11 +14,11 @@ use crate::db::{self, db_impl::DbImpl};
 use crate::memtable::memtable::{Memtable, Mutable};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, Ordering};
-use crate::utils;
 use crate::utils::skiplists::batch_index::BatchSkipList;
 use crate::utils::var_int::VarInt;
 use crate::wal::{SyncLogWaiter, SyncWaiter};
 use crate::{Error, Result};
+use crate::{error, utils};
 
 use super::batch_pool::BatchPoolImpl;
 
@@ -787,6 +787,7 @@ pub(super) struct IndexedBatchInner {
     index: BatchSkipList,
     // XXX: range-del skiplist indexes are allocated lazily on first operation
     range_del_index: Option<BatchSkipList>,
+    // XXX: Need tombstone cache which is invalidated on iterator creation
     //
 }
 
@@ -801,19 +802,37 @@ impl IndexedBatchInner {
 
 // TODO: Finish the deferred op - will need methods on this for slice exposure and also closure??
 pub(crate) struct DeferredOp<'batch> {
+    _life: PhantomData<&'batch ()>,
     batch: Option<&'batch mut BatchInner>,
-    reservation_offset: usize,
+    reservation_start: usize,
+    reservation_end: usize,
     key_offset: usize,
     key_len: usize,
     value_offset: usize,
     value_len: usize,
 }
 
+impl<'batch> DeferredOp<'batch> {
+    fn new(reservation_start: usize, reservation_end: usize) -> Self {
+        debug_assert!(reservation_start <= reservation_end);
+
+        Self {
+            _life: PhantomData,
+            batch: None,
+            reservation_start,
+            reservation_end,
+            key_offset: 0,
+            key_len: 0,
+            value_offset: 0,
+            value_len: 0,
+        }
+    }
+}
+
 //
 
 //TODO: Add sync waiting state and completion state so the batch can wait for fysync
 
-// https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 //
 // Batch:
 // | --------- 12 byte header ----------|--------- Operations ---------|
@@ -922,7 +941,7 @@ impl BatchInner {
 
         let size = Self::HEADER_SIZE + capacity_hint;
 
-        // NOTE: Do we want to assert! and panic! on this? or return Error?
+        // Do we want to assert! and panic! on this? or return Error?
         assert!(size <= MAX_BATCH_SIZE);
 
         self.data.reserve(size);
@@ -1047,22 +1066,27 @@ impl BatchInner {
         todo!()
     }
 
-    fn reserve_operation(&mut self, record_size: usize) -> Result<usize> {
+    fn reserve_operation(
+        &mut self,
+        record_size: usize,
+    ) -> std::result::Result<(usize, usize), usize> {
         //
 
-        let old_len = self.data.len();
-
-        assert!(old_len + record_size <= MAX_BATCH_SIZE);
-
         // We need to make sure the batch is initialised and ready to recieve an operation if the current batch is empty
-        if self.data.len() == 0 {
-            //
+        if self.data.is_empty() {
             self.init_buffer(record_size);
         }
 
-        self.data.resize(old_len + record_size, 0);
+        let start = self.data.len();
+        let end = start.checked_add(record_size).ok_or(usize::MAX)?;
 
-        Ok(old_len)
+        if end >= MAX_BATCH_SIZE {
+            return Err(end);
+        }
+
+        self.data.resize(end, 0);
+
+        Ok((start, end))
     }
 
     fn prepare_with_key_value_impl<'batch>(
@@ -1071,20 +1095,16 @@ impl BatchInner {
         key_len: usize,
         value_len: usize,
         kind: BatchRecordKind,
-    ) -> Result<DeferredOp<'batch>> {
+    ) -> std::result::Result<DeferredOp<'batch>, usize> {
         debug_assert!(
             self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
         );
 
         let record_size = key_len + value_len + 2 * VarInt::MAX_VARINT;
 
-        if let Ok(reservation_offset) = self.reserve_operation(record_size) {
-            //
-            ()
-        }
+        let (reservation_start, reservation_end) = self.reserve_operation(record_size)?;
 
-        //
-        todo!()
+        Ok(DeferredOp::new(reservation_start, reservation_end))
     }
 
     fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
@@ -1181,5 +1201,17 @@ mod tests {
         unsafe { b_ref.assign_seq_num_once(10) };
 
         assert_eq!(b_ref.seq_num(), 10);
+    }
+
+    #[test]
+    fn batch_prepare_put() {
+        //
+        let mut batch = BatchInner::new();
+
+        let deferred_op = batch
+            .prepare_with_key_value_impl(0, 0, 0, BatchRecordKind::Put)
+            .unwrap();
+
+        batch.count = 1;
     }
 }

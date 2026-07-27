@@ -13,4 +13,6 @@ pub enum Error {
     ColumnFamilyNotFound(u32),
 
     WalError,
+
+    RecordSizeInBatchTooBig(usize, usize),
 }
