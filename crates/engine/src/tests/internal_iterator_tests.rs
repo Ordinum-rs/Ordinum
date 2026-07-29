@@ -5,7 +5,7 @@ mod tests {
     use crate::arena::arena::*;
     use crate::iterator::internal_iterator::InternalIterator;
     use crate::key::comparator::InternalKeyComparator;
-    use crate::key::internal_key::{InternalKeyRef, InternalKeyKind};
+    use crate::key::internal_key::{InternalKeyKind, InternalKeyRef};
     use crate::key::lookup_key::{LookUpInternalKey, LookUpKey};
     use crate::memtable::memtable::*;
 
@@ -102,7 +102,9 @@ mod tests {
         {
             let mut iter = mem.iter();
 
-            iter.seek(LookUpInternalKey::new(b"51.1.User1001a", 100, InternalKeyKind::Max).as_ref());
+            iter.seek(
+                LookUpInternalKey::new(b"51.1.User1001a", 100, InternalKeyKind::Max).as_ref(),
+            );
 
             assert!(iter.valid());
             assert_eq!(iter.internal_key().unwrap(), ik(&k_other));

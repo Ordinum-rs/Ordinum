@@ -1,6 +1,6 @@
 use super::INITIAL_KEY_BUFFER_CAP;
-use super::MAX_KEY_SIZE;
 use super::InternalKeyKind;
+use super::MAX_KEY_SIZE;
 use super::encode_into;
 use super::inner_key::ITER_INLINE;
 use super::inner_key::InnerKey;

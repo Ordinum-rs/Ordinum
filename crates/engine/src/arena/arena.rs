@@ -22,8 +22,8 @@ use std::ptr::NonNull;
 use std::ptr::*;
 use std::slice;
 use std::sync::{
-    atomic::{AtomicPtr, AtomicUsize, Ordering},
     Mutex,
+    atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 use crate::arena::allocator::Allocator;
@@ -572,12 +572,14 @@ mod tests {
             allocated_bytes
         );
         assert_eq!(arena.chunks.get_mut().unwrap().len(), 2);
-        assert!(arena
-            .chunks
-            .get_mut()
-            .unwrap()
-            .iter_mut()
-            .all(|chunk| *chunk.bump.get_mut() == 0));
+        assert!(
+            arena
+                .chunks
+                .get_mut()
+                .unwrap()
+                .iter_mut()
+                .all(|chunk| *chunk.bump.get_mut() == 0)
+        );
 
         // Reset selects the initial chunk and reuses its first allocation.
         let reused = unsafe { arena.alloc_raw(layout) };

@@ -508,14 +508,14 @@ where
 
         b.set_runtime_state(super::batch::BatchRuntimeState::InQueue, Ordering::Release);
 
-        // TODO: Need to check this and test
+        // TODO: Need to check this and test - Why do we do this with batch count?
         // Assign the seq_no to the batch
         unsafe {
             b.assign_seq_num_once(
                 self.seq_state
                     .log_seq_num
-                    .fetch_add(b.get_batch_count(), Ordering::AcqRel)
-                    - b.get_batch_count(),
+                    .fetch_add(b.get_batch_count() as u64, Ordering::AcqRel)
+                    - b.get_batch_count() as u64,
             )
         };
 

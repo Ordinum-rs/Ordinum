@@ -2,27 +2,24 @@
 //
 //
 
-use std::ops::Deref;
-
 const MSB: u8 = 0x80;
 const LOW_7_BITS: u32 = 0x7F;
 const SHIFT_7_BITS: u32 = 7;
 
 #[derive(Debug)]
-pub(crate) enum VarInt {
-    One([u8; 1]),
-    Two([u8; 2]),
-    Three([u8; 3]),
-    Four([u8; 4]),
+pub(crate) struct VarInt {
+    buf: [u8; Self::MAX_VARINT],
+    len: u8,
 }
 
 impl VarInt {
-    pub(crate) const MAX_VARINT: usize = 4;
+    /// Maximum number of bytes required to encode a `u32` using seven payload
+    /// bits per byte.
+    pub(crate) const MAX_VARINT: usize = 5;
 
     pub(crate) fn new(value: u32) -> Self {
-        let mut buf = [0u8; 4];
+        let mut buf = [0u8; Self::MAX_VARINT];
         let mut v = value;
-
         let mut i = 0;
 
         while v > 127 {
@@ -32,11 +29,9 @@ impl VarInt {
         }
         buf[i] = v as u8;
 
-        match i + 1 {
-            1 => Self::One([buf[0]]),
-            2 => Self::Two([buf[0], buf[1]]),
-            3 => Self::Three([buf[0], buf[1], buf[2]]),
-            _ => Self::Four([buf[0], buf[1], buf[2], buf[3]]),
+        Self {
+            buf,
+            len: (i + 1) as u8,
         }
     }
 
@@ -57,13 +52,12 @@ impl VarInt {
         (result, bytes_read)
     }
 
+    pub(crate) fn size(&self) -> usize {
+        self.len as usize
+    }
+
     pub(crate) fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::One(buf) => buf.as_ref(),
-            Self::Two(buf) => buf.as_ref(),
-            Self::Three(buf) => buf.as_ref(),
-            Self::Four(buf) => buf.as_ref(),
-        }
+        &self.buf[..self.size()]
     }
 }
 
@@ -84,4 +78,51 @@ fn want() {
 
     assert_eq!(result_3.as_slice().len(), 4);
     assert_eq!(VarInt::decode(result_3.as_slice()), (3000000, 4));
+}
+
+#[test]
+fn size() {
+    let value = 5;
+    let varint = VarInt::new(value);
+
+    assert_eq!(varint.size(), 1);
+
+    let big_value = 3000000;
+    let varint_big = VarInt::new(big_value);
+
+    assert_eq!(varint_big.size(), 4);
+}
+
+#[test]
+fn u32_max_uses_five_bytes_and_round_trips() {
+    let varint = VarInt::new(u32::MAX);
+
+    assert_eq!(varint.as_slice(), &[0xff, 0xff, 0xff, 0xff, 0x0f]);
+    assert_eq!(varint.size(), VarInt::MAX_VARINT);
+    assert_eq!(
+        VarInt::decode(varint.as_slice()),
+        (u32::MAX, VarInt::MAX_VARINT)
+    );
+}
+
+#[test]
+fn varint_size_boundaries_round_trip() {
+    let cases = [
+        (0, 1),
+        (127, 1),
+        (128, 2),
+        (16_383, 2),
+        (16_384, 3),
+        (2_097_151, 3),
+        (2_097_152, 4),
+        (268_435_455, 4),
+        (268_435_456, 5),
+    ];
+
+    for (value, expected_size) in cases {
+        let varint = VarInt::new(value);
+
+        assert_eq!(varint.size(), expected_size);
+        assert_eq!(VarInt::decode(varint.as_slice()), (value, expected_size));
+    }
 }

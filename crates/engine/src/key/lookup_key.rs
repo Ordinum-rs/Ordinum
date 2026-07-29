@@ -1,5 +1,5 @@
-use super::MAX_KEY_SIZE;
 use super::InternalKeyKind;
+use super::MAX_KEY_SIZE;
 use super::inner_key::InnerKey;
 use super::internal_key::INLINE_IK_SIZE;
 use super::internal_key::encode_trailer;

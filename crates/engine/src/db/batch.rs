@@ -14,6 +14,7 @@ use crate::db::{self, db_impl::DbImpl};
 use crate::memtable::memtable::{Memtable, Mutable};
 use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::utils::read_u32_le_unsafe;
 use crate::utils::skiplists::batch_index::BatchSkipList;
 use crate::utils::var_int::VarInt;
 use crate::wal::{SyncLogWaiter, SyncWaiter};
@@ -872,7 +873,7 @@ pub(super) struct BatchInner {
     /// memtable.
     max_batch_size: usize,
     //
-    count: u64,
+    count: u32,
     //
     //
     //
@@ -921,7 +922,6 @@ impl BatchInner {
 
         assert!(capacity <= MAX_BATCH_SIZE);
         let mut data = Vec::with_capacity(capacity);
-        data.extend_from_slice(&[0u8; Self::HEADER_SIZE]);
         Self {
             data,
             max_batch_size: MAX_BATCH_SIZE,
@@ -940,6 +940,8 @@ impl BatchInner {
         debug_assert!(self.data.len() == 0);
 
         let size = Self::HEADER_SIZE + capacity_hint;
+
+        println!("size = {}", size);
 
         // Do we want to assert! and panic! on this? or return Error?
         assert!(size <= MAX_BATCH_SIZE);
@@ -1016,7 +1018,7 @@ impl BatchInner {
             .store(BatchRuntimeState::Applied as u8, Ordering::Release)
     }
 
-    pub(super) fn get_batch_count(&self) -> u64 {
+    pub(super) fn get_batch_count(&self) -> u32 {
         self.count
     }
 
@@ -1033,12 +1035,108 @@ impl BatchInner {
         0
     }
 
-    // ---- Writing ---- //
+    fn reserve_operation(
+        &mut self,
+        record_size: usize,
+    ) -> std::result::Result<(usize, usize), usize> {
+        //
 
-    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) {
-        // Copy from slice
+        // We need to make sure the batch is initialised and ready to recieve an operation if the current batch is empty
+        if self.data.is_empty() {
+            self.init_buffer(record_size);
+        } else {
+            println!("data is not empty");
+        }
+
+        let start = self.data.len();
+        let end = start.checked_add(record_size).ok_or(usize::MAX)?;
+
+        if end >= MAX_BATCH_SIZE {
+            return Err(end);
+        }
+
+        self.data.resize(end, 0);
+
+        Ok((start, end))
     }
 
+    // ---- Header ---- //
+
+    fn adjust_count_in_header(&mut self, count: u32) -> u32 {
+        assert!(
+            self.data.len() >= Self::HEADER_SIZE,
+            "batch header must be initialised"
+        );
+
+        let count_bytes = &mut self.data[Self::BATCH_COUNT_OFFSET..Self::HEADER_SIZE];
+
+        let old = u32::from_le_bytes(
+            (*count_bytes)
+                .try_into()
+                .expect("count field must be exactly four bytes"),
+        );
+
+        count_bytes.copy_from_slice(&count.to_le_bytes());
+
+        old
+    }
+
+    // ---- Writing ---- //
+
+    pub(crate) fn put(&mut self, cf_id: Option<[u8; 8]>, key: &[u8], value: &[u8]) {
+        //
+        //
+        let k_len = key.len();
+        let v_len = value.len();
+
+        assert!(k_len <= u32::MAX as usize);
+        assert!(v_len <= u32::MAX as usize);
+
+        let key_varint = VarInt::new(k_len as u32);
+        let value_varint = VarInt::new(v_len as u32);
+
+        let k_varint_size = key_varint.size();
+        let v_varint_size = value_varint.size();
+
+        let record_size = 1 + 8 + k_len + v_len + k_varint_size + v_varint_size;
+
+        let (start, end) = self
+            .reserve_operation(record_size)
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let mut index = start;
+
+        self.data[index] = (BatchRecordKind::Put as u8);
+
+        index += 1;
+
+        if let Some(cf) = cf_id {
+            self.data[index..index + 8].copy_from_slice(&cf);
+        }
+        index += 8;
+
+        self.data[index..index + k_varint_size].copy_from_slice(key_varint.as_slice());
+        index += k_varint_size;
+
+        self.data[index..index + k_len].copy_from_slice(key);
+        index += k_len;
+
+        self.data[index..index + v_varint_size].copy_from_slice(value_varint.as_slice());
+        index += v_varint_size;
+
+        self.data[index..index + v_len].copy_from_slice(value);
+        index += v_len;
+
+        debug_assert!(index == end);
+
+        self.count += 1;
+
+        // Update the header
+        let _ = self.adjust_count_in_header(self.count);
+        //
+    }
+
+    // TODO: Continue from here
     pub(crate) fn put_deferred<'batch>(
         &'batch mut self,
         cf_id: u64,
@@ -1066,29 +1164,6 @@ impl BatchInner {
         todo!()
     }
 
-    fn reserve_operation(
-        &mut self,
-        record_size: usize,
-    ) -> std::result::Result<(usize, usize), usize> {
-        //
-
-        // We need to make sure the batch is initialised and ready to recieve an operation if the current batch is empty
-        if self.data.is_empty() {
-            self.init_buffer(record_size);
-        }
-
-        let start = self.data.len();
-        let end = start.checked_add(record_size).ok_or(usize::MAX)?;
-
-        if end >= MAX_BATCH_SIZE {
-            return Err(end);
-        }
-
-        self.data.resize(end, 0);
-
-        Ok((start, end))
-    }
-
     fn prepare_with_key_value_impl<'batch>(
         &'batch mut self,
         cf_id: u64,
@@ -1100,7 +1175,7 @@ impl BatchInner {
             self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
         );
 
-        let record_size = key_len + value_len + 2 * VarInt::MAX_VARINT;
+        let record_size = 1 + 8 + key_len + value_len + 2 * VarInt::MAX_VARINT;
 
         let (reservation_start, reservation_end) = self.reserve_operation(record_size)?;
 
@@ -1213,5 +1288,14 @@ mod tests {
             .unwrap();
 
         batch.count = 1;
+    }
+
+    #[test]
+    fn inner_put() {
+        let mut inner = BatchInner::new_with_capacity(100);
+
+        inner.put(None, b"hello", b"world");
+
+        println!("{:?}", inner.data);
     }
 }
