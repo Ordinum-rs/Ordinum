@@ -12,4 +12,4 @@ pub(crate) mod batch;
 pub(crate) mod write_pipeline;
 
 // TODO: Move to CF module
-pub(crate) const DEFAULT_CF_ID: u32 = 0;
+pub(crate) const DEFAULT_CF_ID: u64 = 0;

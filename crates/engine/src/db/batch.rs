@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::slice::from_raw_parts_mut;
 use std::thread::{self, Thread};
 use std::{array, panic, ptr, todo};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
@@ -9,11 +10,11 @@ use std::{marker::PhantomData, sync::atomic::AtomicU8};
 use crate::arena::arena::Arena;
 use crate::column_family::cf::ColumnFamilyHandle;
 use crate::db::DEFAULT_CF_ID;
-use crate::db::batch_pool::IndexedBatchPool;
+use crate::db::write_batch::BatchOpType;
 use crate::db::{self, db_impl::DbImpl};
 use crate::memtable::memtable::{Memtable, Mutable};
 use crate::sync::Arc;
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::Ordering;
 use crate::utils::read_u32_le_unsafe;
 use crate::utils::skiplists::batch_index::BatchSkipList;
 use crate::utils::var_int::VarInt;
@@ -22,6 +23,7 @@ use crate::{Error, Result};
 use crate::{error, utils};
 
 use super::batch_pool::BatchPoolImpl;
+use super::batch_pool::IndexedBatchPool;
 
 // ---- Constants ---- //
 
@@ -628,7 +630,11 @@ impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
 
     pub(crate) fn can_reset(&self) -> bool {
         let state = self.state(Ordering::Acquire);
-        if !state.is_reset_safe() { false } else { true }
+        if !state.is_reset_safe() {
+            return false;
+        } else {
+            return true;
+        }
     }
 
     /// Clears the batch for immediate reuse while retaining its current buffer
@@ -673,7 +679,7 @@ impl BatchObject<UnCommitted, OwnedBatchPtr> {
         self.put_cf(Self::default_cf(), key, value);
     }
 
-    pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
+    pub(crate) fn put_cf<K, V>(&self, cf_id: u64, key: K, value: V)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -704,7 +710,7 @@ impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
         self.put_cf(Self::default_cf(), key, value);
     }
 
-    pub(crate) fn put_cf<K, V>(&self, cf_id: VarInt, key: K, value: V)
+    pub(crate) fn put_cf<K, V>(&self, cf_id: u64, key: K, value: V)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -717,8 +723,8 @@ impl BatchObject<UnCommitted, OwnedIndexedBatchPtr> {
 // ---- Uncommitted Generic ---- //
 
 impl<P: BatchAllocation> BatchObject<UnCommitted, P> {
-    fn default_cf() -> VarInt {
-        VarInt::new(DEFAULT_CF_ID)
+    fn default_cf() -> u64 {
+        DEFAULT_CF_ID
     }
 
     pub(super) fn acquire(inner: P) -> Self {
@@ -818,6 +824,10 @@ impl<'batch> DeferredOp<'batch> {
         batch: &'batch mut BatchInner,
         reservation_start: usize,
         reservation_end: usize,
+        key_offset: usize,
+        key_len: usize,
+        value_offset: usize,
+        value_len: usize,
     ) -> Self {
         debug_assert!(reservation_start <= reservation_end);
 
@@ -826,10 +836,10 @@ impl<'batch> DeferredOp<'batch> {
             batch: Some(batch),
             reservation_start,
             reservation_end,
-            key_offset: 0,
-            key_len: 0,
-            value_offset: 0,
-            value_len: 0,
+            key_offset,
+            key_len,
+            value_offset,
+            value_len,
         }
     }
 
@@ -848,13 +858,25 @@ impl<'batch> DeferredOp<'batch> {
     }
 
     pub(crate) fn key_value_mut(&mut self) -> (&mut [u8], &mut [u8]) {
-        debug_assert!(self.batch.is_some());
+        //
+        let batch = self.batch.as_deref_mut().expect("missing deferred batch");
 
-        let data = self.batch.as_deref_mut().unwrap_or_else(|| panic!());
+        let region = &mut batch.data[self.key_offset..self.value_offset + self.value_len];
 
-        let region = &mut data.data[self.key_offset..self.value_offset + self.value_len];
+        // Region
+        //  ---- Key ---- [X] --- Value ---
+        // [0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0]
+        //  0           4     6           10
+        //
+        //
 
-        unsafe { region.split_at_mut_unchecked(self.value_offset) }
+        let (key, remainder) = region.split_at_mut(self.key_len);
+
+        let value_varint_len = self.value_offset - (self.key_offset + self.key_len);
+
+        let (_, value) = remainder.split_at_mut(value_varint_len);
+
+        (key, &mut value[..self.value_len])
     }
 }
 
@@ -869,7 +891,7 @@ impl<'batch> DeferredOp<'batch> {
 //
 //
 // Operation:
-// | op_type (1 byte) | cf_id (VarInt) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
+// | op_type (1 byte) | cf_id (u64 LE) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
 
 // https://github.com/cockroachdb/pebble/blob/a3b8dfe9e85015110be33743718a7de47458a4d7/batch.go#L199
 //
@@ -1125,18 +1147,58 @@ impl BatchInner {
         let key_varint = VarInt::new(key_len as u32);
         let value_varint = VarInt::new(value_len as u32);
 
+        let k_varint_size = key_varint.size();
+        let v_varint_size = value_varint.size();
+
         let record_size = 1 + 8 + key_varint.size() + key_len + value_varint.size() + value_len;
 
         let (reservation_start, reservation_end) = self
             .reserve_operation(record_size)
             .map_err(|attempted_batch_size| (record_size, attempted_batch_size))?;
 
-        Ok(DeferredOp::new(self, reservation_start, reservation_end))
+        println!("{reservation_start}");
+
+        // let key_offset = reservation_start + key_varint.size();
+        // let value_offset = key_offset + value_varint.size();
+
+        let mut index = reservation_start;
+
+        self.data[index] = BatchOpType::Put as u8;
+        index += 1;
+
+        self.data[index..index + 8].copy_from_slice(&cf_id.to_le_bytes());
+        index += 8;
+
+        self.data[index..index + k_varint_size].copy_from_slice(key_varint.as_slice());
+        index += k_varint_size;
+
+        // Capture key offset
+        let key_offset = index;
+        // Skip key value
+        index += key_len;
+
+        self.data[index..index + v_varint_size].copy_from_slice(value_varint.as_slice());
+        index += v_varint_size;
+
+        // Capture value offset
+        let value_offset = index;
+
+        debug_assert_eq!(reservation_end, index + value_len);
+
+        Ok(DeferredOp::new(
+            self,
+            reservation_start,
+            reservation_end,
+            key_offset,
+            key_len,
+            value_offset,
+            value_len,
+        ))
     }
 
     fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
 
-    pub(crate) fn put(&mut self, cf_id: Option<[u8; 8]>, key: &[u8], value: &[u8]) {
+    pub(crate) fn put(&mut self, cf_id: u64, key: &[u8], value: &[u8]) {
         //
         //
         let k_len = key.len();
@@ -1163,9 +1225,7 @@ impl BatchInner {
 
         index += 1;
 
-        if let Some(cf) = cf_id {
-            self.data[index..index + 8].copy_from_slice(&cf);
-        }
+        self.data[index..index + 8].copy_from_slice(&cf_id.to_le_bytes());
         index += 8;
 
         self.data[index..index + k_varint_size].copy_from_slice(key_varint.as_slice());
@@ -1329,8 +1389,30 @@ mod tests {
 
         let expected_len = 33;
 
-        inner.put(None, b"hello", b"world");
+        inner.put(DEFAULT_CF_ID, b"hello", b"world");
 
         assert_eq!(inner.data.len(), 33);
+    }
+
+    #[test]
+    fn put_deferred() {
+        let mut inner = BatchInner::new_with_capacity(40);
+
+        let key = b"Hello";
+        let value = b"World";
+
+        let mut def = inner
+            .put_deferred(0, key.len(), value.len(), BatchRecordKind::Put)
+            .unwrap_or_else(|e| panic!("{:?}", e));
+
+        let (k, v) = def.key_value_mut();
+
+        println!("{:?}", k);
+        println!("{:?}", v);
+
+        assert_eq!(key.len(), k.len());
+        assert_eq!(key.len(), v.len());
+
+        //
     }
 }
