@@ -814,12 +814,16 @@ pub(crate) struct DeferredOp<'batch> {
 }
 
 impl<'batch> DeferredOp<'batch> {
-    fn new(reservation_start: usize, reservation_end: usize) -> Self {
+    fn new(
+        batch: &'batch mut BatchInner,
+        reservation_start: usize,
+        reservation_end: usize,
+    ) -> Self {
         debug_assert!(reservation_start <= reservation_end);
 
         Self {
             _life: PhantomData,
-            batch: None,
+            batch: Some(batch),
             reservation_start,
             reservation_end,
             key_offset: 0,
@@ -827,6 +831,30 @@ impl<'batch> DeferredOp<'batch> {
             value_offset: 0,
             value_len: 0,
         }
+    }
+
+    pub(crate) fn key_mut(&mut self) -> &mut [u8] {
+        debug_assert!(self.batch.is_some());
+
+        &mut self.batch.as_deref_mut().unwrap_or_else(|| panic!()).data
+            [self.key_offset..self.key_offset + self.key_len]
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut [u8] {
+        debug_assert!(self.batch.is_some());
+
+        &mut self.batch.as_deref_mut().unwrap_or_else(|| panic!()).data
+            [self.value_offset..self.value_offset + self.value_len]
+    }
+
+    pub(crate) fn key_value_mut(&mut self) -> (&mut [u8], &mut [u8]) {
+        debug_assert!(self.batch.is_some());
+
+        let data = self.batch.as_deref_mut().unwrap_or_else(|| panic!());
+
+        let region = &mut data.data[self.key_offset..self.value_offset + self.value_len];
+
+        unsafe { region.split_at_mut_unchecked(self.value_offset) }
     }
 }
 
@@ -1083,6 +1111,31 @@ impl BatchInner {
 
     // ---- Writing ---- //
 
+    fn prepare_with_key_value_impl<'batch>(
+        &'batch mut self,
+        cf_id: u64,
+        key_len: usize,
+        value_len: usize,
+        kind: BatchRecordKind,
+    ) -> std::result::Result<DeferredOp<'batch>, (usize, usize)> {
+        debug_assert!(
+            self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
+        );
+
+        let key_varint = VarInt::new(key_len as u32);
+        let value_varint = VarInt::new(value_len as u32);
+
+        let record_size = 1 + 8 + key_varint.size() + key_len + value_varint.size() + value_len;
+
+        let (reservation_start, reservation_end) = self
+            .reserve_operation(record_size)
+            .map_err(|attempted_batch_size| (record_size, attempted_batch_size))?;
+
+        Ok(DeferredOp::new(self, reservation_start, reservation_end))
+    }
+
+    fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
+
     pub(crate) fn put(&mut self, cf_id: Option<[u8; 8]>, key: &[u8], value: &[u8]) {
         //
         //
@@ -1144,10 +1197,10 @@ impl BatchInner {
         value_len: usize,
         kind: BatchRecordKind,
     ) -> Result<DeferredOp<'batch>> {
-        //
-        // Call prepare_with_key_value_impl
-
-        todo!()
+        self.prepare_with_key_value_impl(cf_id, key_len, value_len, kind)
+            .map_err(|(record_size, attempted_batch_size)| {
+                Error::RecordSizeInBatchTooBig(record_size, attempted_batch_size)
+            })
     }
 
     pub(crate) fn put_with<F>(
@@ -1163,26 +1216,6 @@ impl BatchInner {
         // Deferred op inside the closure
         todo!()
     }
-
-    fn prepare_with_key_value_impl<'batch>(
-        &'batch mut self,
-        cf_id: u64,
-        key_len: usize,
-        value_len: usize,
-        kind: BatchRecordKind,
-    ) -> std::result::Result<DeferredOp<'batch>, usize> {
-        debug_assert!(
-            self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
-        );
-
-        let record_size = 1 + 8 + key_len + value_len + 2 * VarInt::MAX_VARINT;
-
-        let (reservation_start, reservation_end) = self.reserve_operation(record_size)?;
-
-        Ok(DeferredOp::new(reservation_start, reservation_end))
-    }
-
-    fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
 
     pub(super) fn clear(&mut self) {
         // NOTE:
@@ -1294,8 +1327,10 @@ mod tests {
     fn inner_put() {
         let mut inner = BatchInner::new_with_capacity(100);
 
+        let expected_len = 33;
+
         inner.put(None, b"hello", b"world");
 
-        println!("{:?}", inner.data);
+        assert_eq!(inner.data.len(), 33);
     }
 }
