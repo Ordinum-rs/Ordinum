@@ -11,7 +11,11 @@ pub(crate) mod lookup_key;
 // For read path, we need a temporary buffer to hold the internal key
 // We can try stack approach for small keys, heap for large keys
 
-pub(crate) const MAX_KEY_SIZE: usize = u16::MAX as usize;
+/// Maximum number of bytes in a user key, excluding the internal-key trailer.
+pub(crate) const MAX_USER_KEY_BYTES: usize = u16::MAX as usize;
+
+// Retained while read-path key buffers still use the older name.
+pub(crate) const MAX_KEY_SIZE: usize = MAX_USER_KEY_BYTES;
 
 pub(crate) const INITIAL_KEY_BUFFER_CAP: usize = 512;
 pub(crate) const MEDIUM_KEY_THRESHOLD: usize = 1024;

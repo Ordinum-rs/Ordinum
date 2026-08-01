@@ -194,7 +194,10 @@ impl Arena {
     // NOTE: I've made the closure unsafe and it is up to the caller to ensure that the Layout and write to the pointer are correct.
     #[inline(always)]
     pub unsafe fn alloc_raw(&self, layout: Layout) -> NonNull<u8> {
-        //
+        assert!(
+            layout.size() <= self.policy.block_size,
+            "arena allocation exceeds regular block size"
+        );
 
         loop {
             // Get chunk from current_chunk
@@ -241,7 +244,9 @@ impl Arena {
 
     #[inline(always)]
     pub unsafe fn alloc_raw_fallback(&self, layout: Layout) -> Result<NonNull<u8>, ArenaError> {
-        //
+        if layout.size() > self.policy.block_size {
+            return Err(ArenaError::AllocationError(layout.size()));
+        }
 
         loop {
             // Get chunk from current_chunk
@@ -446,6 +451,23 @@ mod tests {
         assert!(arena.allocated_bytes.load(Ordering::Relaxed) <= arena.max_bytes());
 
         println!("chunks used: {}", chunks.len());
+    }
+
+    #[test]
+    fn oversized_layout_is_rejected_without_allocating_more_chunks() {
+        let arena = Arena::new(
+            ArenaPolicy {
+                block_size: 64,
+                cap: 256,
+            },
+            Allocator::System(SystemAllocator::new()),
+        );
+        let layout = Layout::from_size_align(65, 1).unwrap();
+
+        let result = unsafe { arena.alloc_raw_fallback(layout) };
+
+        assert_eq!(result, Err(ArenaError::AllocationError(65)));
+        assert_eq!(arena.blocks_used(), 1);
     }
 
     #[test]

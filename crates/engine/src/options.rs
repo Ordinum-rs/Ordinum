@@ -3,17 +3,18 @@
 
 use crate::arena::arena::ArenaPolicy;
 
-const MB: usize = 1024;
+const KIB: usize = 1024;
+const MIB: usize = KIB * 1024;
 
-pub(crate) const SMALL_16MB: usize = 16 * MB;
-pub(crate) const MEDIUM_32MB: usize = 32 * MB;
-pub(crate) const DEFAULT_64MB: usize = 64 * MB;
-pub(crate) const LARGE_128MB: usize = 128 * MB;
+pub(crate) const SMALL_16MB: usize = 16 * MIB;
+pub(crate) const MEDIUM_32MB: usize = 32 * MIB;
+pub(crate) const DEFAULT_64MB: usize = 64 * MIB;
+pub(crate) const LARGE_128MB: usize = 128 * MIB;
 
-const SMALL_BLOCK: usize = 2 * MB;
-const MEDIUM_BLOCK: usize = 4 * MB;
-const DEFAULT_BLOCK: usize = 4 * MB;
-const LARGE_BLOCK: usize = 8 * MB;
+const SMALL_BLOCK: usize = 2 * MIB;
+const MEDIUM_BLOCK: usize = 4 * MIB;
+const DEFAULT_BLOCK: usize = 4 * MIB;
+const LARGE_BLOCK: usize = 8 * MIB;
 
 pub(crate) enum WriteBufferSize {
     Small,
@@ -55,4 +56,11 @@ impl WriteBufferSize {
 }
 
 #[test]
-fn const_test() {}
+fn write_buffer_presets_are_measured_in_mebibytes() {
+    assert_eq!(WriteBufferSize::Small.as_bytes(), 16 * 1024 * 1024);
+    assert_eq!(WriteBufferSize::Default.as_bytes(), 64 * 1024 * 1024);
+    assert_eq!(
+        WriteBufferSize::Default.arena_policy().block_size,
+        4 * 1024 * 1024
+    );
+}

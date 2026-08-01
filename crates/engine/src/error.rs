@@ -14,5 +14,24 @@ pub enum Error {
 
     WalError,
 
-    RecordSizeInBatchTooBig(usize, usize),
+    KeyTooLarge {
+        size: usize,
+        max: usize,
+    },
+
+    ValueTooLarge {
+        size: usize,
+        max: usize,
+    },
+
+    RecordTooLarge {
+        encoded_size: usize,
+        max_batch_size: usize,
+    },
+
+    BatchFull {
+        record_size: usize,
+        current_size: usize,
+        max_batch_size: usize,
+    },
 }

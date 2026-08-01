@@ -10,8 +10,10 @@ use std::{marker::PhantomData, sync::atomic::AtomicU8};
 use crate::arena::arena::Arena;
 use crate::column_family::cf::ColumnFamilyHandle;
 use crate::db::DEFAULT_CF_ID;
+use crate::db::options::DEFAULT_MAX_WRITE_BATCH_BYTES;
 use crate::db::write_batch::BatchOpType;
 use crate::db::{self, db_impl::DbImpl};
+use crate::key::MAX_USER_KEY_BYTES;
 use crate::memtable::memtable::{Memtable, Mutable};
 use crate::sync::Arc;
 use crate::sync::atomic::Ordering;
@@ -27,7 +29,59 @@ use super::batch_pool::IndexedBatchPool;
 
 // ---- Constants ---- //
 
-pub(crate) const MAX_BATCH_SIZE: usize = 1 << 20;
+// Batch size policy flow
+// ======================
+//
+// 1. Database policy
+//
+//    `DEFAULT_MAX_WRITE_BATCH_BYTES` is the default operational limit for one
+//    atomic batch. `MAX_BATCH_SIZE` exposes that default within this module.
+//    Each `BatchInner` stores the selected limit in `max_batch_size` so a future
+//    `DBOptions` value can be copied into newly allocated batches without
+//    changing the encoding or reservation logic.
+//
+// 2. API input and wire-format limits
+//
+//    Before reserving memory, the write path validates the user-key policy and
+//    converts key/value lengths to the `u32` lengths used by the batch format.
+//    It then calculates the complete encoded record size with checked
+//    arithmetic. The size includes the kind, column-family ID, both varints,
+//    and the key/value bytes; it does not include the batch header.
+//
+// 3. Atomic batch reservation
+//
+//    `reserve_operation` first checks whether `HEADER_SIZE + record_size` can
+//    ever fit in an empty batch. Failure is `RecordTooLarge`. If the record fits
+//    alone but not after the records already present, failure is `BatchFull`.
+//    Both checks happen before the Vec is initialized or resized, so callers may
+//    commit a full batch and retry a valid record in a fresh batch.
+//
+// 4. WAL and commit pipeline
+//
+//    `data.len()` is the serialized batch size: the 12-byte header followed by
+//    encoded operations. These same bytes form the WAL record, so the batch
+//    limit also bounds one atomic WAL write, recovery work, sequence reservation,
+//    and the amount of memory retained while a commit is in flight. A batch is
+//    never silently split because that would break its atomicity.
+//
+// 5. Memtable application
+//
+//    The batch limit is independent of a column family's write-buffer size.
+//    During application, each operation must also fit in one memtable arena
+//    allocation. The current arena rejects layouts larger than its regular block
+//    size. Future large-batch handling may install a batch as a flushable LSM
+//    layer, and future blob support may replace a durable value with a reference;
+//    neither behavior is currently implemented, so oversized records are
+//    rejected at the batch boundary.
+//
+// 6. Pool retention
+//
+//    `max_batch_size` controls what may be written, while the batch pool's
+//    retention policy controls how much Vec capacity is kept after reset. A
+//    previously large but valid batch may be shrunk before pooling; this does not
+//    change its configured write limit and it may grow again on later use.
+
+pub(crate) const MAX_BATCH_SIZE: usize = DEFAULT_MAX_WRITE_BATCH_BYTES;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10;
 
 const DEFAULT_INLINE_CF_ARRAY: usize = 4;
@@ -807,7 +861,6 @@ impl IndexedBatchInner {
 
 // ------------------------------------------------------------------------------------------
 
-// TODO: Finish the deferred op - will need methods on this for slice exposure and also closure??
 pub(crate) struct DeferredOp<'batch> {
     _life: PhantomData<&'batch ()>,
     batch: Option<&'batch mut BatchInner>,
@@ -878,7 +931,23 @@ impl<'batch> DeferredOp<'batch> {
 
         (key, &mut value[..self.value_len])
     }
+
+    // TODO: Need finish() method
+    pub(crate) fn finish(mut self) {
+        //
+
+        //
+    }
+
+    // TODO: Need rollback() method
+    fn rollback(&mut self) {
+        //
+
+        //
+    }
 }
+
+// TODO: Implement Drop for DeferredOp which rolls back the inner batch buffer to original reservation start IF batch is some()
 
 //
 
@@ -918,9 +987,9 @@ pub(super) struct BatchInner {
     /// - preserve fairness for concurrent writers,
     /// - and protect the write pipeline from oversized atomic operations.
     ///
-    /// Memtable flush and large-batch heuristics are evaluated separately on a
-    /// per-column-family basis using the batch footprint for each destination
-    /// memtable.
+    /// Memtable capacity is a separate concern. Per-column-family reservation
+    /// and a flushable-batch path still need to be implemented before batches
+    /// larger than an ordinary destination memtable can be accepted safely.
     max_batch_size: usize,
     //
     count: u32,
@@ -953,6 +1022,7 @@ impl BatchInner {
 
     fn new() -> Self {
         let mut data = Vec::with_capacity(DEFAULT_BATCH_INIT_SIZE);
+        data.resize(Self::HEADER_SIZE, 0);
         Self {
             data,
             max_batch_size: MAX_BATCH_SIZE,
@@ -968,10 +1038,13 @@ impl BatchInner {
     }
 
     fn new_with_capacity(cap: usize) -> Self {
-        let capacity = cap + Self::HEADER_SIZE;
+        let capacity = cap
+            .checked_add(Self::HEADER_SIZE)
+            .expect("batch initial capacity overflow");
 
         assert!(capacity <= MAX_BATCH_SIZE);
         let mut data = Vec::with_capacity(capacity);
+        data.resize(Self::HEADER_SIZE, 0);
         Self {
             data,
             max_batch_size: MAX_BATCH_SIZE,
@@ -989,14 +1062,10 @@ impl BatchInner {
     fn init_buffer(&mut self, capacity_hint: usize) {
         debug_assert!(self.data.len() == 0);
 
-        let size = Self::HEADER_SIZE + capacity_hint;
+        let desired_capacity = Self::HEADER_SIZE + capacity_hint;
+        debug_assert!(desired_capacity <= self.max_batch_size);
 
-        println!("size = {}", size);
-
-        // Do we want to assert! and panic! on this? or return Error?
-        assert!(size <= MAX_BATCH_SIZE);
-
-        self.data.reserve(size);
+        self.data.reserve(desired_capacity);
 
         // We've validated that we have the capacity - now we want len to start after the header so we can write operations to the region
         self.data.resize(Self::HEADER_SIZE, 0);
@@ -1081,29 +1150,53 @@ impl BatchInner {
         self.data.shrink_to(new_size);
     }
 
+    // This is for calcualting the estimated memtable size needed in the cf_table
     fn estimate_entry_size(&self, key_len: usize, value: usize) -> usize {
         0
     }
 
-    fn reserve_operation(
-        &mut self,
-        record_size: usize,
-    ) -> std::result::Result<(usize, usize), usize> {
-        //
+    fn reserve_operation(&mut self, record_size: usize) -> Result<(usize, usize)> {
+        let empty_batch_size =
+            Self::HEADER_SIZE
+                .checked_add(record_size)
+                .ok_or(Error::RecordTooLarge {
+                    encoded_size: usize::MAX,
+                    max_batch_size: self.max_batch_size,
+                })?;
 
-        // We need to make sure the batch is initialised and ready to recieve an operation if the current batch is empty
+        if empty_batch_size > self.max_batch_size {
+            return Err(Error::RecordTooLarge {
+                encoded_size: empty_batch_size,
+                max_batch_size: self.max_batch_size,
+            });
+        }
+
+        let current_size = if self.data.is_empty() {
+            Self::HEADER_SIZE
+        } else {
+            self.data.len()
+        };
+        let end = current_size
+            .checked_add(record_size)
+            .ok_or(Error::BatchFull {
+                record_size,
+                current_size,
+                max_batch_size: self.max_batch_size,
+            })?;
+
+        if end > self.max_batch_size {
+            return Err(Error::BatchFull {
+                record_size,
+                current_size,
+                max_batch_size: self.max_batch_size,
+            });
+        }
+
         if self.data.is_empty() {
             self.init_buffer(record_size);
-        } else {
-            println!("data is not empty");
         }
 
         let start = self.data.len();
-        let end = start.checked_add(record_size).ok_or(usize::MAX)?;
-
-        if end >= MAX_BATCH_SIZE {
-            return Err(end);
-        }
 
         self.data.resize(end, 0);
 
@@ -1133,37 +1226,65 @@ impl BatchInner {
 
     // ---- Writing ---- //
 
+    fn key_value_record_layout(
+        &self,
+        key_len: usize,
+        value_len: usize,
+    ) -> Result<(VarInt, VarInt, usize)> {
+        if key_len > MAX_USER_KEY_BYTES {
+            return Err(Error::KeyTooLarge {
+                size: key_len,
+                max: MAX_USER_KEY_BYTES,
+            });
+        }
+
+        let encoded_key_len = u32::try_from(key_len).map_err(|_| Error::KeyTooLarge {
+            size: key_len,
+            max: u32::MAX as usize,
+        })?;
+        let encoded_value_len = u32::try_from(value_len).map_err(|_| Error::ValueTooLarge {
+            size: value_len,
+            max: u32::MAX as usize,
+        })?;
+
+        let key_varint = VarInt::new(encoded_key_len);
+        let value_varint = VarInt::new(encoded_value_len);
+        let record_size = 1usize
+            .checked_add(size_of::<u64>())
+            .and_then(|size| size.checked_add(key_varint.size()))
+            .and_then(|size| size.checked_add(key_len))
+            .and_then(|size| size.checked_add(value_varint.size()))
+            .and_then(|size| size.checked_add(value_len))
+            .ok_or(Error::RecordTooLarge {
+                encoded_size: usize::MAX,
+                max_batch_size: self.max_batch_size,
+            })?;
+
+        Ok((key_varint, value_varint, record_size))
+    }
+
     fn prepare_with_key_value_impl<'batch>(
         &'batch mut self,
         cf_id: u64,
         key_len: usize,
         value_len: usize,
         kind: BatchRecordKind,
-    ) -> std::result::Result<DeferredOp<'batch>, (usize, usize)> {
+    ) -> Result<DeferredOp<'batch>> {
         debug_assert!(
             self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
         );
 
-        let key_varint = VarInt::new(key_len as u32);
-        let value_varint = VarInt::new(value_len as u32);
+        let (key_varint, value_varint, record_size) =
+            self.key_value_record_layout(key_len, value_len)?;
 
         let k_varint_size = key_varint.size();
         let v_varint_size = value_varint.size();
 
-        let record_size = 1 + 8 + key_varint.size() + key_len + value_varint.size() + value_len;
-
-        let (reservation_start, reservation_end) = self
-            .reserve_operation(record_size)
-            .map_err(|attempted_batch_size| (record_size, attempted_batch_size))?;
-
-        println!("{reservation_start}");
-
-        // let key_offset = reservation_start + key_varint.size();
-        // let value_offset = key_offset + value_varint.size();
+        let (reservation_start, reservation_end) = self.reserve_operation(record_size)?;
 
         let mut index = reservation_start;
 
-        self.data[index] = BatchOpType::Put as u8;
+        self.data[index] = kind as u8;
         index += 1;
 
         self.data[index..index + 8].copy_from_slice(&cf_id.to_le_bytes());
@@ -1198,26 +1319,16 @@ impl BatchInner {
 
     fn prepare_with_key_record_impl(&mut self, key_len: usize) {}
 
-    pub(crate) fn put(&mut self, cf_id: u64, key: &[u8], value: &[u8]) {
-        //
-        //
+    pub(crate) fn put(&mut self, cf_id: u64, key: &[u8], value: &[u8]) -> Result<()> {
         let k_len = key.len();
         let v_len = value.len();
 
-        assert!(k_len <= u32::MAX as usize);
-        assert!(v_len <= u32::MAX as usize);
-
-        let key_varint = VarInt::new(k_len as u32);
-        let value_varint = VarInt::new(v_len as u32);
+        let (key_varint, value_varint, record_size) = self.key_value_record_layout(k_len, v_len)?;
 
         let k_varint_size = key_varint.size();
         let v_varint_size = value_varint.size();
 
-        let record_size = 1 + 8 + k_len + v_len + k_varint_size + v_varint_size;
-
-        let (start, end) = self
-            .reserve_operation(record_size)
-            .unwrap_or_else(|e| panic!("{e}"));
+        let (start, end) = self.reserve_operation(record_size)?;
 
         let mut index = start;
 
@@ -1246,10 +1357,10 @@ impl BatchInner {
 
         // Update the header
         let _ = self.adjust_count_in_header(self.count);
-        //
+
+        Ok(())
     }
 
-    // TODO: Continue from here
     pub(crate) fn put_deferred<'batch>(
         &'batch mut self,
         cf_id: u64,
@@ -1258,11 +1369,9 @@ impl BatchInner {
         kind: BatchRecordKind,
     ) -> Result<DeferredOp<'batch>> {
         self.prepare_with_key_value_impl(cf_id, key_len, value_len, kind)
-            .map_err(|(record_size, attempted_batch_size)| {
-                Error::RecordSizeInBatchTooBig(record_size, attempted_batch_size)
-            })
     }
 
+    // TODO: Finishing + Need testing
     pub(crate) fn put_with<F>(
         &mut self,
         cf_id: u64,
@@ -1389,7 +1498,7 @@ mod tests {
 
         let expected_len = 33;
 
-        inner.put(DEFAULT_CF_ID, b"hello", b"world");
+        inner.put(DEFAULT_CF_ID, b"hello", b"world").unwrap();
 
         assert_eq!(inner.data.len(), 33);
     }
@@ -1407,12 +1516,110 @@ mod tests {
 
         let (k, v) = def.key_value_mut();
 
-        println!("{:?}", k);
-        println!("{:?}", v);
+        k.copy_from_slice(key);
+        v.copy_from_slice(value);
 
+        let result_k = String::from_utf8_lossy(k);
+        let result_v = String::from_utf8_lossy(v);
+
+        // Length checks
         assert_eq!(key.len(), k.len());
         assert_eq!(key.len(), v.len());
 
+        // Bytes checks
+        assert_eq!(result_k.as_bytes(), key);
+        assert_eq!(result_v.as_bytes(), value);
+
+        // Write checks
+        assert_eq!(key, def.key_mut());
+
         //
+    }
+
+    #[test]
+    fn record_may_fill_batch_to_exact_limit() {
+        let mut inner = BatchInner::new();
+        let record_size = 1 + size_of::<u64>() + 1 + 1 + 1 + 1;
+        inner.max_batch_size = BatchInner::HEADER_SIZE + record_size;
+
+        inner.put(DEFAULT_CF_ID, b"k", b"v").unwrap();
+
+        assert_eq!(inner.data.len(), inner.max_batch_size);
+        assert_eq!(inner.count, 1);
+    }
+
+    #[test]
+    fn oversized_record_is_rejected_without_initializing_batch() {
+        let mut inner = BatchInner::new();
+        inner.max_batch_size = BatchInner::HEADER_SIZE + 10;
+
+        let error = inner.put(DEFAULT_CF_ID, b"k", b"v").unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::RecordTooLarge {
+                max_batch_size,
+                ..
+            } if max_batch_size == BatchInner::HEADER_SIZE + 10
+        ));
+        assert_eq!(inner.data.len(), BatchInner::HEADER_SIZE);
+        assert_eq!(inner.count, 0);
+    }
+
+    #[test]
+    fn full_batch_rejects_next_record_without_mutation() {
+        let mut inner = BatchInner::new();
+        inner.max_batch_size = 30;
+        inner.put(DEFAULT_CF_ID, b"", b"").unwrap();
+
+        let previous_data = inner.data.clone();
+        let previous_count = inner.count;
+        let error = inner.put(DEFAULT_CF_ID, b"", b"").unwrap_err();
+
+        assert!(matches!(error, Error::BatchFull { .. }));
+        assert_eq!(inner.data, previous_data);
+        assert_eq!(inner.count, previous_count);
+    }
+
+    #[test]
+    fn oversized_user_key_is_rejected_before_reservation() {
+        let mut inner = BatchInner::new();
+
+        let error = match inner.put_deferred(
+            DEFAULT_CF_ID,
+            MAX_USER_KEY_BYTES + 1,
+            0,
+            BatchRecordKind::Put,
+        ) {
+            Ok(_) => panic!("oversized key unexpectedly reserved a record"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::KeyTooLarge {
+                size,
+                max: MAX_USER_KEY_BYTES,
+            } if size == MAX_USER_KEY_BYTES + 1
+        ));
+        assert_eq!(inner.data.len(), BatchInner::HEADER_SIZE);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn value_length_that_cannot_be_encoded_is_rejected() {
+        let mut inner = BatchInner::new();
+        let value_len = u32::MAX as usize + 1;
+
+        let error = match inner.put_deferred(DEFAULT_CF_ID, 0, value_len, BatchRecordKind::Put) {
+            Ok(_) => panic!("unencodable value length unexpectedly reserved a record"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::ValueTooLarge { size, max } if size == value_len && max == u32::MAX as usize
+        ));
+        assert_eq!(inner.data.len(), BatchInner::HEADER_SIZE);
     }
 }
