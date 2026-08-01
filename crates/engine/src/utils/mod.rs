@@ -1,3 +1,5 @@
+mod radix;
+
 pub(crate) mod cache_padded;
 pub(crate) mod skiplists;
 pub(crate) mod sync_points;
