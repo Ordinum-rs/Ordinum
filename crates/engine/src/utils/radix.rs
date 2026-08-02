@@ -29,6 +29,24 @@
 use mem::hazard::Pointer;
 use std::{array, marker::PhantomData, mem::MaybeUninit, ptr::NonNull};
 
+// --- TREE --- //
+
+struct RadixTree<T> {
+    root: NodePtr,
+    store: NodeStore<T>,
+}
+
+impl<T> RadixTree<T> {
+    fn new() -> Self {
+        Self {
+            root: NodePtr {
+                ptr: NonNull::dangling(), // FIX:
+            },
+            store: NodeStore::new(),
+        }
+    }
+}
+
 // --- SLAB --- //
 
 struct Slot<T> {
@@ -75,7 +93,7 @@ impl<T, const CHUNK_SIZE: usize> ChunkSlab<T, CHUNK_SIZE> {
 
 #[derive(Clone, Copy)]
 struct NodePtr {
-    ptr: NonNull<()>,
+    ptr: NonNull<()>, // NOTE: Tagged Pointer
 }
 
 #[repr(transparent)]
@@ -194,11 +212,11 @@ enum NodeKind {
 
 // Each entry to be wrapped by the slab
 struct NodeStore<T> {
-    node4: ChunkSlab<Node4, 12>,
-    node16: ChunkSlab<Node16, 12>,
-    node48: ChunkSlab<Node48, 8>,
-    node256: ChunkSlab<Node256, 2>,
-    leaf: ChunkSlab<Leaf<T>, 16>,
+    node4: ChunkSlab<Node4, 186>,
+    node16: ChunkSlab<Node16, 85>,
+    node48: ChunkSlab<Node48, 7>,
+    node256: ChunkSlab<Node256, 7>,
+    leaf: ChunkSlab<Leaf<T>, 186>,
 }
 
 impl<T> NodeStore<T> {
@@ -214,14 +232,33 @@ impl<T> NodeStore<T> {
 }
 
 #[test]
+fn tdd() {
+    let tree: RadixTree<String> = RadixTree::new();
+}
+
+#[test]
 fn size_estimates() {
     // TODO: Keep workiing size estimates
 
-    println!("{}", size_of::<Slot<Node4>>());
+    fn estimate_size<T>(target: usize) -> usize {
+        let size = size_of::<Slot<T>>();
+
+        if size == 0 {
+            return 1;
+        } else {
+            let chunks = target / size;
+
+            if chunks == 0 { return 1 } else { chunks }
+        }
+    }
 
     let target = 16 * 1024;
-    let chunk_est = target / size_of::<Slot<Node4>>();
-    println!("{}", chunk_est);
+
+    println!("{}", estimate_size::<Node4>(target));
+    println!("{}", estimate_size::<Node16>(target));
+    println!("{}", estimate_size::<Node48>(target));
+    println!("{}", estimate_size::<Node256>(target));
+    println!("{}", estimate_size::<Leaf<String>>(target));
 }
 
 #[test]
