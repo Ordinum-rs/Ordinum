@@ -17,28 +17,89 @@ const PTR_WIDTH: usize = 64;
 #[cfg(target_pointer_width = "32")]
 const PTR_WIDTH: usize = 32;
 
-unsafe trait Taggable<const TAG_BITS: u32>: Sized {
-    const VERIFY: () = {
-        assert!(align_of::<Self>().trailing_zeros() >= TAG_BITS);
-        assert!(TAG_BITS < usize::BITS);
-    };
+#[repr(u32)]
+pub(crate) enum TAGGABLE_BITS {
+    TAG_16 = 1,
+    TAG_32,
+    TAG_64,
+    TAG_128,
+}
 
-    fn verify() {
-        let () = Self::VERIFY;
+impl TAGGABLE_BITS {
+    const fn is_taggable(tagging: u32) -> bool {
+        match tagging {
+            1 => true,
+            2 => true,
+            3 => true,
+            4 => true,
+            _ => false,
+        }
+    }
+
+    const fn from_alignment<T>() -> u32 {
+        let trail = align_of::<T>().trailing_zeros();
+        match trail {
+            1 => TAGGABLE_BITS::TAG_16 as u32,
+            2 => TAGGABLE_BITS::TAG_32 as u32,
+            3 => TAGGABLE_BITS::TAG_64 as u32,
+            4 => TAGGABLE_BITS::TAG_128 as u32,
+            _ => unreachable!(),
+        }
     }
 }
 
-// NOTE: How to ensure alignment is more than 1?
-pub(crate) struct TaggedPointer<T: Sized> {
+unsafe trait Taggable: Sized {
+    const TAG_BITS: u32;
+    const VERIFY_ALIGNMENT: () = {
+        assert!(TAGGABLE_BITS::is_taggable(Self::TAG_BITS));
+        assert!(align_of::<Self>().trailing_zeros() == Self::TAG_BITS);
+        assert!(Self::TAG_BITS < usize::BITS);
+    };
+
+    fn verify<const REQUIRED_BITS: u32>() {
+        let () = Self::VERIFY_ALIGNMENT;
+
+        const {
+            assert!(REQUIRED_BITS > 0);
+            assert!(REQUIRED_BITS < usize::BITS);
+            assert!(Self::TAG_BITS >= REQUIRED_BITS);
+        }
+    }
+
+    fn available_bits(&self) -> usize {
+        Self::TAG_BITS as usize
+    }
+}
+
+struct TaggedPointerInner<T> {
     ptr: *const T,
 }
 
-impl<T> TaggedPointer<T> {
-    const fn something() -> usize {
-        let a = align_of::<T>();
-        if a == 8 { a } else { 0 }
+impl<T> TaggedPointerInner<T> {
+    // Standard masking methods and ptr addr mapping
+}
+
+pub(crate) struct TaggedPointer<T: Taggable, const TAG_BITS: u32> {
+    ptr: TaggedPointerInner<T>,
+}
+
+impl<T: Taggable, const TAG_BITS: u32> TaggedPointer<T, TAG_BITS> {
+    pub(crate) fn new(object: &T) -> Self {
+        // Verify first
+        T::verify::<TAG_BITS>();
+
+        Self {
+            ptr: TaggedPointerInner {
+                ptr: object as *const T,
+            },
+        }
     }
 }
+
+pub(crate) type TaggedPointer1Bit<T> = TaggedPointer<T, 1>;
+pub(crate) type TaggedPointer2Bits<T> = TaggedPointer<T, 2>;
+pub(crate) type TaggedPointer3Bits<T> = TaggedPointer<T, 3>;
+pub(crate) type TaggedPointer4Bits<T> = TaggedPointer<T, 4>;
 
 #[test]
 fn full_binary_ptr() {
@@ -91,31 +152,15 @@ fn alignment() {
 }
 
 #[test]
-fn enforce_alignment() {
-    //
-    // #[inline(always)]
-    // const fn verify_size<T, const EXPECTED_SIZE: usize>() {
-    //     struct Foo<T, const EXPECTED_SIZE: usize>(T);
-    //     impl<T, const EXPECTED_SIZE: usize> Foo<T, EXPECTED_SIZE> {
-    //         const VERIFY: () = if core::mem::size_of::<T>() != EXPECTED_SIZE {
-    //             panic!("invalid size");
-    //         };
-    //     }
-
-    //     Foo::<T, EXPECTED_SIZE>::VERIFY
-    // }
-
-    // verify_size::<u8, 10>();
-}
-
-#[test]
 fn align_of_t() {
     //
 
-    #[repr(align(2))]
+    #[repr(align(4))]
     struct Foo {
-        num: u8,
+        num: u16,
     }
+
+    println!("{}", align_of::<Foo>());
 
     impl Foo {
         fn new() -> Self {
@@ -123,33 +168,23 @@ fn align_of_t() {
         }
     }
 
-    unsafe impl Taggable<1> for Foo {}
-
-    let foo = Foo::new();
-
-    struct Bar<B, const BIT: u32>
-    where
-        B: Taggable<BIT>,
-    {
-        _blank: PhantomData<B>,
+    // We implement Taggable for Foo which means that we are saying any pointer that is produced for a Foo object
+    // is taggable because the pointer will be aligned to the alignment of the object which is of TAB_BITS either (u16, u32, u64)
+    unsafe impl Taggable for Foo {
+        const TAG_BITS: u32 = TAGGABLE_BITS::from_alignment::<Foo>();
     }
 
-    impl<B, const BITS: u32> Bar<B, BITS>
-    where
-        B: Taggable<BITS>,
-    {
-        fn new() -> Self {
-            B::verify();
-            Self {
-                _blank: PhantomData,
-            }
-        }
-    }
+    let foo = Box::new(Foo::new());
 
-    let bar = Bar::<Foo, 1>::new();
+    let tagged = TaggedPointer1Bit::<Foo>::new(&foo);
 
     //
     //
     //
     //
+}
+
+#[test]
+fn is_taggable() {
+    println!("{}", TAGGABLE_BITS::is_taggable(4))
 }
