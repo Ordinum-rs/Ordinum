@@ -17,7 +17,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "API outline until WritePipeline::commit and BatchPool release are implemented"]
+    // #[ignore = "API outline until WritePipeline::commit and BatchPool release are implemented"]
     fn correct_api() {
         // The simple correct API for caller acuired batch, accumalating operations and committing the batch
         //
@@ -55,7 +55,7 @@ mod tests {
         // We borrow the object because we want ownership to remain in the callers scope, this allows us to return early from pipeline whilst the
         // ptr reference is still queued. If we moved ownership of the Object, then the pipeline would own the NonNullBatchPtr meaning lifetime misery
         // The only problem is we can't return a transitioned state handle from the commit.
-        wp.commit(sealed_batch.inner())
+        wp.commit(&sealed_batch)
             .expect("sealed batch commit should succeed");
 
         let object = sealed_batch.reset();
