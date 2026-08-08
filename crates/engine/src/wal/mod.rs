@@ -3,6 +3,8 @@ pub(crate) mod writer;
 
 // --------------------------------------
 
+use std::fmt::Display;
+
 use crate::sync::Arc;
 use crate::sync::Condvar;
 use crate::sync::Mutex;
@@ -102,9 +104,22 @@ impl Default for SyncSem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WalSyncResultState {
     Init = 0,
-    SyncDone = 1,
-    IoError = 2,
-    WalError = 3,
+    Primed,
+    SyncDone,
+    IoError,
+    WalError,
+}
+
+impl Display for WalSyncResultState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalSyncResultState::Init => write!(f, "Init"),
+            WalSyncResultState::Primed => write!(f, "Primed"),
+            WalSyncResultState::SyncDone => write!(f, "SyncDone"),
+            WalSyncResultState::IoError => write!(f, "IoError"),
+            WalSyncResultState::WalError => write!(f, "WalError"),
+        }
+    }
 }
 
 impl From<WalSyncResultState> for u8 {
@@ -117,9 +132,10 @@ impl From<u8> for WalSyncResultState {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::Init,
-            1 => Self::SyncDone,
-            2 => Self::IoError,
-            3 => Self::WalError,
+            1 => Self::Primed,
+            2 => Self::SyncDone,
+            3 => Self::IoError,
+            4 => Self::WalError,
             _ => unreachable!("invalid WAL sync state"),
         }
     }
@@ -160,7 +176,12 @@ impl Default for SyncLogWaiter {
 impl SyncLogWaiter {
     #[inline(always)]
     fn is_terminal(&self, state: WalSyncResultState) -> bool {
-        state != WalSyncResultState::Init
+        matches!(
+            state,
+            WalSyncResultState::SyncDone
+                | WalSyncResultState::IoError
+                | WalSyncResultState::WalError
+        )
     }
 
     #[inline(always)]
@@ -169,8 +190,29 @@ impl SyncLogWaiter {
             WalSyncResultState::SyncDone => Some(Ok(())),
             WalSyncResultState::IoError => Some(Err(WalSyncResultState::IoError)),
             WalSyncResultState::WalError => Some(Err(WalSyncResultState::WalError)),
-            WalSyncResultState::Init => None,
+            _ => None,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn state(&self) -> WalSyncResultState {
+        WalSyncResultState::from(self.state.load(Ordering::Acquire))
+    }
+
+    #[inline(always)]
+    pub(crate) fn prime(&self) {
+        let state = WalSyncResultState::from(self.state.load(Ordering::Acquire));
+
+        if state == WalSyncResultState::Primed {
+            return;
+        }
+
+        debug_assert!(state == WalSyncResultState::Init);
+
+        let _guard = self.mu.lock().unwrap();
+
+        self.state
+            .store(WalSyncResultState::Primed.into(), Ordering::Release);
     }
 
     // TODO: Test this
@@ -179,11 +221,12 @@ impl SyncLogWaiter {
         for _ in 0..200 {
             let state = WalSyncResultState::from(self.state.load(Ordering::Acquire));
 
-            if state == WalSyncResultState::Init {
+            if state == WalSyncResultState::Primed {
                 spin_loop();
                 continue;
             }
 
+            // If we are in a state which is not Primed then we should return out of the wait
             if let Some(result) = Self::to_result(state) {
                 return result;
             }
@@ -201,7 +244,7 @@ impl SyncLogWaiter {
             .unwrap_or_else(|e| panic!("error on unwrapping the sync waiter mutex: {e}"));
 
         while WalSyncResultState::from(self.state.load(Ordering::Acquire))
-            == WalSyncResultState::Init
+            == WalSyncResultState::Primed
         {
             guard = self
                 .cv
@@ -224,7 +267,7 @@ impl SyncLogWaiter {
     // Signalling
 
     pub(crate) fn signal(&self, state: WalSyncResultState) {
-        assert!(state != WalSyncResultState::Init);
+        assert!(state != WalSyncResultState::Primed);
 
         let _guard = self
             .mu

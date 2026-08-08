@@ -473,8 +473,19 @@ where
 
         let b = batch.batch_ptr();
 
+        // TODO: Need to look at the safety of dereferencing here and also the lifetime of the object
+        let batch_ref: &BatchInner = unsafe { &*b.as_ptr() };
+
         // Need a queue and WAL token
         self.reserve_space();
+
+        // NOTE: Remove when we have envs in here
+        // FIX: Once the commit pipeline has env methods working we need to remove the manual prime
+        // Manually prime the sync_waiter so we don't spin on wait for now
+        // The env will take a BatchRef with an 'env lifetime
+        batch_ref
+            .sync_waiter
+            .signal(crate::wal::WalSyncResultState::SyncDone);
 
         // Hand off to DB which will carry out the write
 

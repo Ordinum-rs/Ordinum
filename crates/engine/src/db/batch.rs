@@ -22,7 +22,7 @@ use crate::sync::atomic::Ordering;
 use crate::utils::read_u32_le_unsafe;
 use crate::utils::skiplists::batch_index::BatchSkipList;
 use crate::utils::var_int::VarInt;
-use crate::wal::{SyncLogWaiter, SyncWaiter};
+use crate::wal::{SyncLogWaiter, SyncWaiter, WalSyncResultState};
 use crate::{Error, Result};
 use crate::{error, utils};
 
@@ -209,17 +209,6 @@ impl BatchCommitState for Sealed {}
 pub(crate) trait SealedBatch {
     /// Returns the stable address of the encoded Batch consumed by the pipeline.
     fn batch_ptr(&self) -> NonNull<BatchInner>;
-}
-
-// NOTE: This implementation may be unnecessary if the write pipeline only
-// accepts caller-facing `Batch<Sealed>` and `IndexedBatch<Sealed>` handles.
-// Those implementations can forward directly through `as_non_null()`, leaving
-// `BatchObject` as an internal owning/type-state detail rather than a commit
-// input in its own right.
-impl<P: BatchAllocation> SealedBatch for BatchObject<Sealed, P> {
-    fn batch_ptr(&self) -> NonNull<BatchInner> {
-        self.as_non_null()
-    }
 }
 
 // ---- Batch Factory Trait ---- //
@@ -464,6 +453,11 @@ impl<S: BatchCommitState> Batch<S> {
 
     pub(crate) fn reset(mut self) -> Batch<UnCommitted> {
         //
+        debug_assert!(
+            self.batch.can_reset(),
+            "batch cannot be reset while the pipeline still owns access"
+        );
+
         self.wait().expect("batch wait failed before reset");
 
         Batch {
@@ -504,7 +498,7 @@ impl Batch<UnCommitted> {
 
 impl SealedBatch for Batch<Sealed> {
     fn batch_ptr(&self) -> NonNull<BatchInner> {
-        self.batch.batch_ptr()
+        self.batch.as_non_null()
     }
 }
 
@@ -557,7 +551,7 @@ impl<B: BatchCommitState> IndexedBatch<B> {
 
 impl SealedBatch for IndexedBatch<Sealed> {
     fn batch_ptr(&self) -> NonNull<BatchInner> {
-        self.batch.batch_ptr()
+        self.batch.as_non_null()
     }
 }
 
@@ -680,13 +674,30 @@ impl<B: BatchCommitState, P: BatchAllocation> BatchObject<B, P> {
     }
 
     pub(super) fn wait_until_reusable(&self) -> Result<()> {
+        // SAFETY:
+        //
+        // BatchObject owns the allocation and therefore keeps it alive while this
+        // method accesses the embedded waiter. Ownership alone does not exclude
+        // non-owning pipeline pointers.
+        //
+        // The write-pipeline contract requires all accesses through those pointers
+        // to finish before commit returns and publishes `Applied`. `reset_batch`
+        // verifies that state with an Acquire load before mutating the allocation.
+        //
+        // At this point only the WAL worker may remain active, and it holds a clone
+        // of `sync_waiter`, not a pointer into the mutable batch data. Waiting here
+        // prevents the batch and its waiter from being reset or pooled before that
+        // WAL operation completes.
         let batch = unsafe { &*self.as_inner_ptr() };
 
         // TODO: Need to wait on the sync signal - do we need a timeout?
 
-        batch.sync_waiter.wait().unwrap();
-
-        Ok(())
+        match batch.sync_waiter.state() {
+            WalSyncResultState::Init => Ok(()),
+            WalSyncResultState::Primed => batch.sync_waiter.wait().map_err(|_| Error::WalError),
+            WalSyncResultState::SyncDone => Ok(()),
+            WalSyncResultState::IoError | WalSyncResultState::WalError => Err(Error::WalError),
+        }
     }
 
     pub(crate) fn can_reset(&self) -> bool {
@@ -1019,7 +1030,7 @@ pub(super) struct BatchInner {
     // worker receives a clone when this batch is written, then signals it when
     // the batch's WAL bytes are durable. Reset/reuse must wait on this waiter
     // when the batch has outstanding sync work.
-    sync_waiter: SyncWaiter,
+    pub(crate) sync_waiter: SyncWaiter,
 }
 
 impl BatchInner {
@@ -1208,6 +1219,23 @@ impl BatchInner {
         self.data.resize(end, 0);
 
         Ok((start, end))
+    }
+
+    pub(crate) fn send_sync_waiter(&self) -> SyncWaiter {
+        /*
+         * NOTE: Do we want to assert strong count is 1 here? so we know we're only sending this to WAL and not anywhere else
+         *  where we might be able to signal pipeline logic?
+         */
+        debug_assert!(Arc::strong_count(&self.sync_waiter) == 1);
+        Arc::clone(&self.sync_waiter)
+    }
+
+    pub(crate) fn prime_sync_waiter(&self) {
+        self.sync_waiter.prime();
+    }
+
+    pub(crate) fn sync_waiter_state(&self) -> WalSyncResultState {
+        self.sync_waiter.state()
     }
 
     // ---- Header ---- //
@@ -1628,5 +1656,16 @@ mod tests {
             Error::ValueTooLarge { size, max } if size == value_len && max == u32::MAX as usize
         ));
         assert_eq!(inner.data.len(), BatchInner::HEADER_SIZE);
+    }
+
+    #[test]
+    #[should_panic]
+    fn sync_waiter_send() {
+        let batch_inner = BatchInner::new();
+
+        let one = batch_inner.send_sync_waiter();
+        let two = batch_inner.send_sync_waiter();
+
+        let keep_alive = &one;
     }
 }
