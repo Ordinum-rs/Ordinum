@@ -10,8 +10,10 @@ use std::{marker::PhantomData, sync::atomic::AtomicU8};
 use crate::arena::arena::Arena;
 use crate::column_family::cf::ColumnFamilyHandle;
 use crate::db::DEFAULT_CF_ID;
+use crate::db::batch_pool::BatchPool;
 use crate::db::options::DEFAULT_MAX_WRITE_BATCH_BYTES;
 use crate::db::write_batch::BatchOpType;
+use crate::db::write_pipeline::WritePipeline;
 use crate::db::{self, db_impl::DbImpl};
 use crate::key::MAX_USER_KEY_BYTES;
 use crate::memtable::memtable::{Memtable, Mutable};
@@ -209,6 +211,11 @@ pub(crate) trait SealedBatch {
     fn batch_ptr(&self) -> NonNull<BatchInner>;
 }
 
+// NOTE: This implementation may be unnecessary if the write pipeline only
+// accepts caller-facing `Batch<Sealed>` and `IndexedBatch<Sealed>` handles.
+// Those implementations can forward directly through `as_non_null()`, leaving
+// `BatchObject` as an internal owning/type-state detail rather than a commit
+// input in its own right.
 impl<P: BatchAllocation> SealedBatch for BatchObject<Sealed, P> {
     fn batch_ptr(&self) -> NonNull<BatchInner> {
         self.as_non_null()
@@ -262,7 +269,7 @@ impl BatchFactory for IndexedBatchFactory {
 
 pub(crate) unsafe trait BatchAllocation: Send + Sized {
     fn batch_ptr(&self) -> NonNull<BatchInner>;
-    // TODO: Add a reset for reuse so when BatchObject::clear() is called we can handle both Indexed+Non-Indexed
+
     fn reset_for_reuse(&mut self);
 }
 

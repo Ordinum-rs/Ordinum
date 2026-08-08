@@ -172,6 +172,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize, P: BatchAllocation>
     }
 }
 
+// Implement the ThreadLocalObject trait for ThreadBatchCache to define the functionality for handler() for ThreadBatchCache
 impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize, P: BatchAllocation> ThreadLocalObject
     for ThreadBatchCache<CACHE_CAP, TARGET_RETAINED, P>
 {

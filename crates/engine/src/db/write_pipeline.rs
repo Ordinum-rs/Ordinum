@@ -534,7 +534,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::sync::atomic::{AtomicBool, AtomicUsize};
+    use crate::{
+        db::{batch::Batch, batch_pool::BatchPool},
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
     use std::{ptr, sync::Barrier, thread, time::Duration};
 
     use crate::db::{
@@ -675,6 +678,28 @@ mod tests {
 
     #[test]
     fn want_api() {
+        struct EnvStub;
+        impl WriterEnv for EnvStub {
+            fn apply_commit<'env>(&'env self, batch: &'env BatchRef) -> Result<()> {
+                Ok(())
+            }
+            fn prepare_commit<'env>(&'env self, batch: &'env BatchRef) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let env = Arc::new(EnvStub {});
+
+        let seq_state = Arc::new(SeqNumState::default());
+        let sync_sem = SyncQueueSem::default();
+
+        let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
+
+        let pool = Arc::new(BatchPool::new());
+        let mut batch = Batch::new(Arc::clone(&pool), BatchPool::acquire(&pool));
+
+        let _ = wp.commit(&batch.seal());
+
         /*
          * let pool = Arc::new(BatchPool::new());
          * let mut batch = Batch::new(Arc::clone(&pool), pool.acquire());
