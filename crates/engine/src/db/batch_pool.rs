@@ -279,6 +279,8 @@ struct BatchPoolStats {
 
     allocations: AtomicUsize,
     allocated_bytes: AtomicUsize,
+
+    batches_dropped: AtomicUsize,
 }
 
 impl Default for BatchPoolStats {
@@ -294,9 +296,41 @@ impl BatchPoolStats {
             global_batches_reused: AtomicUsize::new(0),
             allocations: AtomicUsize::new(0),
             allocated_bytes: AtomicUsize::new(0),
+            batches_dropped: AtomicUsize::new(0),
         }
     }
+
+    fn print_stats(&self) {
+        // XXX: At some point i might want to abstract this into utils into a table builder
+        print!(
+            concat!(
+                "\n╭───────────────────────────┬────────────────────╮\n",
+                "│ {:<25} │ {:<18} │\n",
+                "├───────────────────────────┼────────────────────┤\n",
+                "│ {:<25} │ {:<18} │\n",
+                "│ {:<25} │ {:<18} │\n",
+                "│ {:<25} │ {:<18} │\n",
+                "│ {:<25} │ {:<18} │\n",
+                "│ {:<25} │ {:<18} │\n",
+                "╰───────────────────────────┴────────────────────╯\n",
+            ),
+            "BATCH POOL STATISTICS",
+            "VALUE",
+            "TLS MISSES",
+            self.tls_misses.load(Ordering::Relaxed),
+            "GLOBAL BATCHES REUSED",
+            self.global_batches_reused.load(Ordering::Relaxed),
+            "ALLOCATIONS",
+            self.allocations.load(Ordering::Relaxed),
+            "ALLOCATED BYTES",
+            self.allocated_bytes.load(Ordering::Relaxed),
+            "BATCHES DROPPED",
+            self.batches_dropped.load(Ordering::Relaxed),
+        );
+    }
 }
+
+// TODO: Implement drop pool - thinking is we'd need to look/handle thread local pointer first? drop the column and coelesce any in-flight references
 
 // DOCS: Need docs
 pub(crate) struct BatchPoolImpl<
@@ -441,13 +475,14 @@ impl<
         let shard = &self.pool[self.shard_idx_for_cache(cache)];
 
         let mut allocated: u8 = 0;
+        let mut bytes_allocated: usize = 0;
         let mut reused: u8 = 0;
 
         // Grab a batch we can return straight away
-        let returnable_batch = match shard.pop() {
+        let (bytes_allocated, returnable_batch) = match shard.pop() {
             Some(batch) => {
                 reused += 1;
-                batch
+                (0, batch)
             }
             None => {
                 allocated += 1;
@@ -478,6 +513,9 @@ impl<
             self.stats
                 .allocations
                 .fetch_add(allocated as usize, Ordering::Relaxed);
+            self.stats
+                .allocated_bytes
+                .fetch_add(bytes_allocated, Ordering::Relaxed);
         }
         if reused != 0 {
             self.stats
@@ -556,6 +594,46 @@ impl<
                 }
             }
         })
+    }
+
+    pub(crate) fn print_stats(&self) {
+        self.stats.print_stats();
+    }
+}
+
+impl<
+    const SHARDS_PER_POOL: usize,
+    const MAX_BATCH_PER_SHARD: usize,
+    const TLS_CAP: usize,
+    const TLS_TARGET_RETAINED: usize,
+    F: BatchFactory,
+> Drop for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
+{
+    fn drop(&mut self) {
+        // BatchPoolImpl teardown relies on the DB (or another owning container)
+        // retaining an Arc to the pool until batch activity has quiesced. Batch
+        // handles also retain an Arc, so the pool cannot be destroyed while any
+        // handle can still access it. The owning container must not release its
+        // Arc early and then rely on the final outstanding batch to coordinate
+        // shutdown.
+        //
+        // Once Drop begins, no new pool operation can start and no operation may
+        // still be accessing its ThreadLocalPtr column. Retained allocations can
+        // remain in both the per-thread caches and the global shards.
+        //
+        // Teardown order:
+        //
+        // - Drop the ThreadLocalPtr first. Its column reclamation synchronously
+        //   invokes ThreadBatchCache::unref and drops every cached allocation.
+        //   Keep this field before the shard array so normal field drop order
+        //   enforces TLS-before-shards teardown.
+        // - Each shard then drains the initialized prefix of its MaybeUninit
+        //   storage in its own Drop implementation, dropping each allocation
+        //   exactly once.
+        // - The remaining ordinary pool fields can then drop normally.
+        //
+
+        println!("dropping");
     }
 }
 

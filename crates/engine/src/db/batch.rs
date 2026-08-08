@@ -229,7 +229,9 @@ pub(crate) trait BatchFactory: Send + Sync {
     type Allocation: BatchAllocation;
 
     /// Returns one valid, uniquely owned batch allocation.
-    fn allocate(&self) -> Self::Allocation;
+    fn allocate(&self) -> (usize, Self::Allocation);
+
+    fn allocate_with_capacity(&self, cap: usize) -> (usize, Self::Allocation);
 }
 
 pub(crate) struct OwnedBatchFactory;
@@ -237,8 +239,14 @@ pub(crate) struct OwnedBatchFactory;
 impl BatchFactory for OwnedBatchFactory {
     type Allocation = OwnedBatchPtr;
 
-    fn allocate(&self) -> Self::Allocation {
-        Box::new(BatchInner::new()).into()
+    fn allocate(&self) -> (usize, Self::Allocation) {
+        let batch = Box::new(BatchInner::new());
+        (batch.data.len(), batch.into())
+    }
+
+    fn allocate_with_capacity(&self, cap: usize) -> (usize, Self::Allocation) {
+        let batch = Box::new(BatchInner::new_with_capacity(cap));
+        (batch.data.len(), batch.into())
     }
 }
 
@@ -248,8 +256,12 @@ pub(crate) struct IndexedBatchFactory;
 impl BatchFactory for IndexedBatchFactory {
     type Allocation = OwnedIndexedBatchPtr;
 
-    fn allocate(&self) -> Self::Allocation {
+    fn allocate(&self) -> (usize, Self::Allocation) {
         // TODO: finish indexed allocation
+        todo!()
+    }
+
+    fn allocate_with_capacity(&self, cap: usize) -> (usize, Self::Allocation) {
         todo!()
     }
 }
@@ -443,7 +455,7 @@ pub(crate) struct Batch<S: BatchCommitState> {
 }
 
 impl<S: BatchCommitState> Batch<S> {
-    pub(crate) fn new(pool: Arc<BatchPoolImpl>, batch: BatchObject<S>) -> Self {
+    pub(super) fn new(pool: Arc<BatchPoolImpl>, batch: BatchObject<S>) -> Self {
         Self { pool, batch }
     }
 
@@ -480,7 +492,7 @@ impl<S: BatchCommitState> Batch<S> {
 }
 
 impl Batch<UnCommitted> {
-    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    pub(crate) fn put<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -742,7 +754,7 @@ impl BatchObject<UnCommitted, OwnedBatchPtr> {
         }
     }
 
-    pub(crate) fn put<K, V>(&self, key: K, value: V)
+    pub(crate) fn put<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
@@ -751,13 +763,21 @@ impl BatchObject<UnCommitted, OwnedBatchPtr> {
         self.put_cf(Self::default_cf(), key, value);
     }
 
-    pub(crate) fn put_cf<K, V>(&self, cf_id: u64, key: K, value: V)
+    pub(crate) fn put_cf<K, V>(&mut self, cf_id: u64, key: K, value: V)
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
         //
         // TODO: Finish this when we have column families and can use a resolver
+
+        // # SAFETY
+        //
+        // BatchObject owns the inner allocation and keeps it alive while this method is active. The BatchCommitState <Uncommitted>
+        // ensures that the batch object is not in the write pipeline and because we hold the BatchObject
+        // we are not in the pool or batch cache so we are safe to dereference into &BatchInner
+        let batch_inner =
+            unsafe { &mut *self.as_inner_ptr() }.put(cf_id, key.as_ref(), value.as_ref());
     }
 }
 

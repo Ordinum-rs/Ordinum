@@ -45,8 +45,7 @@ mod tests {
 
         // ============================================
 
-        let batch = pool.acquire();
-        let b = Batch::new(Arc::clone(&pool), batch);
+        let mut b = pool.acquire_batch();
 
         b.put(b"Hello", b"There");
 
@@ -59,6 +58,21 @@ mod tests {
             .expect("sealed batch commit should succeed");
 
         let object = sealed_batch.reset();
+
+        // Check batch pool stats
+        pool.print_stats();
+
+        // Want to keep alive the pool through a batch
+        drop(pool);
+
+        let still_alive = &object;
+
+        println!(
+            "still alive {}",
+            still_alive
+                .inner()
+                .state(std::sync::atomic::Ordering::Relaxed)
+        )
 
         // The caller retains ownership of `sealed_batch` throughout the commit.
         // The pipeline only borrows the underlying Batch via its stable heap address.
