@@ -707,13 +707,13 @@ mod tests {
         let wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
 
         let pool = Arc::new(BatchPool::new());
-        let mut batch = Batch::new(Arc::clone(&pool), BatchPool::acquire(&pool));
+        let mut batch = pool.acquire_batch();
 
         let _ = wp.commit(&batch.seal());
 
         /*
          * let pool = Arc::new(BatchPool::new());
-         * let mut batch = Batch::new(Arc::clone(&pool), pool.acquire());
+         * let mut batch = pool.acquire_batch();
          *
          * batch.put(key1, value1);
          * batch.put(key2, value2);

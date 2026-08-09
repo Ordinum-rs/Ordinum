@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::db::batch::Batch;
+    use crate::db::batch::{Batch, OwnedBatchFactory};
+    use crate::db::batch_pool::BatchPoolImpl;
     use crate::{Error, Result};
     use crate::{
         db::{
@@ -41,68 +42,44 @@ mod tests {
 
         let mut wp = WritePipeline::<1, EnvStub>::new_with_size(env, seq_state.clone(), sync_sem);
 
-        let mut pool = Arc::new(BatchPool::new());
+        let pool = Arc::new(BatchPoolImpl::<1, 1, 1, 1>::new());
 
         // ============================================
 
-        let mut b = pool.acquire_batch();
+        // Want stats:
+        //
+        // TLS MISSES: 3
+        // GLOBAL BATCHES REUSED: 1
+        // ALLOCATIONS: 2
+        // ALLOCATED BYTES: 24
+        // BATCHES DROPPED: 0
+
+        let one = pool.acquire_batch(); // Fresh allocation
+        let two = pool.acquire_batch(); // Fresh allocation
+
+        one.close(); // Give back to TLS
+        two.close(); // Give back to Global
+
+        let three = pool.acquire_batch(); // Acquire from TLS
+
+        let mut b = pool.acquire_batch(); // Miss on TLS - Acquire from Global
 
         b.put(b"Hello", b"There");
 
         let sealed_batch = b.seal();
 
         // We borrow the object because we want ownership to remain in the callers scope, this allows us to return early from pipeline whilst the
-        // ptr reference is still queued. If we moved ownership of the Object, then the pipeline would own the NonNullBatchPtr meaning lifetime misery
+        // ptr reference is still queued. If we moved ownership of the Object, then the pipeline would own the NonNull<BatchInner> meaning lifetime misery
         // The only problem is we can't return a transitioned state handle from the commit.
         wp.commit(&sealed_batch)
             .expect("sealed batch commit should succeed");
 
         let object = sealed_batch.reset();
 
+        let _ = object.close();
+
+        // NOTE: Need to make a snapshot stats to assert on - and it should be printable
         // Check batch pool stats
         pool.print_stats();
-
-        // Want to keep alive the pool through a batch
-        drop(pool);
-
-        let still_alive = &object;
-
-        println!(
-            "still alive {}",
-            still_alive
-                .inner()
-                .state(std::sync::atomic::Ordering::Relaxed)
-        )
-
-        // The caller retains ownership of `sealed_batch` throughout the commit.
-        // The pipeline only borrows the underlying Batch via its stable heap address.
-        //
-        // For a synchronous commit, `commit()` does not return until the batch has
-        // been fully published (and fsynced if requested). Once it returns, the caller
-        // may safely Reset() or Close() the batch.
-        //
-        // For a future NoSyncWait path, `commit()` may return before the batch has
-        // completed publication/fsync. In that case the batch remains InFlight and
-        // must not be modified, Reset()'d or Close()'d until completion is observed.
-        //
-        // While waiting for an earlier batch to complete, the caller may continue
-        // doing useful work and build additional batches:
-        //
-        // batch1.put(...)
-        // batch1.commit_no_sync_wait()
-        //
-        // batch2.put(...)
-        // batch2.commit_no_sync_wait()
-        //
-        // batch3.put(...)
-        // batch3.commit_no_sync_wait()
-        //
-        // batch1.sync_wait()
-        // batch2.sync_wait()
-        // batch3.sync_wait()
-        //
-        // This allows WAL fsync and publication latency to overlap with application
-        // work, improving throughput. Each in-flight batch remains immutable until
-        // its completion has been observed.
     }
 }

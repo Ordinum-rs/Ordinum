@@ -10,7 +10,7 @@ use std::{marker::PhantomData, sync::atomic::AtomicU8};
 use crate::arena::arena::Arena;
 use crate::column_family::cf::ColumnFamilyHandle;
 use crate::db::DEFAULT_CF_ID;
-use crate::db::batch_pool::BatchPool;
+use crate::db::batch_pool::{BatchPool, BatchPoolHandle};
 use crate::db::options::DEFAULT_MAX_WRITE_BATCH_BYTES;
 use crate::db::write_batch::BatchOpType;
 use crate::db::write_pipeline::WritePipeline;
@@ -234,6 +234,7 @@ pub(crate) trait BatchFactory: Send + Sync {
     fn allocate_with_capacity(&self, cap: usize) -> (usize, Self::Allocation);
 }
 
+#[derive(Default)]
 pub(crate) struct OwnedBatchFactory;
 
 impl BatchFactory for OwnedBatchFactory {
@@ -251,6 +252,7 @@ impl BatchFactory for OwnedBatchFactory {
 }
 
 // NOTE: Can hold state in {} if needed
+#[derive(Default)]
 pub(crate) struct IndexedBatchFactory;
 
 impl BatchFactory for IndexedBatchFactory {
@@ -356,6 +358,7 @@ unsafe impl Send for OwnedBatchPtr {}
 
 impl Drop for OwnedBatchPtr {
     fn drop(&mut self) {
+        println!("dropping batch");
         drop(unsafe { Box::from_raw(self.ptr.as_ptr()) })
     }
 }
@@ -449,21 +452,29 @@ impl Drop for OwnedIndexedBatchPtr {
 
 // ---- Batch ---- //
 
-pub(crate) struct Batch<S: BatchCommitState> {
-    pool: Arc<BatchPoolImpl>,
+pub(crate) struct Batch<S, P = BatchPool>
+where
+    S: BatchCommitState,
+    P: BatchPoolHandle<Allocation = OwnedBatchPtr>,
+{
+    pool: Arc<P>,
     batch: BatchObject<S, OwnedBatchPtr>,
 }
 
-impl<S: BatchCommitState> Batch<S> {
-    pub(super) fn new(pool: Arc<BatchPoolImpl>, batch: BatchObject<S>) -> Self {
+impl<S, P> Batch<S, P>
+where
+    S: BatchCommitState,
+    P: BatchPoolHandle<Allocation = OwnedBatchPtr>,
+{
+    pub(crate) fn new(pool: Arc<P>, batch: BatchObject<S, OwnedBatchPtr>) -> Self {
         Self { pool, batch }
     }
 
-    pub(crate) fn inner(&self) -> &BatchObject<S> {
+    pub(crate) fn inner(&self) -> &BatchObject<S, OwnedBatchPtr> {
         &self.batch
     }
 
-    pub(crate) fn reset(mut self) -> Batch<UnCommitted> {
+    pub(crate) fn reset(mut self) -> Batch<UnCommitted, P> {
         //
         debug_assert!(
             self.batch.can_reset(),
@@ -491,7 +502,10 @@ impl<S: BatchCommitState> Batch<S> {
     }
 }
 
-impl Batch<UnCommitted> {
+impl<P> Batch<UnCommitted, P>
+where
+    P: BatchPoolHandle<Allocation = OwnedBatchPtr>,
+{
     pub(crate) fn put<K, V>(&mut self, key: K, value: V)
     where
         K: AsRef<[u8]>,
@@ -500,7 +514,7 @@ impl Batch<UnCommitted> {
         self.batch.put(key, value);
     }
 
-    pub(crate) fn seal(self) -> Batch<Sealed> {
+    pub(crate) fn seal(self) -> Batch<Sealed, P> {
         Batch {
             pool: self.pool,
             batch: self.batch.seal(),
@@ -508,7 +522,10 @@ impl Batch<UnCommitted> {
     }
 }
 
-impl SealedBatch for Batch<Sealed> {
+impl<P> SealedBatch for Batch<Sealed, P>
+where
+    P: BatchPoolHandle<Allocation = OwnedBatchPtr>,
+{
     fn batch_ptr(&self) -> NonNull<BatchInner> {
         self.batch.as_non_null()
     }
@@ -516,22 +533,27 @@ impl SealedBatch for Batch<Sealed> {
 
 // ---- Index Batch ---- //
 
-pub(crate) struct IndexedBatch<B: BatchCommitState> {
-    pool: Arc<IndexedBatchPool>,
-    batch: BatchObject<B, OwnedIndexedBatchPtr>,
+pub(crate) struct IndexedBatch<S, P = IndexedBatchPool>
+where
+    S: BatchCommitState,
+    P: BatchPoolHandle<Allocation = OwnedIndexedBatchPtr>,
+{
+    pool: Arc<P>,
+    batch: BatchObject<S, OwnedIndexedBatchPtr>,
 }
 
 // TODO: Implement user facing indexed batch methods
 
-impl<B: BatchCommitState> IndexedBatch<B> {
-    pub(crate) fn new(
-        pool: Arc<IndexedBatchPool>,
-        batch: BatchObject<B, OwnedIndexedBatchPtr>,
-    ) -> Self {
+impl<S, P> IndexedBatch<S, P>
+where
+    S: BatchCommitState,
+    P: BatchPoolHandle<Allocation = OwnedIndexedBatchPtr>,
+{
+    pub(crate) fn new(pool: Arc<P>, batch: BatchObject<S, OwnedIndexedBatchPtr>) -> Self {
         Self { pool, batch }
     }
 
-    pub(crate) fn inner(&self) -> &BatchObject<B, OwnedIndexedBatchPtr> {
+    pub(crate) fn inner(&self) -> &BatchObject<S, OwnedIndexedBatchPtr> {
         &self.batch
     }
 
@@ -548,7 +570,7 @@ impl<B: BatchCommitState> IndexedBatch<B> {
         Ok(())
     }
 
-    pub(crate) fn reset(mut self) -> IndexedBatch<UnCommitted> {
+    pub(crate) fn reset(mut self) -> IndexedBatch<UnCommitted, P> {
         self.wait().expect("batch wait failed before reset");
 
         // Must reset the arena?
@@ -561,7 +583,10 @@ impl<B: BatchCommitState> IndexedBatch<B> {
     }
 }
 
-impl SealedBatch for IndexedBatch<Sealed> {
+impl<P> SealedBatch for IndexedBatch<Sealed, P>
+where
+    P: BatchPoolHandle<Allocation = OwnedIndexedBatchPtr>,
+{
     fn batch_ptr(&self) -> NonNull<BatchInner> {
         self.batch.as_non_null()
     }

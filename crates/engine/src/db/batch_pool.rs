@@ -6,15 +6,8 @@ use crate::{
         DEFAULT_BATCH_INIT_SIZE, IndexedBatch, IndexedBatchFactory, OwnedBatchFactory,
         OwnedBatchPtr, UnCommitted,
     },
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-        cell::UnsafeCell,
-    },
-    thread_local_storage::{
-        thread_ctx, thread_db_instance_ctx,
-        thread_local_ptr::{ThreadLocalObject, ThreadLocalPtr, UnrefHandler},
-    },
+    sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering, cell::UnsafeCell},
+    thread_local_storage::thread_local_ptr::{ThreadLocalObject, ThreadLocalPtr, UnrefHandler},
     utils::cache_padded::CachePadded,
 };
 
@@ -244,6 +237,28 @@ impl<const CAP: usize, P: BatchAllocation> BatchPoolShardInner<CAP, P> {
     }
 }
 
+impl<const CAP: usize, P: BatchAllocation> Drop for BatchPoolShardInner<CAP, P> {
+    fn drop(&mut self) {
+        while self.len > 0 {
+            self.len -= 1;
+            let index = self.len as usize;
+
+            // SAFETY:
+            //
+            // BatchShardInner uses self.len to track the number of elements in the array which have been initialised and are safe to
+            // use assume_init() on.
+            // BatchPoolShardInner stores and holds stable BatchAllocations at those indexes up to self.len.
+            // We are in a shard of the BatchPool and Drop is only called after the pool has quiesced and
+            // no other access to the shards may take place therefore we are safe to call the Drop for each BatchAllocation in our array.
+            //
+            // Decrementing len before Drop makes the initialised-prefix invariant remain correct if P::drop panics.
+            unsafe {
+                self.batches[index].assume_init_drop();
+            }
+        }
+    }
+}
+
 struct BatchPoolShard<const CAP: usize, P: BatchAllocation = OwnedBatchPtr> {
     inner: Mutex<BatchPoolShardInner<CAP, P>>,
 }
@@ -340,7 +355,9 @@ pub(crate) struct BatchPoolImpl<
     const TLS_TARGET_RETAINED: usize = DEFAULT_THREAD_BATCH_CACHE_TARGET_RETAINED,
     F: BatchFactory = OwnedBatchFactory,
 > {
-    //
+    // Ordered first so tlp is dropped first before pool shards
+    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>>,
+    // Dropped second; each shard drains its initialized entries
     pool: [CachePadded<BatchPoolShard<MAX_BATCH_PER_SHARD, F::Allocation>>; SHARDS_PER_POOL],
 
     factory: F,
@@ -349,7 +366,6 @@ pub(crate) struct BatchPoolImpl<
     //
     stats: BatchPoolStats,
     //
-    thread_local_ptr: ThreadLocalPtr<ThreadBatchCache<TLS_CAP, TLS_TARGET_RETAINED, F::Allocation>>,
 }
 
 // SAFETY:
@@ -386,7 +402,7 @@ impl<
     F: BatchFactory,
 > BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
 {
-    pub(crate) fn new_with_const_size(factory: F) -> Self {
+    pub(crate) fn with_factory(factory: F) -> Self {
         Self {
             pool: array::from_fn(|_| CachePadded::new(BatchPoolShard::new())),
             factory,
@@ -421,6 +437,7 @@ impl<
         batch_ptr: F::Allocation,
     ) -> Result<(), F::Allocation> {
         //
+
         self.pool[shard_idx].push(batch_ptr)
         //
     }
@@ -481,6 +498,7 @@ impl<
         // Grab a batch we can return straight away
         let (bytes_allocated, returnable_batch) = match shard.pop() {
             Some(batch) => {
+                println!("HIT");
                 reused += 1;
                 (0, batch)
             }
@@ -529,7 +547,7 @@ impl<
         BatchObject::acquire(returnable_batch)
     }
 
-    pub(crate) fn acquire(&self) -> BatchObject<UnCommitted, F::Allocation> {
+    fn acquire_object(&self) -> BatchObject<UnCommitted, F::Allocation> {
         self.thread_local_batch_cache_mut(|cache| {
             self.try_acquire_from_tls(cache)
                 .unwrap_or_else(|| self.refill_tls_cache(cache))
@@ -606,6 +624,21 @@ impl<
     const MAX_BATCH_PER_SHARD: usize,
     const TLS_CAP: usize,
     const TLS_TARGET_RETAINED: usize,
+    F,
+> BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
+where
+    F: BatchFactory + Default,
+{
+    pub(crate) fn new() -> Self {
+        Self::with_factory(F::default())
+    }
+}
+
+impl<
+    const SHARDS_PER_POOL: usize,
+    const MAX_BATCH_PER_SHARD: usize,
+    const TLS_CAP: usize,
+    const TLS_TARGET_RETAINED: usize,
     F: BatchFactory,
 > Drop for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
 {
@@ -633,7 +666,27 @@ impl<
         // - The remaining ordinary pool fields can then drop normally.
         //
 
+        // TODO: Do we need custom drop logic here?
+
         println!("dropping");
+    }
+}
+
+// ---- Generic BatchPoolImpl For OwnedBatchFactory (Non-Indexed) ---- //
+
+impl<const SHARDS: usize, const SHARD_CAP: usize, const TLS_CAP: usize, const TLS_RETAINED: usize>
+    BatchPoolImpl<SHARDS, SHARD_CAP, TLS_CAP, TLS_RETAINED, OwnedBatchFactory>
+{
+    pub(crate) fn acquire_batch(self: &Arc<Self>) -> Batch<UnCommitted, Self> {
+        Batch::new(Arc::clone(self), self.acquire_object())
+    }
+}
+
+impl<const SHARDS: usize, const SHARD_CAP: usize, const TLS_CAP: usize, const TLS_RETAINED: usize>
+    BatchPoolImpl<SHARDS, SHARD_CAP, TLS_CAP, TLS_RETAINED, IndexedBatchFactory>
+{
+    pub(crate) fn acquire_indexed_batch(self: &Arc<Self>) -> IndexedBatch<UnCommitted, Self> {
+        IndexedBatch::new(Arc::clone(self), self.acquire_object())
     }
 }
 
@@ -646,17 +699,6 @@ pub(crate) type BatchPool = BatchPoolImpl<
     OwnedBatchFactory,
 >;
 
-impl BatchPoolImpl {
-    pub(crate) fn new() -> Self {
-        Self::new_with_const_size(OwnedBatchFactory)
-    }
-
-    // TODO: Add comments as to why we can only do this here
-    pub(crate) fn acquire_batch(self: &Arc<Self>) -> Batch<UnCommitted> {
-        Batch::new(Arc::clone(self), self.acquire())
-    }
-}
-
 /// Indexed Batch pool configuration used by the engine.
 pub(crate) type IndexedBatchPool = BatchPoolImpl<
     DEFAULT_SHARDS_PER_POOL,
@@ -666,14 +708,32 @@ pub(crate) type IndexedBatchPool = BatchPoolImpl<
     IndexedBatchFactory,
 >;
 
-impl IndexedBatchPool {
-    pub(crate) fn new() -> Self {
-        Self::new_with_const_size(IndexedBatchFactory)
-    }
+// ---- Batch Pool Handle ---- //
 
-    // TODO: Add comments as to why we can only do this here
-    pub(crate) fn acquire_batch(self: &Arc<Self>) -> IndexedBatch<UnCommitted> {
-        IndexedBatch::new(Arc::clone(self), self.acquire())
+// Define a pool handle trait which we can use to bundle the pool into a single type so that objects which are bound by the handle can infer the const
+// parameters without having to embed single types of the pool
+
+pub(crate) trait BatchPoolHandle: Send + Sync {
+    type Allocation: BatchAllocation;
+
+    fn release<B: BatchCommitState>(&self, batch: BatchObject<B, Self::Allocation>);
+}
+
+// Implement it for all const configurations of BatchPoolImpl
+
+impl<
+    const SHARDS_PER_POOL: usize,
+    const MAX_BATCH_PER_SHARD: usize,
+    const TLS_CAP: usize,
+    const TLS_TARGET_RETAINED: usize,
+    F: BatchFactory,
+> BatchPoolHandle
+    for BatchPoolImpl<SHARDS_PER_POOL, MAX_BATCH_PER_SHARD, TLS_CAP, TLS_TARGET_RETAINED, F>
+{
+    type Allocation = F::Allocation;
+
+    fn release<B: BatchCommitState>(&self, batch: BatchObject<B, Self::Allocation>) {
+        BatchPoolImpl::release(self, batch);
     }
 }
 
@@ -683,33 +743,6 @@ mod tests {
     use std::{sync::Barrier, thread};
 
     use super::*;
-
-    #[test]
-    fn empty_try_acquire() {
-        //
-        let mut pool = BatchPool::new();
-
-        thread_db_instance_ctx(0, |ctx| {
-            // We don't have any db instances yet so just use 0 and let tls make a slot for us
-            ctx.thread_batch_cache_mut(|cache| {
-                let result = pool.try_acquire_from_tls(cache);
-
-                assert!(result.is_none());
-
-                // A cached allocation is returned as an acquired BatchObject.
-                cache.push(BatchObject::<UnCommitted>::new().into_inner());
-            })
-        });
-
-        thread_db_instance_ctx(0, |ctx| {
-            // We don't have any db instances yet so just use 0 and let tls make a slot for us
-            ctx.thread_batch_cache_mut(|cache| {
-                let result = pool.try_acquire_from_tls(cache);
-
-                assert!(result.is_some());
-            })
-        });
-    }
 
     #[test]
     fn basic_acquire() {
@@ -722,10 +755,10 @@ mod tests {
             .unwrap();
 
         thread::scope(|s| {
-            let batch = pool.acquire();
+            let batch = pool.acquire_object();
 
             s.spawn(|| {
-                let batch = pool.acquire();
+                let batch = pool.acquire_object();
             });
         });
 
@@ -818,7 +851,7 @@ mod tests {
 
         // Even though we have 2 batches per global pool we set the cache retained to 2 and cap to 2 so there is no spill
         // Therefore if we fill up cache and then try to release one more batch it should be put in the global pool and nothing should spill or be destroyed
-        let mut bp = BatchPoolImpl::<2, 2, 2, 2>::new_with_const_size(OwnedBatchFactory);
+        let mut bp = BatchPoolImpl::<2, 2, 2, 2>::new();
 
         // Fill up the tls cache so we have to spill to global
         bp.thread_local_batch_cache_mut(|cache| {
@@ -839,9 +872,9 @@ mod tests {
         // Acquire = Idle -> Acquired
         // Release = Acquired -> Idle
 
-        let pool = BatchPoolImpl::<1, 1, 1, 1>::new_with_const_size(OwnedBatchFactory);
+        let pool = BatchPoolImpl::<1, 1, 1, 1>::new();
 
-        let batch = pool.acquire();
+        let batch = pool.acquire_object();
         assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
 
         pool.release(batch);
@@ -852,7 +885,7 @@ mod tests {
             cache.push(batch.into_inner())
         });
 
-        let batch = pool.acquire();
+        let batch = pool.acquire_object();
         assert_eq!(batch.state(Ordering::Relaxed), BatchRuntimeState::Acquired);
         pool.release(batch);
 

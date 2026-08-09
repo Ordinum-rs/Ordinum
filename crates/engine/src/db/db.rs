@@ -12,7 +12,6 @@ use crate::db::write_pipeline::WritePipeline;
 use crate::sync::Arc;
 use crate::sync::atomic::AtomicUsize;
 use crate::sync::atomic::Ordering;
-use crate::thread_local_storage::static_meta;
 use crate::wal::SyncQueueSem;
 
 // -------------------------------------------------------------
@@ -50,7 +49,7 @@ impl DB {
 
         Self {
             db_id: id,
-            tls_id: static_meta().next_tls_id.fetch_add(1, Ordering::AcqRel),
+            tls_id: 0, // NOTE: To change
             inner: Arc::clone(&db_impl),
             write_pipeline: Arc::new(WritePipeline::new(
                 Arc::clone(&db_impl),
