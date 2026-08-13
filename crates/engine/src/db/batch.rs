@@ -358,7 +358,6 @@ unsafe impl Send for OwnedBatchPtr {}
 
 impl Drop for OwnedBatchPtr {
     fn drop(&mut self) {
-        println!("dropping batch");
         drop(unsafe { Box::from_raw(self.ptr.as_ptr()) })
     }
 }
@@ -998,6 +997,7 @@ impl<'batch> DeferredOp<'batch> {
     // TODO: Need finish() method
     pub(crate) fn finish(mut self) {
         //
+        // Once finish is called - if we are an indexed batch we then would insert the operations into the skiplist either regular or range del
 
         //
     }
@@ -1005,6 +1005,7 @@ impl<'batch> DeferredOp<'batch> {
     // TODO: Need rollback() method
     fn rollback(&mut self) {
         //
+        // rollback is simply the mechanism to unreserve batch buffer space if we error during writing
 
         //
     }
@@ -1219,6 +1220,9 @@ impl BatchInner {
     }
 
     fn reserve_operation(&mut self, record_size: usize) -> Result<(usize, usize)> {
+        // Start with calculating what an empty batch size would be for this record - reason is if the record itself is too big for a batch
+        // we want to return that error immediately so caller can handle that and so that we don't try to create a new batch only to fail
+        // again because the record size is actually too big for any batch even empty ones
         let empty_batch_size =
             Self::HEADER_SIZE
                 .checked_add(record_size)
@@ -1233,12 +1237,19 @@ impl BatchInner {
                 max_batch_size: self.max_batch_size,
             });
         }
+        // We can safely fit into an empty batch if we need to.
 
+        // Check if we need to intialise the batch buffer where len will be after Self::HEADER_SIZE
         let current_size = if self.data.is_empty() {
+            // If data buffer is empty then we need to set the current size to header and also init the buffer
+            self.init_buffer(record_size);
             Self::HEADER_SIZE
         } else {
             self.data.len()
         };
+
+        // Reserve the end of the space we need inside the buffer
+        // Checking to make sure that we don't spill the buffer meaning it's full
         let end = current_size
             .checked_add(record_size)
             .ok_or(Error::BatchFull {
@@ -1255,12 +1266,12 @@ impl BatchInner {
             });
         }
 
-        if self.data.is_empty() {
-            self.init_buffer(record_size);
-        }
-
+        // len here will be the beginning of the reservation because we have only written up until that point - capacity is the full buffer capacity
+        // and end is the end point within the capacity after len giving us the span of memory in buffer we want
         let start = self.data.len();
 
+        // By resizing we are effectively setting the len to the end of the reserved memory in buffer so future writers can begin writing there and do not
+        // touch our reserved space. Because we can return a DeferredOp struct it's important that we do this so we can fill the space when we want as we've reserved it
         self.data.resize(end, 0);
 
         Ok((start, end))
@@ -1318,17 +1329,24 @@ impl BatchInner {
             });
         }
 
+        // Key
         let encoded_key_len = u32::try_from(key_len).map_err(|_| Error::KeyTooLarge {
             size: key_len,
             max: u32::MAX as usize,
         })?;
+
+        let key_varint = VarInt::new(encoded_key_len);
+
+        // Value
         let encoded_value_len = u32::try_from(value_len).map_err(|_| Error::ValueTooLarge {
             size: value_len,
             max: u32::MAX as usize,
         })?;
 
-        let key_varint = VarInt::new(encoded_key_len);
         let value_varint = VarInt::new(encoded_value_len);
+
+        // Record Binary:
+        // | op_type (1 byte) | cf_id (u64 LE) | key_len (VarInt) | key ... | value_len (VarInt) | value ... |
         let record_size = 1usize
             .checked_add(size_of::<u64>())
             .and_then(|size| size.checked_add(key_varint.size()))
@@ -1451,7 +1469,6 @@ impl BatchInner {
         self.prepare_with_key_value_impl(cf_id, key_len, value_len, kind)
     }
 
-    // TODO: Finishing + Need testing
     pub(crate) fn put_with<F>(
         &mut self,
         cf_id: u64,
@@ -1460,10 +1477,11 @@ impl BatchInner {
         kind: BatchRecordKind,
         f: F,
     ) where
-        F: FnOnce(DeferredOp),
+        F: FnOnce(Result<DeferredOp>),
     {
         // Deferred op inside the closure
-        todo!()
+        let deferred = self.put_deferred(cf_id, key_len, value_len, kind);
+        f(deferred)
     }
 
     pub(super) fn clear(&mut self) {

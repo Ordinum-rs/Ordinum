@@ -298,6 +298,14 @@ struct BatchPoolStats {
     batches_dropped: AtomicUsize,
 }
 
+pub(crate) struct BatchPoolStatsSnapshot {
+    pub(crate) tls_misses: usize,
+    pub(crate) global_batches_reused: usize,
+    pub(crate) allocations: usize,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) batches_dropped: usize,
+}
+
 impl Default for BatchPoolStats {
     fn default() -> Self {
         Self::new()
@@ -342,6 +350,16 @@ impl BatchPoolStats {
             "BATCHES DROPPED",
             self.batches_dropped.load(Ordering::Relaxed),
         );
+    }
+
+    fn snapshot(&self) -> BatchPoolStatsSnapshot {
+        BatchPoolStatsSnapshot {
+            tls_misses: self.tls_misses.load(Ordering::Relaxed),
+            global_batches_reused: self.global_batches_reused.load(Ordering::Relaxed),
+            allocations: self.allocations.load(Ordering::Relaxed),
+            allocated_bytes: self.allocated_bytes.load(Ordering::Relaxed),
+            batches_dropped: self.batches_dropped.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -498,7 +516,6 @@ impl<
         // Grab a batch we can return straight away
         let (bytes_allocated, returnable_batch) = match shard.pop() {
             Some(batch) => {
-                println!("HIT");
                 reused += 1;
                 (0, batch)
             }
@@ -617,6 +634,10 @@ impl<
     pub(crate) fn print_stats(&self) {
         self.stats.print_stats();
     }
+
+    pub(crate) fn snapshot_stats(&self) -> BatchPoolStatsSnapshot {
+        self.stats.snapshot()
+    }
 }
 
 impl<
@@ -667,8 +688,6 @@ impl<
         //
 
         // TODO: Do we need custom drop logic here?
-
-        println!("dropping");
     }
 }
 

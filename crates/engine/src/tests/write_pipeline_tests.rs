@@ -81,5 +81,13 @@ mod tests {
         // NOTE: Need to make a snapshot stats to assert on - and it should be printable
         // Check batch pool stats
         pool.print_stats();
+
+        let stats = pool.snapshot_stats();
+
+        assert_eq!(stats.tls_misses, 3);
+        assert_eq!(stats.global_batches_reused, 1);
+        assert_eq!(stats.allocations, 2);
+        assert_eq!(stats.allocated_bytes, 24);
+        assert_eq!(stats.batches_dropped, 0);
     }
 }
