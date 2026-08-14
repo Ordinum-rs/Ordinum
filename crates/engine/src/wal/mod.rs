@@ -153,6 +153,7 @@ pub(crate) type SyncWaiter = Arc<SyncLogWaiter>;
 /// `state` is atomic so callers can spin briefly on the fast path before
 /// falling back to the mutex/condvar path for longer waits. The mutex still
 /// coordinates condvar sleep/wake transitions to avoid missed notifications.
+#[derive(Debug)]
 pub(crate) struct SyncLogWaiter {
     state: AtomicU8,
     mu: Mutex<()>,

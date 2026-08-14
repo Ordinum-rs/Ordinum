@@ -92,6 +92,7 @@ const DEFAULT_INLINE_CF_ARRAY: usize = 4;
 
 // ---- Batch Meta ---- //
 
+#[derive(Debug)]
 struct BatchMeta {
     first_seen_cf_id: u64,
     multiple_cf_ids: bool,
@@ -116,8 +117,10 @@ impl BatchMeta {
  *
  * XXX: Future optimisation being flushable batches to avoid wasting current memtable space
 */
+#[derive(Debug)]
 struct CFTableEntry((u64, NonNull<Memtable<Mutable>>));
 
+#[derive(Debug)]
 struct CFTable {
     len: usize,
     vec: Vec<CFTableEntry>,
@@ -923,6 +926,7 @@ impl IndexedBatchInner {
 
 // ------------------------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub(crate) struct DeferredOp<'batch> {
     _life: PhantomData<&'batch ()>,
     batch: Option<&'batch mut BatchInner>,
@@ -995,11 +999,9 @@ impl<'batch> DeferredOp<'batch> {
     }
 
     // TODO: Need finish() method
-    pub(crate) fn finish(mut self) {
-        //
-        // Once finish is called - if we are an indexed batch we then would insert the operations into the skiplist either regular or range del
-
-        //
+    // We don't want this to consume self because we want to allow drop to handle the deferred op
+    pub(crate) fn finish(&mut self) {
+        self.batch = None
     }
 
     // TODO: Need rollback() method
@@ -1012,6 +1014,17 @@ impl<'batch> DeferredOp<'batch> {
 }
 
 // TODO: Implement Drop for DeferredOp which rolls back the inner batch buffer to original reservation start IF batch is some()
+impl<'batch> Drop for DeferredOp<'batch> {
+    fn drop(&mut self) {
+        // If batch is None then we do nothing else we need to rollback and then drop
+        if self.batch.is_some() {
+            println!("Rolling ...");
+            self.rollback();
+            return;
+        }
+        println!("Dropping normally");
+    }
+}
 
 //
 
@@ -1030,6 +1043,7 @@ impl<'batch> DeferredOp<'batch> {
 //
 //
 //
+#[derive(Debug)]
 pub(super) struct BatchInner {
     // ----
     // Operaton Data
@@ -1459,15 +1473,19 @@ impl BatchInner {
         Ok(())
     }
 
-    pub(crate) fn put_deferred<'batch>(
-        &'batch mut self,
-        cf_id: u64,
-        key_len: usize,
-        value_len: usize,
-        kind: BatchRecordKind,
-    ) -> Result<DeferredOp<'batch>> {
-        self.prepare_with_key_value_impl(cf_id, key_len, value_len, kind)
-    }
+    /* NOTE: Keeping this because i want to benchmark against using closures - pebble avoids closures because of the
+     *  function calling overhead and to avoid allocation through closure capture. This may be just a Go optimisation, Rust stack allocates closures
+     *  and compiles them down to inline structs.
+     */
+    // pub(crate) fn put_deferred<'batch>(
+    //     &'batch mut self,
+    //     cf_id: u64,
+    //     key_len: usize,
+    //     value_len: usize,
+    //     kind: BatchRecordKind,
+    // ) -> Result<DeferredOp<'batch>> {
+    //     self.prepare_with_key_value_impl(cf_id, key_len, value_len, kind)
+    // }
 
     pub(crate) fn put_with<F>(
         &mut self,
@@ -1476,12 +1494,23 @@ impl BatchInner {
         value_len: usize,
         kind: BatchRecordKind,
         f: F,
-    ) where
-        F: FnOnce(Result<DeferredOp>),
+    ) -> Result<()>
+    where
+        F: FnOnce(&mut DeferredOp),
     {
         // Deferred op inside the closure
-        let deferred = self.put_deferred(cf_id, key_len, value_len, kind);
-        f(deferred)
+        self.prepare_with_key_value_impl(cf_id, key_len, value_len, kind)
+            .map_or_else(
+                // FIX: Do we want to panic here? May need better error handling
+                |err| Err(err),
+                |mut def| {
+                    f(&mut def);
+                    def.finish();
+                    Ok(())
+                },
+            )
+
+        // After this closure finishes - if we haven't panicked then we should call deferred.finish()
     }
 
     pub(super) fn clear(&mut self) {
@@ -1579,18 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_prepare_put() {
-        //
-        let mut batch = BatchInner::new();
-
-        let deferred_op = batch
-            .prepare_with_key_value_impl(0, 0, 0, BatchRecordKind::Put)
-            .unwrap();
-
-        batch.count = 1;
-    }
-
-    #[test]
     fn inner_put() {
         let mut inner = BatchInner::new_with_capacity(100);
 
@@ -1601,37 +1618,38 @@ mod tests {
         assert_eq!(inner.data.len(), 33);
     }
 
+    #[should_panic]
     #[test]
     fn put_deferred() {
         let mut inner = BatchInner::new_with_capacity(40);
 
         let key = b"Hello";
+        let wrong_key = b"GoodAfternoon"; // We use a wrong key here to inject into the deferred closure which is more than the reserved space
         let value = b"World";
 
-        let mut def = inner
-            .put_deferred(0, key.len(), value.len(), BatchRecordKind::Put)
-            .unwrap_or_else(|e| panic!("{:?}", e));
+        inner.put_with(0, key.len(), value.len(), BatchRecordKind::Put, |def| {
+            let (k, v) = def.key_value_mut();
 
-        let (k, v) = def.key_value_mut();
+            k.copy_from_slice(wrong_key);
+            v.copy_from_slice(value);
 
-        k.copy_from_slice(key);
-        v.copy_from_slice(value);
+            let result_k = String::from_utf8_lossy(k);
+            let result_v = String::from_utf8_lossy(v);
 
-        let result_k = String::from_utf8_lossy(k);
-        let result_v = String::from_utf8_lossy(v);
+            // Length checks
+            assert_eq!(key.len(), k.len());
+            assert_eq!(key.len(), v.len());
 
-        // Length checks
-        assert_eq!(key.len(), k.len());
-        assert_eq!(key.len(), v.len());
+            // Bytes checks
+            assert_eq!(result_k.as_bytes(), key);
+            assert_eq!(result_v.as_bytes(), value);
 
-        // Bytes checks
-        assert_eq!(result_k.as_bytes(), key);
-        assert_eq!(result_v.as_bytes(), value);
+            // Write checks
+            assert_eq!(key, def.key_mut());
+        });
 
-        // Write checks
-        assert_eq!(key, def.key_mut());
-
-        //
+        // Deferred closure should panic and also rollback
+        // We can assert buffer len in the closure and then out of the closure here to confirm
     }
 
     #[test]
@@ -1683,15 +1701,15 @@ mod tests {
     fn oversized_user_key_is_rejected_before_reservation() {
         let mut inner = BatchInner::new();
 
-        let error = match inner.put_deferred(
-            DEFAULT_CF_ID,
-            MAX_USER_KEY_BYTES + 1,
-            0,
-            BatchRecordKind::Put,
-        ) {
-            Ok(_) => panic!("oversized key unexpectedly reserved a record"),
-            Err(error) => error,
-        };
+        let error = inner
+            .put_with(
+                DEFAULT_CF_ID,
+                MAX_USER_KEY_BYTES + 1,
+                0,
+                BatchRecordKind::Put,
+                |def| (),
+            )
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1709,10 +1727,11 @@ mod tests {
         let mut inner = BatchInner::new();
         let value_len = u32::MAX as usize + 1;
 
-        let error = match inner.put_deferred(DEFAULT_CF_ID, 0, value_len, BatchRecordKind::Put) {
-            Ok(_) => panic!("unencodable value length unexpectedly reserved a record"),
-            Err(error) => error,
-        };
+        let error =
+            match inner.put_with(DEFAULT_CF_ID, 0, value_len, BatchRecordKind::Put, |def| ()) {
+                Ok(_) => panic!("unencodable value length unexpectedly reserved a record"),
+                Err(error) => error,
+            };
 
         assert!(matches!(
             error,
