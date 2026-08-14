@@ -133,6 +133,7 @@ impl<const CACHE_CAP: usize, const TARGET_RETAINED: usize, P: BatchAllocation>
         // takes exclusive ownership and marks the live allocation idle before
         // publishing it in the initialized cache prefix.
 
+        // TODO: Need safety comment
         unsafe { &*entry.batch_ptr().as_ptr() }
             .set_runtime_state(super::batch::BatchRuntimeState::Idle, Ordering::Release);
 

@@ -9,3 +9,5 @@ pub(crate) trait WALManager {
     fn create(/* */);
     //
 }
+
+// NOTE: Writes and Reads are handled by a log::Reader and log::Writer

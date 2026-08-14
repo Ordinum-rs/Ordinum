@@ -473,7 +473,11 @@ where
 
         let b = batch.batch_ptr();
 
-        // TODO: Need to look at the safety of dereferencing here and also the lifetime of the object
+        // SAFETY
+        //
+        // We are safe to dereference because the pipeline is passed a SealedBatch which is a BatchObject with the type state <Sealed> holding a
+        // heap allocated BatchPtr and the caller passes a reference to the BatchObject where the drop implementation waits for the Batch to be
+        // safe to drop and deallocate. So while we are in the commit() the Batch and the underlying memory will be kept alive and not moved
         let batch_ref: &BatchInner = unsafe { &*b.as_ptr() };
 
         // Need a queue and WAL token
