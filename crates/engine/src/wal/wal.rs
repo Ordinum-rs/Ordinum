@@ -5,6 +5,8 @@ pub(super) struct WAL {
     //
 }
 
+// https://github.com/cockroachdb/pebble/blob/master/internal/base/directory_lock.go
+
 // Key points to understand:
 //
 // 1. Obselete Virtual WAL's:

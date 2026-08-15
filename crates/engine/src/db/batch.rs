@@ -1003,7 +1003,6 @@ impl<'batch> DeferredOp<'batch> {
         self.batch = None
     }
 
-    // TODO: Need rollback() method
     fn rollback(&mut self) {
         //
         debug_assert!(self.batch.is_some());
@@ -1016,20 +1015,19 @@ impl<'batch> DeferredOp<'batch> {
             .data
             .resize(self.reservation_start, 0);
 
+        debug_assert!(self.batch.as_deref().unwrap().data.len() == self.reservation_start)
+
         //
     }
 }
 
-// TODO: Implement Drop for DeferredOp which rolls back the inner batch buffer to original reservation start IF batch is some()
 impl<'batch> Drop for DeferredOp<'batch> {
     fn drop(&mut self) {
         // If batch is None then we do nothing else we need to rollback and then drop
         if self.batch.is_some() {
-            println!("Rolling ...");
             self.rollback();
             return;
         }
-        println!("Dropping normally");
     }
 }
 
@@ -1672,13 +1670,13 @@ mod tests {
         // KEY     - 5  +
         // VAR INT - 1  +
         // VALUE   - 5  +
-        //        = 31
+        //         = 33
 
         inner.put_with(0, key.len(), value.len(), BatchRecordKind::Put, |def| {
-            let (k, v) = def.key_value_mut();
-
             // Assert that we have correct reserved space
-            assert_eq!(def.reservation_end, )
+            assert_eq!(def.reservation_end, 33);
+
+            let (k, v) = def.key_value_mut();
 
             k.copy_from_slice(wrong_key);
             v.copy_from_slice(value);
