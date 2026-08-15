@@ -998,7 +998,6 @@ impl<'batch> DeferredOp<'batch> {
         (key, &mut value[..self.value_len])
     }
 
-    // TODO: Need finish() method
     // We don't want this to consume self because we want to allow drop to handle the deferred op
     pub(crate) fn finish(&mut self) {
         self.batch = None
@@ -1007,7 +1006,15 @@ impl<'batch> DeferredOp<'batch> {
     // TODO: Need rollback() method
     fn rollback(&mut self) {
         //
+        debug_assert!(self.batch.is_some());
         // rollback is simply the mechanism to unreserve batch buffer space if we error during writing
+        self.reservation_end = self.reservation_start;
+
+        self.batch
+            .as_deref_mut()
+            .expect("found None for Batch when trying to Rollback")
+            .data
+            .resize(self.reservation_start, 0);
 
         //
     }
@@ -1618,19 +1625,17 @@ mod tests {
         assert_eq!(inner.data.len(), 33);
     }
 
-    #[should_panic]
     #[test]
-    fn put_deferred() {
+    fn put_deferred_ok() {
         let mut inner = BatchInner::new_with_capacity(40);
 
         let key = b"Hello";
-        let wrong_key = b"GoodAfternoon"; // We use a wrong key here to inject into the deferred closure which is more than the reserved space
         let value = b"World";
 
         inner.put_with(0, key.len(), value.len(), BatchRecordKind::Put, |def| {
             let (k, v) = def.key_value_mut();
 
-            k.copy_from_slice(wrong_key);
+            k.copy_from_slice(key);
             v.copy_from_slice(value);
 
             let result_k = String::from_utf8_lossy(k);
@@ -1646,6 +1651,40 @@ mod tests {
 
             // Write checks
             assert_eq!(key, def.key_mut());
+        });
+    }
+
+    // TODO: Check my rollback works
+    #[should_panic]
+    #[test]
+    fn put_deferred_rollback() {
+        let mut inner = BatchInner::new_with_capacity(40);
+
+        let key = b"Hello";
+        let wrong_key = b"GoodAfternoon"; // We use a wrong key here to inject into the deferred closure which is more than the reserved space
+        let value = b"World";
+
+        // Reserved should equal
+        // HEADER  - 12 +
+        // OP TYPE - 1  +
+        // CF ID   - 8  +
+        // VAR INT - 1  +
+        // KEY     - 5  +
+        // VAR INT - 1  +
+        // VALUE   - 5  +
+        //        = 31
+
+        inner.put_with(0, key.len(), value.len(), BatchRecordKind::Put, |def| {
+            let (k, v) = def.key_value_mut();
+
+            // Assert that we have correct reserved space
+            assert_eq!(def.reservation_end, )
+
+            k.copy_from_slice(wrong_key);
+            v.copy_from_slice(value);
+
+            let result_k = String::from_utf8_lossy(k);
+            let result_v = String::from_utf8_lossy(v);
         });
 
         // Deferred closure should panic and also rollback

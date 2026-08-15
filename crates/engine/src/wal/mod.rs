@@ -1,4 +1,5 @@
 pub(crate) mod manager;
+pub(crate) mod wal;
 pub(crate) mod writer;
 
 // --------------------------------------
