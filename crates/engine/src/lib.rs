@@ -11,6 +11,7 @@ mod db;
 pub mod error;
 mod iterator;
 mod key;
+mod log_records;
 mod memtable;
 mod options;
 mod range;
