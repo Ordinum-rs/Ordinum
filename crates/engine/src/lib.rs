@@ -17,6 +17,7 @@ mod options;
 mod range;
 mod thread_local_storage;
 mod version;
+mod virtual_file_system;
 mod wal;
 
 pub mod block;
