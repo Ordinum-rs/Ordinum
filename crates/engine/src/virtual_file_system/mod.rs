@@ -21,48 +21,75 @@
 
 use std::{
     env::temp_dir,
-    file, fs,
-    io::{Cursor, Seek, SeekFrom, Write},
-    os::windows::fs::MetadataExt,
+    file,
+    fs::{self, Metadata},
+    io::{self, Cursor, Error, Read, Seek, SeekFrom, Write},
+    os::windows::{
+        fs::MetadataExt,
+        io::{BorrowedHandle, RawHandle},
+    },
     path::PathBuf,
 };
 
-/* NOTE: For implementing VMemFS we can use Cursor: https://doc.rust-lang.org/nightly/std/io/struct.Cursor.html
-*  which wraps an in-memory buffer and provides it with a Seek implementation
-*  This could be useful anywhere where a Reader/Writer does actual I/O */
+#[cfg(unix)]
+pub(crate) type NativeHandle<'a> = BorrowedFd<'a>;
 
-// WAL directory layout
-//
-// Ordinum uses a single WAL directory containing a sequence of numbered
-// WAL files. The directory itself is not rotated; individual WAL files are.
-//
-// Example:
-//
-// db/
-// └── wal/
-//     ├── 000017.log
-//     ├── 000018.log
-//     └── 000019.log   // current active WAL
-//
-// In standalone mode, one logical WAL maps to one physical WAL file:
-//
-//     WAL #17 -> 000017.log
-//     WAL #18 -> 000018.log
-//
-// A new WAL is created when the current WAL is rotated, typically alongside
-// memtable rotation. Older WALs remain until the data they protect has been
-// flushed to persistent SSTables and they are no longer required for recovery.
-//
-// Once obsolete, a WAL file may either:
-//
-//     1. be deleted, or
-//     2. be retained by the WAL recycler and later renamed/reused as a
-//        newly numbered WAL file.
-//
-// The WAL directory may be located separately from the main database
-// directory, but all standalone WAL files reside within the configured
-// primary WAL directory.
-//
+#[cfg(windows)]
+pub(crate) type NativeHandle<'a> = BorrowedHandle<'a>;
+
+pub(crate) struct FileInfo {
+    len: usize,
+    is_dir: bool,
+    is_file: bool,
+    // XXX:
+}
+
+/// VfsFile is a file abstraction over IO File operations. This enables different implementations over than OS to act as the
+/// file system primarily we can create an in-memory file system.
+pub(crate) trait VfsFile: Read + Write + Send {
+    //
+    fn preallocate(&self, offset: u64, length: u64) -> io::Result<()>;
+    fn stat(&self) -> io::Result<FileInfo>;
+
+    fn sync(&self) -> io::Result<()>;
+
+    // Requests that the filesystem begin syncing the file prefix [0, length)
+    // toward stable storage.
+    //
+    // This is primarily a writeback/latency optimisation for large, continuously
+    // growing files such as the WAL. By starting writeback of older dirty pages
+    // before a real durability barrier is required, a later fsync/sync_data may
+    // have less dirty data left to flush, reducing sync latency spikes.
+    //
+    // This operation must NOT be treated as a durability guarantee unless the
+    // implementation explicitly reports that a full synchronous sync occurred.
+    // An asynchronous prefix sync may only queue writeback and can still leave
+    // data vulnerable to loss on crash.
+    //
+    // Typical WAL usage:
+    //
+    //     write -> write -> sync_to(prefix) -> write -> ... -> sync_data()
+    //
+    // `sync_to` proactively moves data toward storage;
+    // `sync_data` provides the actual durability barrier.
+    fn sync_to(&self, length: u64) -> io::Result<bool /* Replace bool with FullSync new type */>;
+
+    // Persist all written data.
+    fn sync_data(&self) -> io::Result<()>;
+
+    fn prefetch(&self, offset: u64, length: u64) -> io::Result<()>;
+
+    fn raw_file_descriptor_handle<'a>(&'a self) -> Option<NativeHandle<'a>>;
+}
+
+pub(crate) type FileHandle = Box<dyn VfsFile>;
+
+pub(crate) trait FileSystem {
+    //
+    fn create() -> io::Result<FileHandle>;
+
+    // TODO: Finish trait methods
+}
 
 #[test]
 fn basic_file_operations() {

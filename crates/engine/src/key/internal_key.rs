@@ -19,7 +19,7 @@
 
 use std::fmt::Display;
 
-use crate::db::batch::BatchRecordKind;
+use crate::db::batch::RecordKind;
 
 pub(super) const INLINE_IK_SIZE: usize = 20;
 
@@ -89,15 +89,15 @@ impl Display for InternalKeyKind {
     }
 }
 
-impl TryFrom<BatchRecordKind> for InternalKeyKind {
-    type Error = BatchRecordKind;
+impl TryFrom<RecordKind> for InternalKeyKind {
+    type Error = RecordKind;
 
-    fn try_from(kind: BatchRecordKind) -> std::result::Result<Self, Self::Error> {
+    fn try_from(kind: RecordKind) -> std::result::Result<Self, Self::Error> {
         match kind {
-            BatchRecordKind::Put => Ok(Self::Put),
-            BatchRecordKind::Delete => Ok(Self::Delete),
-            BatchRecordKind::Merge => Ok(Self::Merge),
-            BatchRecordKind::RangeDel => Err(BatchRecordKind::RangeDel),
+            RecordKind::Put => Ok(Self::Put),
+            RecordKind::Delete => Ok(Self::Delete),
+            RecordKind::Merge => Ok(Self::Merge),
+            RecordKind::RangeDel => Err(RecordKind::RangeDel),
         }
     }
 }
@@ -199,15 +199,15 @@ mod tests {
     #[test]
     fn point_batch_record_kinds_map_to_internal_key_kinds() {
         assert_eq!(
-            InternalKeyKind::try_from(BatchRecordKind::Put),
+            InternalKeyKind::try_from(RecordKind::Put),
             Ok(InternalKeyKind::Put)
         );
         assert_eq!(
-            InternalKeyKind::try_from(BatchRecordKind::Delete),
+            InternalKeyKind::try_from(RecordKind::Delete),
             Ok(InternalKeyKind::Delete)
         );
         assert_eq!(
-            InternalKeyKind::try_from(BatchRecordKind::Merge),
+            InternalKeyKind::try_from(RecordKind::Merge),
             Ok(InternalKeyKind::Merge)
         );
     }
@@ -215,8 +215,8 @@ mod tests {
     #[test]
     fn range_delete_does_not_map_to_point_internal_key_kind() {
         assert_eq!(
-            InternalKeyKind::try_from(BatchRecordKind::RangeDel),
-            Err(BatchRecordKind::RangeDel)
+            InternalKeyKind::try_from(RecordKind::RangeDel),
+            Err(RecordKind::RangeDel)
         );
     }
 

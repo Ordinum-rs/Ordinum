@@ -145,13 +145,18 @@ impl CFTable {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BatchRecordKind {
+pub(crate) enum RecordKind {
     Put = 1,
     Delete = 2,
     Merge = 3,
     RangeDel = 4,
     // XXX: More operations in later updates
 }
+
+// TODO: Add a Category mapping for RecordKind
+// const RECORD_KIND_CATEGORY: [RecordCategory; N] = [
+//     ...
+// ];
 
 // ---- Batch Runtime State ---- //
 
@@ -1385,7 +1390,7 @@ impl BatchInner {
         cf_id: u64,
         key_len: usize,
         value_len: usize,
-        kind: BatchRecordKind,
+        kind: RecordKind,
     ) -> Result<DeferredOp<'batch>> {
         debug_assert!(
             self.runtime_commit_state.load(Ordering::Acquire) != BatchRuntimeState::InQueue as u8
@@ -1449,7 +1454,7 @@ impl BatchInner {
 
         let mut index = start;
 
-        self.data[index] = (BatchRecordKind::Put as u8);
+        self.data[index] = (RecordKind::Put as u8);
 
         index += 1;
 
@@ -1497,7 +1502,7 @@ impl BatchInner {
         cf_id: u64,
         key_len: usize,
         value_len: usize,
-        kind: BatchRecordKind,
+        kind: RecordKind,
         f: F,
     ) -> Result<()>
     where
@@ -1632,7 +1637,7 @@ mod tests {
         let key = b"Hello";
         let value = b"World";
 
-        inner.put_with(0, key.len(), value.len(), BatchRecordKind::Put, |def| {
+        inner.put_with(0, key.len(), value.len(), RecordKind::Put, |def| {
             let (k, v) = def.key_value_mut();
 
             k.copy_from_slice(key);
@@ -1674,7 +1679,7 @@ mod tests {
         // VALUE   - 5  +
         //         = 33
 
-        inner.put_with(0, key.len(), value.len(), BatchRecordKind::Put, |def| {
+        inner.put_with(0, key.len(), value.len(), RecordKind::Put, |def| {
             // Assert that we have correct reserved space
             assert_eq!(def.reservation_end, 33);
 
@@ -1745,7 +1750,7 @@ mod tests {
                 DEFAULT_CF_ID,
                 MAX_USER_KEY_BYTES + 1,
                 0,
-                BatchRecordKind::Put,
+                RecordKind::Put,
                 |def| (),
             )
             .unwrap_err();
@@ -1766,11 +1771,10 @@ mod tests {
         let mut inner = BatchInner::new();
         let value_len = u32::MAX as usize + 1;
 
-        let error =
-            match inner.put_with(DEFAULT_CF_ID, 0, value_len, BatchRecordKind::Put, |def| ()) {
-                Ok(_) => panic!("unencodable value length unexpectedly reserved a record"),
-                Err(error) => error,
-            };
+        let error = match inner.put_with(DEFAULT_CF_ID, 0, value_len, RecordKind::Put, |def| ()) {
+            Ok(_) => panic!("unencodable value length unexpectedly reserved a record"),
+            Err(error) => error,
+        };
 
         assert!(matches!(
             error,
