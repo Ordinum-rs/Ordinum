@@ -56,6 +56,7 @@ const RecyclableHeaderSize: usize = LegacyHeaderSize + 4;
 const WALSyncRecyclableHeaderSize: usize = RecyclableHeaderSize + 8;
 
 const InvalidChunkEncoding: usize = 0;
+
 const FullChunkEncoding: usize = 1;
 const FirstChunkEncoding: usize = 2;
 const MiddleChunkEncoding: usize = 3;
@@ -128,8 +129,11 @@ const fn make_header_format_map_array() -> [HeaderFormat; HEADER_FORMAT_MAP_ARRA
 
     // Legacy Mappings
 
-    formats[FullChunkEncoding] =
-        HeaderFormat::new(ChunkPosition::InvalidType, WireFormat::InvalidFormat, 0);
+    formats[FullChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::FullType,
+        wire_format: WireFormat::Legacy,
+        header_size: LegacyHeaderSize,
+    };
 
     formats[FirstChunkEncoding] = HeaderFormat {
         chunk_position: ChunkPosition::FirstType,
@@ -137,11 +141,69 @@ const fn make_header_format_map_array() -> [HeaderFormat; HEADER_FORMAT_MAP_ARRA
         header_size: LegacyHeaderSize,
     };
 
-    // TODO: Finish mappings
+    formats[MiddleChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::MiddleType,
+        wire_format: WireFormat::Legacy,
+        header_size: LegacyHeaderSize,
+    };
+
+    formats[LastChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::LastType,
+        wire_format: WireFormat::Legacy,
+        header_size: LegacyHeaderSize,
+    };
 
     // Recyclable Mappings
 
+    formats[RecyclableFullChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::FullType,
+        wire_format: WireFormat::Recyclable,
+        header_size: RecyclableHeaderSize,
+    };
+
+    formats[RecyclableFirstChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::FirstType,
+        wire_format: WireFormat::Recyclable,
+        header_size: RecyclableHeaderSize,
+    };
+
+    formats[RecyclableMiddleChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::MiddleType,
+        wire_format: WireFormat::Recyclable,
+        header_size: RecyclableHeaderSize,
+    };
+
+    formats[RecyclableLastChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::LastType,
+        wire_format: WireFormat::Recyclable,
+        header_size: RecyclableHeaderSize,
+    };
+
     // WALSync Mappings
+
+    formats[WALSyncFullChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::FullType,
+        wire_format: WireFormat::WALSync,
+        header_size: WALSyncRecyclableHeaderSize,
+    };
+
+    formats[WALSyncFirstChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::FirstType,
+        wire_format: WireFormat::WALSync,
+        header_size: WALSyncRecyclableHeaderSize,
+    };
+
+    formats[WALSyncMiddleChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::MiddleType,
+        wire_format: WireFormat::WALSync,
+        header_size: WALSyncRecyclableHeaderSize,
+    };
+
+    formats[WALSyncLastChunkEncoding] = HeaderFormat {
+        chunk_position: ChunkPosition::LastType,
+        wire_format: WireFormat::WALSync,
+        header_size: WALSyncRecyclableHeaderSize,
+    };
 
     formats
 }

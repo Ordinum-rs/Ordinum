@@ -1554,6 +1554,8 @@ impl<'env> BatchRef<'env> {
     }
 }
 
+// TODO: Need a zero alloc BatchIter which iterates over &'_ [u8] from BatchInner and produces BatchOps<'_>
+
 #[cfg(test)]
 mod tests {
     use super::*;
