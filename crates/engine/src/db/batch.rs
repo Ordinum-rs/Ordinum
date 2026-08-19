@@ -1,8 +1,8 @@
 use std::fmt::Display;
 use std::mem::MaybeUninit;
-use std::ops::Deref;
+use std::ops::{Deref, Index};
 use std::ptr::NonNull;
-use std::slice::from_raw_parts_mut;
+use std::slice::{SliceIndex, from_raw_parts_mut};
 use std::thread::{self, Thread};
 use std::{array, panic, ptr, todo};
 use std::{marker::PhantomData, sync::atomic::AtomicU8};
@@ -28,8 +28,6 @@ use crate::{error, utils};
 
 use super::batch_pool::BatchPoolImpl;
 use super::batch_pool::IndexedBatchPool;
-
-// ---- Constants ---- //
 
 // Batch size policy flow
 // ======================
@@ -87,6 +85,10 @@ pub(crate) const MAX_BATCH_SIZE: usize = DEFAULT_MAX_WRITE_BATCH_BYTES;
 pub(crate) const DEFAULT_BATCH_INIT_SIZE: usize = 1 << 10;
 
 const DEFAULT_INLINE_CF_ARRAY: usize = 4;
+
+// XXX: Way too early for format major versions but putting this here until we have need of a module
+pub(crate) const DefaultFormatMajorVersion: u64 = 0;
+pub(crate) type FormatMajorVersion = u64;
 
 // ---- Module Errors ---- //
 
@@ -150,13 +152,93 @@ pub(crate) enum RecordKind {
     Delete = 2,
     Merge = 3,
     RangeDel = 4,
+    LogData = 5,
     // XXX: More operations in later updates
 }
 
-// TODO: Add a Category mapping for RecordKind
-// const RECORD_KIND_CATEGORY: [RecordCategory; N] = [
-//     ...
-// ];
+const RECORD_KIND_MAX: usize = RecordKind::LogData as usize;
+
+impl RecordKind {
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) fn info(&self) -> &'static BatchKindInfo {
+        &RECORD_KIND_MAPPING[self.index()]
+    }
+}
+
+impl Display for RecordKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Put => write!(f, "Put"),
+            Self::Delete => write!(f, "Delete"),
+            Self::Merge => write!(f, "Merge"),
+            Self::RangeDel => write!(f, "RangeDel"),
+            Self::LogData => write!(f, "LogData"),
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordCategory {
+    Invalid = 0,
+    Point,
+    RangeDel,
+    LogData,
+}
+
+impl Display for RecordCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid => write!(f, "Invalid"),
+            Self::Point => write!(f, "Point"),
+            Self::RangeDel => write!(f, "RangeDel"),
+            Self::LogData => write!(f, "LogData"),
+        }
+    }
+}
+
+pub(crate) struct BatchKindInfo {
+    min_format_major_version: FormatMajorVersion,
+    category: RecordCategory,
+}
+
+impl Display for BatchKindInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Format Version: {} - Category: {}",
+            self.min_format_major_version, self.category,
+        )
+    }
+}
+
+impl BatchKindInfo {
+    const fn from(cat: RecordCategory) -> Self {
+        Self {
+            min_format_major_version: DefaultFormatMajorVersion,
+            category: cat,
+        }
+    }
+}
+
+const InvalidBatchKind: BatchKindInfo = BatchKindInfo::from(RecordCategory::Invalid);
+
+const fn make_batch_kind_mapping() -> [BatchKindInfo; RECORD_KIND_MAX + 1] {
+    let mut mappings = [InvalidBatchKind; RECORD_KIND_MAX + 1];
+
+    mappings[RecordKind::Put.index()] = BatchKindInfo::from(RecordCategory::Point);
+    mappings[RecordKind::Delete.index()] = BatchKindInfo::from(RecordCategory::Point);
+    mappings[RecordKind::Merge.index()] = BatchKindInfo::from(RecordCategory::Point);
+    mappings[RecordKind::RangeDel.index()] = BatchKindInfo::from(RecordCategory::RangeDel);
+    mappings[RecordKind::LogData.index()] = BatchKindInfo::from(RecordCategory::LogData);
+
+    mappings
+}
+
+const RECORD_KIND_MAPPING: [BatchKindInfo; RECORD_KIND_MAX + 1] = make_batch_kind_mapping();
 
 // ---- Batch Runtime State ---- //
 
@@ -1549,6 +1631,10 @@ impl BatchInner {
     }
 }
 
+// TODO: Need BatchCommitStats for - duration, wal queue waits, memtable write stalls, wal rotation duration, commit wait
+// --
+
+// --
 pub(crate) struct BatchRef<'env> {
     batch: &'env BatchInner,
 }

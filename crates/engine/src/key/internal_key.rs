@@ -17,7 +17,7 @@
 //
 //
 
-use std::fmt::Display;
+use std::fmt::{Display, write};
 
 use crate::db::batch::RecordKind;
 
@@ -29,6 +29,8 @@ pub(crate) enum InternalKeyKind {
     Put = 1,
     Delete = 2,
     Merge = 3, // TODO: Implement Merge Operation into the system
+    RangeDel = 4,
+    Log = 5,
     Max = 255,
 }
 
@@ -84,6 +86,8 @@ impl Display for InternalKeyKind {
             InternalKeyKind::Put => write!(f, "Put"),
             InternalKeyKind::Delete => write!(f, "Delete"),
             InternalKeyKind::Merge => write!(f, "Merge"),
+            InternalKeyKind::RangeDel => write!(f, "RangeDel"),
+            InternalKeyKind::Log => write!(f, "LogData"),
             InternalKeyKind::Max => write!(f, "Max"),
         }
     }
@@ -98,6 +102,7 @@ impl TryFrom<RecordKind> for InternalKeyKind {
             RecordKind::Delete => Ok(Self::Delete),
             RecordKind::Merge => Ok(Self::Merge),
             RecordKind::RangeDel => Err(RecordKind::RangeDel),
+            RecordKind::LogData => Ok(Self::Log),
         }
     }
 }
